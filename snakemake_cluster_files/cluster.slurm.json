@@ -1,0 +1,46 @@
+{
+    "documenation": {
+        "cmdline": "Use with snakemake --cluster-config cluster.slurm.json --cluster 'sbatch --job-name {cluster.job-name} --ntasks {cluster.ntasks} --cpus-per-task {cluster.cpus-per-task} --mem {cluster.mem} --mem-per-cpu {cluster.mem-per-cpu} --partition {cluster.partition} --time {cluster.time} --mail-user {cluster.mail-user} --mail-type {cluster.mail-type} --error {cluster.error} --output {cluster.output}'"
+    },
+    "__default__" : {
+        "job-name"       : "SM.{rule}",
+        "ntasks"         : 1,
+        "partition"      : "newnodes,sched_mit_hill,sched_any,mit_normal",
+        "time"           : "01:00:00",
+        "cpus-per-task"  : 1,
+        "mem"            : 16000,
+        "mail-user"      : "EMAIL-HERE",
+        "mail-type"      : "FAIL",
+        "output"         : "logs/{rule}_%j.out_err.txt",
+        "error"          : "logs/{rule}_%j.out_err.txt",
+        
+    },
+    "reformat_csv" : {
+        "time"           : "0:30:00",
+        "mem"            : 16000,
+    },
+    "reformat_tree" : {
+        "time"           : "0:30:00",
+        "mem"            : 16000,
+    },
+    "pastml" : {
+        "time"           : "12:00:00",
+        "mem"            : 64000,
+        "cpus-per-task"  : 64,
+    },
+    "aggregatepastml" : {
+        "time"           : "1:30:00",
+        "mem"            : 64000,
+        "cpus-per-task"  : 64,
+    },
+    "SimPhyNI" : {
+        "time"           : "12:00:00",
+        "mem"            : 128000,
+        "cpus-per-task"  : 64,
+    },
+    "prepare_tree" : {
+        "time"           : "0:10:00",
+        "mem"            : 8000,
+    },
+    
+}

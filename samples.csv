@@ -1,0 +1,6 @@
+Sample,Obs Path,Tree Path,Run Type,
+Wu_ecoli,inputs/Wu_ecoli.csv,inputs/Wu_ecoli.nwk,0,(All against All)
+Sepi_mega,inputs/Sepi_mega.csv,inputs/Sepi_mega.nwk,0,
+Panx_ecoli,inputs/Panx_ecoli.csv,inputs/Panx_ecoli.nwk,0,
+IBD_ecoli,inputs/IBD_ecoli.csv,inputs/IBD_ecoli.nwk,1,(First against all)
+panx_ecoli_accessory,inputs/panx_ecoli_accessory.csv,inputs/Panx_ecoli.nwk,0,
