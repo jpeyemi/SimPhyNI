@@ -30,6 +30,7 @@ class TreeSimulator:
         self.node_map = {}
         self.simulation_result: pd.DataFrame = pd.DataFrame()
         self.trait_data: pd.DataFrame = pd.DataFrame()
+        self.tree = None
         self._prepare_data()
     
     def _prepare_data(self):
