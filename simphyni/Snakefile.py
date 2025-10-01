@@ -30,12 +30,23 @@ required_cols = {"Sample", "Traits", "Tree", "RunType"}
 if not required_cols.issubset(samples.columns):
     raise ValueError(f"Samples file must contain columns: {required_cols}")
 
-intermediariesDirectory = config.get('temp_dir','')
+intermediariesDirectory = config.get('temp_dir','./')
 
 SAMPLE_ls = samples['Sample']
 OBS_ls = samples['Traits']
 TREE_ls = samples['Tree']
 RUNTYPE = samples['RunType']
+
+if "MinPrev" not in samples.columns:
+    samples["MinPrev"] = 0.05
+if "MaxPrev" not in samples.columns:
+    samples["MaxPrev"] = .95
+
+samples["MinPrev"] = samples["MinPrev"].fillna(0.05)
+samples["MaxPrev"] = samples["MaxPrev"].fillna(0.95)
+
+MIN_PREVS = samples['MinPrev']
+MAX_PREVS = samples['MaxPrev']
 
 current_directory = os.getcwd()
 
@@ -56,6 +67,7 @@ copy_files_to_inputs(OBS_ls, SAMPLE_ls)
 copy_files_to_inputs(TREE_ls, SAMPLE_ls)
 
 run_dict = dict(zip(SAMPLE_ls,RUNTYPE))
+prev_dict = dict(zip(SAMPLE_ls,list(zip(MIN_PREVS,MAX_PREVS))))
 
 
 ''' SNAKEMAKE '''
@@ -74,10 +86,13 @@ rule reformat_csv:
         inp = 'inputs/{sample}.csv'
     output:
         out = '0-formatting/{sample}/{sample}.csv'
+    params:
+        min_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[0],
+        max_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[1]
     conda:
         'envs/simphyni.yaml'
     shell:
-        'python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out}'
+        'python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev}'
 
 rule reformat_tree:
     input:

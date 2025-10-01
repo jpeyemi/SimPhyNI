@@ -54,8 +54,22 @@ def main():
     run_parser.add_argument(
         "--temp_dir",
         type=str,
-        default='',
+        default='./',
         help="Location to put temporary files (defaults to a subdirectory in the current working directory)"
+    )
+
+    run_parser.add_argument(
+        "--min_prev",
+        type=float,
+        default=0.05,
+        help="Minimum prevanece required by a trait to be analyzed (recommended: 0.05)"
+    )
+
+    run_parser.add_argument(
+        "--max_prev",
+        type=float,
+        default=0.95,
+        help="Maximum prevanece allowed for a trait to be analyzed (recommended: 0.95)"
     )
 
     run_parser.add_argument(
@@ -82,12 +96,14 @@ def main():
     elif args.tree and args.traits and args.runtype:
         # Single-run mode: generate temporary samples.csv
         outdir = args.outdir or "simphyni_outs"
-        single_run_file = "single_run_samples.csv"
+        single_run_file = "simphyni_sample_info.csv"
         df = pd.DataFrame([{
             "Sample": outdir,
             "Tree": args.tree,
             "Traits": args.traits,
             "RunType": args.runtype,
+            "MinPrev": args.min_prev,
+            "MaxPrev": args.max_prev,
         }])
         df.to_csv(single_run_file, index=False)
 
