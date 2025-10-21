@@ -82,7 +82,7 @@ simphyni run --help
 Download and run example inputs using:
 ```bash
 simphyni download-examples
-simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefitler --plot
+simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefilter --plot
 ```
 ---
 

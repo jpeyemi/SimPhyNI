@@ -457,7 +457,6 @@ class TreeSimulator:
         plt.title("Positive (Red) and Negative (Blue) Associations")
         plt.tight_layout()
         plt.savefig(output_file, format='png')
-        plt.show()
     
     def plot_effect_size(self, pval_col, prevalence_range = [0,1], output_file = 'fig.png'):
         
@@ -474,7 +473,6 @@ class TreeSimulator:
         plt.scatter(x = ef, y = pv)
         plt.tight_layout()
         plt.savefig(output_file, format='png')
-        plt.show()
 
 
     
