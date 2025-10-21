@@ -56,7 +56,7 @@ test:
     - simphyni --help
     - simphyni run --help
     - python -c "import simphyni; print(simphyni.__version__)"
-    - snakemake --version
+    - snakemake version
 
 about:
   home: "https://github.com/jpeyemi/simphyni"
