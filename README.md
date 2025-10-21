@@ -91,7 +91,7 @@ simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefi
 Outputs are placed in structured folders in the working directory or specified output directory in the `3-Objects/` subdirectory, including:
 
 * `simphyni_result.csv` contianing all tested trait pairs with their infered interaction direction, p-value, and effect size
-* `simphyni_object.pkl` containinf the completed analysis, parsable with the attached environment (not recommended for large analyses, > 1,000,000 comparisons)
+* `simphyni_object.pkl` containing the completed analysis, parsable with the attached environment (not recommended for large analyses, > 1,000,000 comparisons)
 * heatmap summaries of tested associations if --plot is enabled
 
 ---
