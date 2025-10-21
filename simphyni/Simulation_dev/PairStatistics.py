@@ -1,7 +1,16 @@
 import numpy as np
+from scipy.stats import chi2_contingency
 from sklearn.metrics import mutual_info_score
+from sklearn.metrics.pairwise import cosine_similarity
 
 class PairStatistics:
+
+    @staticmethod
+    def _default_pair_statistic(trait1: np.ndarray, trait2: np.ndarray) -> np.ndarray:
+        oe_ratio = np.sum(np.logical_and(trait1, trait2)) / (np.sum(trait1 > 0) * np.sum(trait2 > 0)) * len(trait1)
+        epsilon = - (np.sum(trait1 > 0) * np.sum(trait2 > 0)) / (len(trait1)) ** 2 # type: ignore
+        oe_ratio = np.nan_to_num(oe_ratio, nan=0)
+        return oe_ratio + epsilon
 
     @staticmethod
     def count_statistic(trait1: np.ndarray, trait2: np.ndarray) -> np.ndarray:
@@ -14,6 +23,17 @@ class PairStatistics:
         sum_trait2 = np.sum(trait2 > 0, axis=0)
         oe_ratio = cooc / (sum_trait1 * sum_trait2) * trait1.shape[0]
         epsilon = - (sum_trait1 * sum_trait2) / (trait1.shape[0] ** 2)
+        oe_ratio = np.nan_to_num(oe_ratio, nan=0)
+        return oe_ratio + epsilon
+    
+    @staticmethod
+    def _alpha_vectorized_pair_statistic(trait1: np.ndarray, trait2: np.ndarray) -> np.ndarray:
+        cooc = np.sum(np.logical_and(trait1, trait2), axis=0)
+        sum_trait1 = np.sum(trait1 > 0, axis=0)
+        sum_trait2 = np.sum(trait2 > 0, axis=0)
+        oe_ratio = cooc / (sum_trait1 * sum_trait2) * trait1.shape[0]
+        alpha = 0.0001
+        epsilon = - (sum_trait1 * sum_trait2) / (trait1.shape[0] ** 2) * alpha
         oe_ratio = np.nan_to_num(oe_ratio, nan=0)
         return oe_ratio + epsilon
     
@@ -152,6 +172,12 @@ class PairStatistics:
         ])
         return mutual_information_values
 
+    @staticmethod
+    def _branch_pair_statistic(tp: np.ndarray, tq: np.ndarray) -> np.ndarray:
+        cooc_bool = np.logical_and(tp, tq)
+        x = tp.copy()
+        x[~cooc_bool] = 0
+        return np.sum(x, axis=0)
     
     @staticmethod
     def cosine_similarity(trait1: np.ndarray, trait2: np.ndarray) -> np.ndarray:
@@ -175,4 +201,29 @@ class PairStatistics:
             p[p == 0] = 0 + epsilon
         # return np.nan_to_num((cooc - exp)/(p * (1-p)),nan = 0)
         return (cooc - exp)/(p * (1-p))
+
     
+    @staticmethod
+    def tami_statistic2(trait1, trait2):
+        cooc = np.sum(np.logical_and(trait1, trait2), axis=0)
+        sum_trait1 = np.sum(trait1 > 0, axis=0)
+        sum_trait2 = np.sum(trait2 > 0, axis=0)
+        exp = sum_trait1 * sum_trait2/ trait1.shape[0]
+        p = sum_trait1 * sum_trait2/ trait1.shape[0]**2
+        return (cooc - exp)/np.sqrt((p * (1-p)))
+    
+    @staticmethod
+    def new_statistic(trait1, trait2):
+        cooc = np.sum(np.logical_and(trait1, trait2), axis=0)
+        sum_trait1 = np.sum(trait1 > 0, axis=0)
+        sum_trait2 = np.sum(trait2 > 0, axis=0)
+        exp = sum_trait1 * sum_trait2/ trait1.shape[0]
+        epsilon = 0.0001
+        p = sum_trait1 * sum_trait2/ trait1.shape[0]**2 
+        if type(p) != np.ndarray:
+            p = min(max(p,epsilon),1-epsilon)
+        else:
+            p[p == 1] = 1 - epsilon
+            p[p == 0] = 0 + epsilon
+        # return np.nan_to_num((cooc - exp)/(p * (1-p)),nan = 0)
+        return (cooc - exp)/(p)

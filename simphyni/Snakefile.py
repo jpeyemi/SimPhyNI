@@ -11,10 +11,8 @@ import sys
 from importlib import resources
 import os
 
-SCRIPTS_DIRECTORY = resources.files("simphyni") / "scripts"
-print(SCRIPTS_DIRECTORY)
-sys.path.insert(0, SCRIPTS_DIRECTORY)
-
+with resources.as_file(resources.files("simphyni") / "scripts") as scripts_dir:
+    SCRIPTS_DIRECTORY = str(scripts_dir)
 
 import os
 import pandas as pd
@@ -31,6 +29,9 @@ if not required_cols.issubset(samples.columns):
     raise ValueError(f"Samples file must contain columns: {required_cols}")
 
 intermediariesDirectory = config.get('temp_dir','./')
+prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
+plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
+
 
 SAMPLE_ls = samples['Sample']
 OBS_ls = samples['Traits']
@@ -113,7 +114,8 @@ rule pastml:
         outfile = "1-PastML/{sample}/out.txt",
     params:
         outdir = lambda wildcards: os.path.join(intermediariesDirectory,'1-PastML',wildcards.sample),
-        max_workers = 64
+        max_workers = workflow.cores,
+        runtype = lambda wildcards: run_dict.get(wildcards.sample, 0),
     conda:
         "envs/simphyni.yaml"
     shell:
@@ -123,6 +125,8 @@ rule pastml:
             --outdir {params.outdir}\
             --max_workers {params.max_workers}\
             --summary_file {output.outfile}\
+            -r {params.runtype}\
+            --{prefilter}\
         "
 
 rule aggregatepastml:
@@ -148,7 +152,9 @@ rule SimPhyNI:
         annotation = "3-Objects/{sample}/simphyni_results.csv"
     params:
         outdir = "3-Objects/{sample}/",
-        runtype = lambda wildcards: run_dict.get(wildcards.sample, 0)
+        runtype = lambda wildcards: run_dict.get(wildcards.sample, 0),
+        min_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[0],
+        max_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[1],
     conda:
         'envs/simphyni.yaml'
     shell:
@@ -158,5 +164,10 @@ rule SimPhyNI:
             -t {input.tree} \
             -o {params.outdir} \
             -r {params.runtype} \
+            -c {workflow.cores} \
+            --min_prev {params.min_prev} \
+            --max_prev {params.max_prev} \
+            --{prefilter} \
+            --{plot} \
         "
 

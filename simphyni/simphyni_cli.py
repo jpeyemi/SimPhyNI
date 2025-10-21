@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 import argparse
 import subprocess
 import sys
@@ -35,13 +35,27 @@ def main():
     run_parser.add_argument(
         "-r", "--runtype",
         choices=['0', '1'],
-        help="Run type: 0 (AllAgainstAll) or 1 (FirstAgainstAl)"
+        help="Run type: 0 (All Against All) or 1 (First Trait Against All)"
+    )
+
+    run_parser.add_argument(
+        "--prefilter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable prefiltering (default: enabled)",
     )
 
     run_parser.add_argument(
         "-o", "--outdir",
         type=str,
         help="Output directory name (single-run mode only, default=simphyni_outs)"
+    )
+
+    parser.add_argument(
+        "--plot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable or disable plotting of results (default: disabled)",
     )
 
     run_parser.add_argument(
@@ -107,7 +121,7 @@ def main():
         }])
         df.to_csv(single_run_file, index=False)
 
-        cmd += ["--config", f"samples={single_run_file}", f"temp_dir={args.temp_dir}"]
+        cmd += ["--config", f"samples={single_run_file}", f"temp_dir={args.temp_dir}", f"prefilter={args.prefilter}", f"plot={args.plot}"]
 
     else:
         sys.exit("Error: Must provide either --samples or --tree/--traits/--runtype")
