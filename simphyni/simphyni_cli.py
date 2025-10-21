@@ -6,7 +6,7 @@ import os
 import pandas as pd
 import requests
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 def main():
     parser = argparse.ArgumentParser(
@@ -108,6 +108,9 @@ def main():
     if args.command == "version":
         print(f"SimPhyNI CLI version {__version__}")
         sys.exit(0)
+    elif args.command == "download-examples":
+        download_all_examples()
+        sys.exit(0)
 
     # Path to Snakefile (assumed in repo root)
     snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py")
@@ -115,16 +118,13 @@ def main():
     cmd = [
         "snakemake",
         "-s", snakefile_path, 
-        "--cores", str(args.cores)
+        "--cores", str(args.cores),
     ]
 
     if args.samples:
         # Batch mode: pass samples file path
         print(f"Running batch mode with samples file: {args.samples}")
-        cmd += ["--config", f"samples={args.samples}",f"temp_dir={args.temp_dir}"]
-    elif args.command == "download-examples":
-        download_all_examples()
-        sys.exit(0)
+        cmd += ["--config", f"samples={args.samples}"]
 
     elif args.tree and args.traits and args.runtype:
         # Single-run mode: generate temporary samples.csv
@@ -141,10 +141,12 @@ def main():
         }])
         df.to_csv(single_run_file, index=False)
 
-        cmd += ["--config", f"samples={single_run_file}", f"temp_dir={args.temp_dir}", f"prefilter={args.prefilter}", f"plot={args.plot}"]
+        cmd += ["--config", f"samples={single_run_file}"]
 
     else:
         sys.exit("Error: Must provide either --samples or --tree/--traits/--runtype")
+
+    cmd += [f"temp_dir={args.temp_dir}", f"prefilter={args.prefilter}", f"plot={args.plot}"]
 
     if args.snakemake_args:
         cmd += args.snakemake_args
@@ -167,14 +169,13 @@ def main():
     print("==========================")
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
-GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/main/example_inputs"
+GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
 
 # List of example files available on GitHub
 EXAMPLE_FILES = [
     "defense_systems_pivot.csv",
     "Sepi_megatree.nwk",
-    "simphyni_sample_info.csv",
-    
+    "simphyni_sample_info.csv"
 ]
 
 def download_example(name):
