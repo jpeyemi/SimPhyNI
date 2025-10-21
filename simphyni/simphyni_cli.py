@@ -4,8 +4,9 @@ import subprocess
 import sys
 import os
 import pandas as pd
+import requests
 
-__version__ = "1.0.0"
+__version__ = "0.1.1"
 
 def main():
     parser = argparse.ArgumentParser(
@@ -39,7 +40,8 @@ def main():
     run_parser.add_argument(
         "-r", "--runtype",
         choices=['0', '1'],
-        help="Run type: 0 (All Against All) or 1 (First Trait Against All)"
+        default = '0',
+        help="Run type: 0 (All Against All) or 1 (First Trait Against All) (default: 0)"
     )
 
     run_parser.add_argument(
@@ -55,7 +57,7 @@ def main():
         help="Output directory name (single-run mode only, default=simphyni_outs)"
     )
 
-    parser.add_argument(
+    run_parser.add_argument(
         "--plot",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -96,6 +98,11 @@ def main():
         help="Extra arguments passed directly to snakemake"
     )
 
+    examples_parser = subparsers.add_parser(
+        "download-examples",
+        help="Download example input files from GitHub"
+    )
+
     args = parser.parse_args()
 
     if args.command == "version":
@@ -113,12 +120,17 @@ def main():
 
     if args.samples:
         # Batch mode: pass samples file path
+        print(f"Running batch mode with samples file: {args.samples}")
         cmd += ["--config", f"samples={args.samples}",f"temp_dir={args.temp_dir}"]
+    elif args.command == "download-examples":
+        download_all_examples()
+        sys.exit(0)
 
     elif args.tree and args.traits and args.runtype:
         # Single-run mode: generate temporary samples.csv
         outdir = args.outdir or "simphyni_outs"
         single_run_file = "simphyni_sample_info.csv"
+        print(f"Running single-run mode for tree: {args.tree} and traits: {args.traits}")
         df = pd.DataFrame([{
             "Sample": outdir,
             "Tree": args.tree,
@@ -137,9 +149,55 @@ def main():
     if args.snakemake_args:
         cmd += args.snakemake_args
 
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
 
+    print("Running workflow with command:")
+    print(" ".join(cmd))
+    print("This may take a while depending on the dataset size...\n")
+
+    try:
+        log_file = './simphyni_log.txt'
+        with open(log_file, "w") as f:
+            subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        print("\nERROR: Snakemake workflow failed. Check the logs for details.")
+        sys.exit(1)
+
+    print("\nWorkflow completed successfully!")
+    print(f"Results are in the output directory: 3-Objects")
+    print("==========================")
+
+EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
+GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/main/example_inputs"
+
+# List of example files available on GitHub
+EXAMPLE_FILES = [
+    "defense_systems_pivot.csv",
+    "Sepi_megatree.nwk",
+    "simphyni_sample_info.csv",
+    
+]
+
+def download_example(name):
+    """Download an example file from GitHub into the current working directory."""
+    os.makedirs(EXAMPLES_DIR, exist_ok=True)
+    url = f"{GITHUB_EXAMPLES_URL}/{name}"
+    local_path = os.path.join(EXAMPLES_DIR, name)
+
+    if not os.path.exists(local_path):
+        print(f"Downloading {name} to {local_path}...")
+        r = requests.get(url)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+    else:
+        print(f"{name} already exists at {local_path}")
+    return local_path
+
+def download_all_examples():
+    """Download all example files to the current working directory."""
+    for example in EXAMPLE_FILES:
+        download_example(example)
+    print(f"All examples downloaded to {EXAMPLES_DIR}")
 
 if __name__ == "__main__":
     main()

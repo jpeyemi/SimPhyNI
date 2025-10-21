@@ -86,10 +86,8 @@ tree_file = args.tree_file
 output_dir = Path(args.outdir)
 obs = pd.read_csv(inputs_file, index_col = 0)
 if args.prefilter:
-    print('JSDBACKSLANAKSLN')
     sample_ids = prefiltering(obs)
 else:
-    print('kjewhdkquehbcedjaclndkjsc')
     sample_ids = list(obs.columns)
 max_workers = args.max_workers
 summary_file = Path(args.summary_file)

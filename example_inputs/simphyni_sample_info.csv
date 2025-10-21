@@ -1,0 +1,2 @@
+Sample,Tree,Traits,RunType,MinPrev,MaxPrev
+Sepi_phage_defense,example_inputs/Sepi_megatree.nwk,example_inputs/defense_systems_pivot.csv,0,0.05,0.95

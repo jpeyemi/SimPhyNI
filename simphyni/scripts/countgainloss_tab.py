@@ -1,10 +1,6 @@
 import os
 import numpy as np
-from numpy import matlib
-from scipy import stats
-import math
-from ete3 import Tree, ProfileFace
-import sys
+from ete3 import Tree
 import pandas as pd
 
 def countgainloss(treepath, gene):
