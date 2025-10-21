@@ -5,12 +5,16 @@ import sys
 import os
 import pandas as pd
 
+__version__ = "1.0.0"
+
 def main():
     parser = argparse.ArgumentParser(
         prog="simphyni",
         description="Wrapper for running SimPhyNISnakemake workflows"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    version_parser = subparsers.add_parser("version", help="Show version information")
 
     # run command
     run_parser = subparsers.add_parser("run", help="Run SimPhyNI analysis")
@@ -93,6 +97,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.command == "version":
+        print(f"SimPhyNI CLI version {__version__}")
+        sys.exit(0)
 
     # Path to Snakefile (assumed in repo root)
     snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py")
