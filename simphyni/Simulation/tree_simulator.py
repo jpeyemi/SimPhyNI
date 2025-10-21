@@ -431,7 +431,7 @@ class TreeSimulator:
             # Grey diagonal
             diagonal_mask = np.zeros_like(combined_matrix, dtype=bool)
             np.fill_diagonal(diagonal_mask, True)
-            sns.heatmap(combined_matrix, mask=~diagonal_mask, cmap=grey_cmap, cbar=False, ax=ax, square=True)
+            sns.heatmap(combined_matrix, mask=~diagonal_mask, cmap=grey_cmap, cbar=False, ax=ax, square=True) # type: ignore
 
             plt.xlabel("")
             plt.ylabel("")
