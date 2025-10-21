@@ -67,7 +67,7 @@ Sim.get_results().to_csv(output_dir / 'simphyni_results.csv')
 print("Simulation completed.")
 
 if args.plot:
-    Sim.plot_results(pval_col = 'pval_naive', output_file= str(output_dir / 'heatmap_uncorrected.svg'), figure_size=10)
-    Sim.plot_results(pval_col = 'pval_bh', output_file= str(output_dir / 'heatmap_bh.svg'), figure_size=10)
-    Sim.plot_results(pval_col = 'pval_by', output_file= str(output_dir / 'heatmap_by.svg'), figure_size=10)
-    Sim.plot_results(pval_col = 'pval_bonf', output_file= str(output_dir / 'heatmap_bonf.svg'), figure_size=10)
+    Sim.plot_results(pval_col = 'pval_naive', output_file= str(output_dir / 'heatmap_uncorrected.png'), figure_size=10)
+    Sim.plot_results(pval_col = 'pval_bh', output_file= str(output_dir / 'heatmap_bh.png'), figure_size=10)
+    Sim.plot_results(pval_col = 'pval_by', output_file= str(output_dir / 'heatmap_by.png'), figure_size=10)
+    Sim.plot_results(pval_col = 'pval_bonf', output_file= str(output_dir / 'heatmap_bonf.png'), figure_size=10)

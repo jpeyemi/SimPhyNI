@@ -2,13 +2,13 @@
 
 ## Overview
 
-SimPhyNI is a phylogenetically-aware framework for detecting evolutionary associations between binary traits (e.g., gene presence/absence) on microbial phylogenetic trees. This Snakemake pipeline automates simulation, preprocessing, and analysis tasks necessary to run SimPhyNI on genetic and phenotypic datasets like those from *E. coli* or *S. epidermidis* pangenomes.
+**SimPhyNI** (Simulation-based Phylogenetic iNteraction Inference) is a phylogenetically-aware framework for detecting evolutionary associations between binary traits (e.g., gene presence/absence, major/minor alleles, binary phenotypes) on microbial phylogenetic trees. This tool leverages phylogenetic infromation to correct for surious associations caused by the relatedness of sister taxa. 
 
 This pipeline is designed to:
 
-* Prepare and simulate trait evolution using phylogenetic trees
-* Detect associations using SimPhyNI methods
-* Output statistical results for associations and python objects for downstream analysis
+* Infer evolutionary parameters for traits (gain/loss rates, time to emergence, ancestral states)
+* Estimate trait co-occurence null models through independent simulation of traits
+* Output statistical results for associations 
 
 ---
 
@@ -16,11 +16,31 @@ This pipeline is designed to:
 
 ### Installation
 
-Clone the repository and install dependencies using Conda:
+First create a new environment:
+
+```bash
+conda create -n simphyni python=3.11
+conda activate simphyni
+```
+
+then install using Conda:
 
 ```bash
 conda install -c bioconda simphyni
 ```
+Or using PyPI
+
+```bash
+pip install simphyni
+```
+
+test installation:
+
+```bash
+simphyni version
+```
+
+---
 
 ### Directory Structure
 
@@ -30,11 +50,8 @@ SimPhyNI/
 │   ├── Simulation/          # Simulation scripts
 │   ├── scripts/             # Workflow scripts
 │   └── envs/simphyni.yaml   # Conda environment (used in snakemake)
-├── conda-recipe/           # Build recipe
-├── samples.csv             # Example input
+├── conda-recipe/           # Build recipe 
 ├── snakemake_cluster_files # Cluster configs for Snakemake
-├── SimPhyNI_local_plotting.py
-├── simphyni_notebook.ipynb # Example notebook
 └── pyproject.toml
 ```
 
@@ -42,34 +59,43 @@ SimPhyNI/
 
 ## Usage
 
-### Step 1: Configure Input
+### Run mode (single-run)
 
-Edit `samples.csv` to specify the input trees and trait matrices:
+```bash
+simphyni run \
+  --tree path/to/tree.nwk \
+  --traits path/to/traits.csv \
+  --runtype 0 \
+  --outdir my_analysis \
+  --cores 4 \
+  --temp_dir ./temp \
+  --min_prev 0.05 \
+  --max_prev 0.95 \
+  --prefilter \
+  --plot
+```
+
+### Run mode (batch)
+
+Create a `samples.csv` file like:
 
 ```csv
-sample,tree,traits,Run Type
-IBD,inputs/IBD_ecoli.nwk,inputs/IBD_ecoli.csv,1
-Sepi,inputs/Sepi_mega.nwk,inputs/Sepi_mega.csv,0
+Sample,Tree,Traits,RunType,MinPrev,MaxPrev
+run1,tree1.nwk,traits1.csv,0,0.05,0.95
+run2,tree2.nwk,traits2.csv,1,0.05,0.90
 ```
 
-
-
-### Step 2: Run the Workflow
+Then execute:
 
 ```bash
-simphyni run -s samples.csv
+simphyni run --samples samples.csv --cores 8 --temp_dir ./temp
 ```
 
-or
+For all run options:
 
 ```bash
-simphyni run -t trait_file.csv -T tree_file.nwk --runtype 0-All against All ,1-First agaist All (default: 0)
+simphyni run --help
 ```
----
-
-## Configuration
-
-No explicit `config.yaml` file is needed; configuration is driven by sample metadata (`samples_example.csv`) and `inputs/` folder contents. Ensure trait files are in CSV format with rows as samples and columns as traits.
 
 ---
 
@@ -78,7 +104,8 @@ No explicit `config.yaml` file is needed; configuration is driven by sample meta
 Outputs are placed in structured folders in the working directory or specified output directory in the `3-Objects/` subdirectory, including:
 
 * `simphyni_result.csv` contianing all tested trait pairs with their infered interaction direction, p-value, and effect size
-* optional pickled SimPhyNI object of the completed analysis, parsable with the attached environment (not recommended for large analyses, > 100,000 comparisons)
+* `simphyni_object.pkl` containinf the completed analysis, parsable with the attached environment (not recommended for large analyses, > 1,000,000 comparisons)
+* heatmap summaries of tested associations if --plot is enabled
 
 ---
 
