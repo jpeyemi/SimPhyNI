@@ -23,12 +23,7 @@ conda create -n simphyni python=3.11
 conda activate simphyni
 ```
 
-then install using Conda:
-
-```bash
-conda install -c bioconda simphyni
-```
-Or using PyPI
+then install using using PyPI
 
 ```bash
 pip install simphyni
@@ -38,21 +33,6 @@ test installation:
 
 ```bash
 simphyni version
-```
-
----
-
-### Directory Structure
-
-```
-SimPhyNI/
-├── simphyni/               # Core package
-│   ├── Simulation/          # Simulation scripts
-│   ├── scripts/             # Workflow scripts
-│   └── envs/simphyni.yaml   # Conda environment (used in snakemake)
-├── conda-recipe/           # Build recipe 
-├── snakemake_cluster_files # Cluster configs for Snakemake
-└── pyproject.toml
 ```
 
 ---
@@ -97,6 +77,13 @@ For all run options:
 simphyni run --help
 ```
 
+## Example data
+
+Download and run example inputs using:
+```bash
+simphyni download-examples
+simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefitler --plot
+```
 ---
 
 ## Outputs
@@ -106,6 +93,21 @@ Outputs are placed in structured folders in the working directory or specified o
 * `simphyni_result.csv` contianing all tested trait pairs with their infered interaction direction, p-value, and effect size
 * `simphyni_object.pkl` containinf the completed analysis, parsable with the attached environment (not recommended for large analyses, > 1,000,000 comparisons)
 * heatmap summaries of tested associations if --plot is enabled
+
+---
+
+### Directory Structure
+
+```
+SimPhyNI/
+├── simphyni/               # Core package
+│   ├── Simulation/          # Simulation scripts
+│   ├── scripts/             # Workflow scripts
+│   └── envs/simphyni.yaml   # Conda environment (used in snakemake)
+├── conda-recipe/           # Build recipe 
+├── snakemake_cluster_files # Cluster configs for Snakemake
+└── pyproject.toml
+```
 
 ---
 
