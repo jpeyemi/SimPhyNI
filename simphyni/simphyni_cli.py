@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 import subprocess
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
@@ -37,10 +37,9 @@ def download_all_examples():
 
 
 CLUST_DIR = os.path.join(os.getcwd(), "cluster_scripts")
-GITHUB_CLUSTER_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/cluster_scripts"
+GITHUB_CLUSTER_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/cluster_profile"
 CLUSTER_FILES = [
-    "cluster.args",
-    "cluster.slurm.json",
+    "config.yaml",
     "run_simphyni.sh"
 ]
 
@@ -102,39 +101,11 @@ def run_simphyni(args):
         f"save_object={args.save_object}"
     ]
 
-    # Slurm flag handling
+    # profile flag handling
     extra_args = []
-    if args.slurm:
-        SM_ARGS = (
-            "--no-requeue "
-            "--parsable "
-            "--cpus-per-task={cluster.cpus-per-task} "
-            "--mem={cluster.mem} "
-            "--job-name={cluster.job-name} "
-            "--ntasks={cluster.ntasks} "
-            "--partition={cluster.partition} "
-            "--time={cluster.time} "
-            "--mail-user={cluster.mail-user} "
-            "--mail-type={cluster.mail-type} "
-            "--error={cluster.error} "
-            "--output={cluster.output}"
-        )
-        cluster_args_file = os.path.join("cluster_scripts", "cluster.args")
-        if os.path.exists(cluster_args_file):
-            with open(cluster_args_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        extra_args.extend(line.split())
-        else:
-            sys.exit(f"No cluster.args found at {cluster_args_file}.")
-        cluster_json = os.path.join("cluster_scripts", "cluster.slurm.json")
-        if not os.path.exists(cluster_json):
-            sys.exit(f"No cluster.json found at {cluster_args_file}.")
-        
+    if args.profile:
         extra_args += [
-            "--cluster-config", cluster_json,
-            "--cluster", f"sbatch {SM_ARGS}"
+            "--profile", args.profile,
         ]
 
 
@@ -192,7 +163,7 @@ def main():
     run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
     run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting (Default: disabled)")
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
-    run_parser.add_argument("--slurm", action="store_true", help="Use cluster config in downloaded folder cluster_scripts to sun SimPhyNI using SLURM job scheduling")
+    run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
 
 
