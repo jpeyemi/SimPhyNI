@@ -10,4 +10,4 @@
 #SBATCH --mem=8000
 
 # Modify for input paths
-simphyni run --samples samples.csv --outdir simphyni_results --slurm
+simphyni run --samples example_inputs/simphyni_sample_info.csv --outdir simphyni_results --profile cluster_scripts

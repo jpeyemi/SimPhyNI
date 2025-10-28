@@ -83,7 +83,12 @@ First, download example cluster scripts:
 simphyni download-cluster-scripts
 ```
 
-Edit cluster config file for your computing cluster then run simphyni with the --profile flag:
+Edit cluster config file for your computing cluster then install the approprate snakemake executor from the avalible catalog: https://snakemake.github.io/snakemake-plugin-catalog/index.html (slurm shown below): 
+```bash
+pip install snakemake-executor-plugin-slurm
+```
+
+run simphyni with the --profile flag:
 ```bash
 simphyni run --samples samples.csv --profile cluster_profile
 ```
