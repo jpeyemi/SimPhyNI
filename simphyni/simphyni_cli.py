@@ -1,177 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
-import subprocess
-import sys
 import os
+import sys
 import pandas as pd
-import requests
+import subprocess
 
-__version__ = "0.1.2"
-
-def main():
-    parser = argparse.ArgumentParser(
-        prog="simphyni",
-        description="Wrapper for running SimPhyNISnakemake workflows"
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    version_parser = subparsers.add_parser("version", help="Show version information")
-
-    # run command
-    run_parser = subparsers.add_parser("run", help="Run SimPhyNI analysis")
-
-    run_mode = run_parser#.add_mutually_exclusive_group(required=True)
-    run_mode.add_argument(
-        "-s","--samples",
-        type=str,
-        help="Path to samples.csv input file"
-    )
-    run_mode.add_argument(
-        "-T", "--tree",
-        type=str,
-        help="Path to input tree file (.nwk)"
-    )
-    run_mode.add_argument(
-        "-t", "--traits",
-        type=str,
-        help="Path to input traits file (.csv)"
-    )
-
-    run_parser.add_argument(
-        "-r", "--runtype",
-        choices=['0', '1'],
-        default = '0',
-        help="Run type: 0 (All Against All) or 1 (First Trait Against All) (default: 0)"
-    )
-
-    run_parser.add_argument(
-        "--prefilter",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable or disable prefiltering (default: enabled)",
-    )
-
-    run_parser.add_argument(
-        "-o", "--outdir",
-        type=str,
-        help="Output directory name (single-run mode only, default=simphyni_outs)"
-    )
-
-    run_parser.add_argument(
-        "--plot",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable or disable plotting of results (default: disabled)",
-    )
-
-    run_parser.add_argument(
-        "--cores",
-        type=int,
-        default=1,
-        help="Number of cores to use (default=1)"
-    )
-
-    run_parser.add_argument(
-        "--temp_dir",
-        type=str,
-        default='./',
-        help="Location to put temporary files (defaults to a subdirectory in the current working directory)"
-    )
-
-    run_parser.add_argument(
-        "--min_prev",
-        type=float,
-        default=0.05,
-        help="Minimum prevanece required by a trait to be analyzed (recommended: 0.05)"
-    )
-
-    run_parser.add_argument(
-        "--max_prev",
-        type=float,
-        default=0.95,
-        help="Maximum prevanece allowed for a trait to be analyzed (recommended: 0.95)"
-    )
-
-    run_parser.add_argument(
-        "snakemake_args",
-        nargs=argparse.REMAINDER,
-        help="Extra arguments passed directly to snakemake"
-    )
-
-    examples_parser = subparsers.add_parser(
-        "download-examples",
-        help="Download example input files from GitHub"
-    )
-
-    args = parser.parse_args()
-
-    if args.command == "version":
-        print(f"SimPhyNI CLI version {__version__}")
-        sys.exit(0)
-    elif args.command == "download-examples":
-        download_all_examples()
-        sys.exit(0)
-
-    # Path to Snakefile (assumed in repo root)
-    snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py")
-
-    cmd = [
-        "snakemake",
-        "-s", snakefile_path, 
-        "--cores", str(args.cores),
-    ]
-
-    if args.samples:
-        # Batch mode: pass samples file path
-        print(f"Running batch mode with samples file: {args.samples}")
-        cmd += ["--config", f"samples={args.samples}"]
-
-    elif args.tree and args.traits and args.runtype:
-        # Single-run mode: generate temporary samples.csv
-        outdir = args.outdir or "simphyni_outs"
-        single_run_file = "simphyni_sample_info.csv"
-        print(f"Running single-run mode for tree: {args.tree} and traits: {args.traits}")
-        df = pd.DataFrame([{
-            "Sample": outdir,
-            "Tree": args.tree,
-            "Traits": args.traits,
-            "RunType": args.runtype,
-            "MinPrev": args.min_prev,
-            "MaxPrev": args.max_prev,
-        }])
-        df.to_csv(single_run_file, index=False)
-
-        cmd += ["--config", f"samples={single_run_file}"]
-
-    else:
-        sys.exit("Error: Must provide either --samples or --tree/--traits/--runtype")
-
-    cmd += [f"temp_dir={args.temp_dir}", f"prefilter={args.prefilter}", f"plot={args.plot}"]
-
-    if args.snakemake_args:
-        cmd += args.snakemake_args
-
-
-    print("Running workflow with command:")
-    print(" ".join(cmd))
-    print("This may take a while depending on the dataset size...\n")
-
-    try:
-        log_file = './simphyni_log.txt'
-        with open(log_file, "w") as f:
-            subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError:
-        print("\nERROR: Snakemake workflow failed. Check the logs for details.")
-        sys.exit(1)
-
-    print("\nWorkflow completed successfully!")
-    print(f"Results are in the output directory: 3-Objects")
-    print("==========================")
+__version__ = "0.1.3"
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
-
-# List of example files available on GitHub
 EXAMPLE_FILES = [
     "defense_systems_pivot.csv",
     "Sepi_megatree.nwk",
@@ -179,11 +16,10 @@ EXAMPLE_FILES = [
 ]
 
 def download_example(name):
-    """Download an example file from GitHub into the current working directory."""
+    import requests
     os.makedirs(EXAMPLES_DIR, exist_ok=True)
     url = f"{GITHUB_EXAMPLES_URL}/{name}"
     local_path = os.path.join(EXAMPLES_DIR, name)
-
     if not os.path.exists(local_path):
         print(f"Downloading {name} to {local_path}...")
         r = requests.get(url)
@@ -195,10 +31,181 @@ def download_example(name):
     return local_path
 
 def download_all_examples():
-    """Download all example files to the current working directory."""
     for example in EXAMPLE_FILES:
         download_example(example)
     print(f"All examples downloaded to {EXAMPLES_DIR}")
+
+
+CLUST_DIR = os.path.join(os.getcwd(), "cluster_scripts")
+GITHUB_CLUSTER_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/cluster_scripts"
+CLUSTER_FILES = [
+    "cluster.args",
+    "cluster.slurm.json",
+    "run_simphyni.sh"
+]
+
+def download_cluster_files(name):
+    import requests
+    os.makedirs(CLUST_DIR, exist_ok=True)
+    url = f"{GITHUB_CLUSTER_URL}/{name}"
+    local_path = os.path.join(CLUST_DIR, name) if name != 'run_simphyni.sh' else os.path.join(os.getcwd(), name)
+    if not os.path.exists(local_path):
+        print(f"Downloading {name} to {local_path}...")
+        r = requests.get(url)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+    else:
+        print(f"{name} already exists at {local_path}")
+    return local_path
+
+def download_all_cluster_files():
+    for file in CLUSTER_FILES:
+        download_cluster_files(file)
+    print(f"All examples downloaded to {CLUST_DIR}")
+
+
+def run_simphyni(args):
+    # Determine samples
+    if args.samples:
+        samples_file = os.path.abspath(args.samples)
+        if not os.path.exists(samples_file):
+            sys.exit(f"Samples file not found: {samples_file}")
+        samples = pd.read_csv(samples_file)
+    elif args.traits and args.tree and args.runtype is not None:
+        sample_name = os.path.splitext(os.path.basename(args.traits))[0]
+        samples = pd.DataFrame([{
+            "Sample": sample_name,
+            "Traits": os.path.abspath(args.traits),
+            "Tree": os.path.abspath(args.tree),
+            "RunType": args.runtype
+        }])
+    else:
+        sys.exit("Must provide either --samples OR -T, -t, and -r for single run.")
+
+    outdir = args.outdir
+    os.makedirs(outdir, exist_ok=True)
+
+    samples_file_out = os.path.join(outdir, "simphyni_sample_info.csv")
+    samples.to_csv(samples_file_out, index=False)
+
+    if not getattr(args, "temp_dir", None) or args.temp_dir == "tmp":
+        args.temp_dir = os.path.join(args.outdir, "tmp")
+
+    # Snakemake config args
+    config_args = [
+        f"samples={samples_file_out}",
+        f"temp_dir={args.temp_dir}",
+        f"prefilter={args.prefilter}",
+        f"plot={args.plot}",
+        f"directory={outdir}",
+    ]
+
+    # Slurm flag handling
+    extra_args = []
+    if args.slurm:
+        SM_ARGS = (
+            "--no-requeue "
+            "--parsable "
+            "--cpus-per-task={cluster.cpus-per-task} "
+            "--mem={cluster.mem} "
+            "--job-name={cluster.job-name} "
+            "--ntasks={cluster.ntasks} "
+            "--partition={cluster.partition} "
+            "--time={cluster.time} "
+            "--mail-user={cluster.mail-user} "
+            "--mail-type={cluster.mail-type} "
+            "--error={cluster.error} "
+            "--output={cluster.output}"
+        )
+        cluster_args_file = os.path.join("cluster_scripts", "cluster.args")
+        if os.path.exists(cluster_args_file):
+            with open(cluster_args_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        extra_args.extend(line.split())
+        else:
+            sys.exit(f"No cluster.args found at {cluster_args_file}.")
+        cluster_json = os.path.join("cluster_scripts", "cluster.slurm.json")
+        if not os.path.exists(cluster_json):
+            sys.exit(f"No cluster.json found at {cluster_args_file}.")
+        
+        extra_args += [
+            "--cluster-config", cluster_json,
+            "--cluster", f"sbatch {SM_ARGS}"
+        ]
+
+
+    snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py") 
+    # Snakemake command
+    snakemake_cmd = [
+        "snakemake",
+        "--snakefile", snakefile_path,
+        "--cores", str(args.cores),
+        "--rerun-incomplete",
+        "--printshellcmds",
+        "--nolock",
+        *extra_args,
+        "--config",
+        *config_args
+    ]
+
+    if args.dry_run:
+        snakemake_cmd.insert(1, "--dry-run")
+
+    print("Launching SimPhyNI...")
+    print("Output directory:", outdir)
+    print("Snakemake command:", " ".join(snakemake_cmd), "\n")
+
+    try:
+        subprocess.run(snakemake_cmd, check=True)
+        print("\nSimPhyNI completed successfully.")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"\n SimPhyNI failed with error: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(prog="simphyni", description="SimPhyNI — Simulation-based Phylogenetic iNteraction Inference.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Version
+    subparsers.add_parser("version", help="Show SimPhyNI version")
+
+    # Download examples
+    subparsers.add_parser("download-examples", help="Download example input files from GitHub")
+
+    # Download template cluster scripts
+    subparsers.add_parser("download-cluster-scripts", help="Download template cluster scripts from GitHub")
+
+    # Run
+    run_parser = subparsers.add_parser("run", help="Run SimPhyNI workflow")
+    run_parser.add_argument("--samples", "-S", help="Path to CSV file with columns: Sample, Traits, Tree, RunType (batch mode)")
+    run_parser.add_argument("-T", "--traits", help="Path to a single traits CSV file (single-run mode)")
+    run_parser.add_argument("-t", "--tree", help="Path to a single tree file (single-run mode)")
+    run_parser.add_argument("-r", "--runtype", type=int, choices=[0,1], help="Run type (0=Test all against all, 1=Test first against all)")
+
+    run_parser.add_argument("--outdir", default="simphyni_outs", help="Main output directory")
+    run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: )")
+    run_parser.add_argument("-c","--cores", type=int, default=8, help="Maximum cores for execution")
+    run_parser.add_argument("--snakefile", default=os.path.join(os.path.dirname(__file__), "Snakefile"), help="Path to Snakefile")
+    run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering")
+    run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting")
+    run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
+    run_parser.add_argument("--slurm", action="store_true", help="Use cluster config in downloaded folder cluster_scripts to sun SimPhyNI using SLURM job scheduling")
+
+    args = parser.parse_args()
+
+    if args.command == "version":
+        print(f"SimPhyNI CLI version {__version__}")
+        sys.exit(0)
+    elif args.command == "download-examples":
+        download_all_examples()
+        sys.exit(0)
+    elif args.command == "download-cluster-scripts":
+        download_all_cluster_files()
+        sys.exit(0)
+    elif args.command == "run":
+        run_simphyni(args)
 
 if __name__ == "__main__":
     main()

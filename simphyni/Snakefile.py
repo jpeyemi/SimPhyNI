@@ -2,58 +2,49 @@
 # SNAKEFILE FOR SimPhyNI #
 ##########################
 
-""" PRE-SNAKEMAKE """
-
-# sampleFile = 'samples.csv' #run_type key: 0 - All against All, 1 - First against All
- #EX: '/home/iobal/orcd/c7/scratch/iobal/AssociationSnakemake/' 
-# Empty string will put intermediaries in the same file systems as outputs
-import sys
-from importlib import resources
 import os
+import sys
+import pandas as pd
+import shutil
+from importlib import resources
+
+# Pre-Snakemake
 
 with resources.as_file(resources.files("simphyni") / "scripts") as scripts_dir:
     SCRIPTS_DIRECTORY = str(scripts_dir)
 
-import os
-import pandas as pd
-import shutil
+with resources.as_file(resources.files("simphyni") / "envs") as envs_dir:
+    ENVIRONMENT_DIRECTORY = str(envs_dir)
 
-samples_file = config.get("samples", None)
+samples_file = config.get("samples")
 if samples_file is None:
     raise ValueError("Must specify samples=... via --config")
 
 samples = pd.read_csv(samples_file)
-
 required_cols = {"Sample", "Traits", "Tree", "RunType"}
 if not required_cols.issubset(samples.columns):
     raise ValueError(f"Samples file must contain columns: {required_cols}")
 
-intermediariesDirectory = config.get('temp_dir','./')
+outdir = config.get("directory")
+base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 
+samples["MinPrev"] = samples.get("MinPrev", 0.05)
+samples["MaxPrev"] = samples.get("MaxPrev", 0.95)
+samples["MinPrev"] = samples["MinPrev"].fillna(0.05)
+samples["MaxPrev"] = samples["MaxPrev"].fillna(0.95)
 
 SAMPLE_ls = samples['Sample']
 OBS_ls = samples['Traits']
 TREE_ls = samples['Tree']
 RUNTYPE = samples['RunType']
 
-if "MinPrev" not in samples.columns:
-    samples["MinPrev"] = 0.05
-if "MaxPrev" not in samples.columns:
-    samples["MaxPrev"] = .95
-
-samples["MinPrev"] = samples["MinPrev"].fillna(0.05)
-samples["MaxPrev"] = samples["MaxPrev"].fillna(0.95)
-
-MIN_PREVS = samples['MinPrev']
-MAX_PREVS = samples['MaxPrev']
-
-current_directory = os.getcwd()
-
+run_dict = dict(zip(SAMPLE_ls, RUNTYPE))
+prev_dict = dict(zip(SAMPLE_ls, list(zip(samples['MinPrev'], samples['MaxPrev']))))
 
 def copy_files_to_inputs(file_paths, name):
-    input_dir = "inputs/"
+    input_dir = os.path.join(outdir, "inputs")
     os.makedirs(input_dir, exist_ok=True)
     for file_path, n in zip(file_paths,name):
         file_name = os.path.basename(file_path)
@@ -67,107 +58,96 @@ def copy_files_to_inputs(file_paths, name):
 copy_files_to_inputs(OBS_ls, SAMPLE_ls)
 copy_files_to_inputs(TREE_ls, SAMPLE_ls)
 
-run_dict = dict(zip(SAMPLE_ls,RUNTYPE))
-prev_dict = dict(zip(SAMPLE_ls,list(zip(MIN_PREVS,MAX_PREVS))))
-
-
-''' SNAKEMAKE '''
+# Snakemake Rules
 
 rule all:
     input:
-        expand("0-formatting/{sample}/{sample}.csv", zip, sample = SAMPLE_ls),
-        expand("0-formatting/{sample}/{sample}.nwk", zip, sample = SAMPLE_ls),
-        expand("1-PastML/{sample}/out.txt", sample = SAMPLE_ls),
-        expand("2-Events/{sample}/pastmlout.csv", sample = SAMPLE_ls),
-        expand("3-Objects/{sample}/simphyni_results.csv", sample = SAMPLE_ls),
-
+        expand(f"{outdir}/{{sample}}/simphyni_results.csv", sample=SAMPLE_ls),
 
 rule reformat_csv:
+    threads: 1
     input:
-        inp = 'inputs/{sample}.csv'
+        inp=f"{outdir}/inputs/{{sample}}.csv"
     output:
-        out = '0-formatting/{sample}/{sample}.csv'
+        out= f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.csv'
     params:
-        min_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[0],
-        max_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[1]
+        min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
+        max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1]
     conda:
-        'envs/simphyni.yaml'
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        'python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev}'
+        "python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev}"
 
 rule reformat_tree:
+    threads: 1
     input:
-        inp = 'inputs/{sample}.nwk'
+        inp="inputs/{sample}.nwk"
     output:
-        out = '0-formatting/{sample}/{sample}.nwk'
+        out=f"{base_tmp}/{{sample}}/0-formatting/{{sample}}.nwk"
     conda:
-        'envs/simphyni.yaml'
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        'python {SCRIPTS_DIRECTORY}/reformat_tree.py {input.inp} {output.out}'
-
+        "python {SCRIPTS_DIRECTORY}/reformat_tree.py {input.inp} {output.out}"
 
 rule pastml:
+    threads: lambda wildcards, attempt: min(64, workflow.cores)
     input:
-        inputsFile = rules.reformat_csv.output.out,
-        tree = rules.reformat_tree.output.out
+        inputsFile=rules.reformat_csv.output.out,
+        tree=rules.reformat_tree.output.out
     output:
-        outfile = "1-PastML/{sample}/out.txt",
+        outfile= f"{base_tmp}/{{sample}}/1-PastML/out.txt"
     params:
-        outdir = lambda wildcards: os.path.join(intermediariesDirectory,'1-PastML',wildcards.sample),
-        max_workers = workflow.cores,
-        runtype = lambda wildcards: run_dict.get(wildcards.sample, 0),
+        outdir=lambda w: os.path.join(base_tmp, w.sample, "1-PastML"),
+        max_workers=lambda wildcards, threads: threads,
+        runtype=lambda w: run_dict.get(w.sample, 0)
     conda:
-        "envs/simphyni.yaml"
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/pastml.py \
-            --inputs_file {input.inputsFile}\
-            --tree_file {input.tree}\
-            --outdir {params.outdir}\
-            --max_workers {params.max_workers}\
-            --summary_file {output.outfile}\
-            -r {params.runtype}\
-            --{prefilter}\
-        "
+        "python {SCRIPTS_DIRECTORY}/pastml.py "
+        "--inputs_file {input.inputsFile} "
+        "--tree_file {input.tree} "
+        "--outdir {params.outdir} "
+        "--max_workers {params.max_workers} "
+        "--summary_file {output.outfile} "
+        "-r {params.runtype} "
+        "--{prefilter}"
 
 rule aggregatepastml:
+    threads: lambda wildcards, attempt: min(64, workflow.cores)
     input:
-        inputsFile = rules.pastml.input.inputsFile,
-        tree = rules.pastml.input.tree,
-        file = rules.pastml.output.outfile,
+        inputsFile=rules.pastml.input.inputsFile,
+        tree=rules.pastml.input.tree,
+        file=rules.pastml.output.outfile
     output:
-        annotation = "2-Events/{sample}/pastmlout.csv"
+        annotation=f"{base_tmp}/{{sample}}/2-Events/pastmlout.csv"
     params:
         pastml_folder = rules.pastml.params.outdir,
     conda:
-        'envs/simphyni.yaml'
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/GL_tab.py {input.inputsFile} {input.tree} {params.pastml_folder} {output.annotation}"
+        "python {SCRIPTS_DIRECTORY}/GL_tab.py "
+        "{input.inputsFile} {input.tree} {params.pastml_folder} {output.annotation}"
 
 rule SimPhyNI:
+    threads: lambda wildcards, attempt: min(64, workflow.cores)
     input:
-        pastml = "2-Events/{sample}/pastmlout.csv",
-        systems = "0-formatting/{sample}/{sample}.csv",
-        tree = "0-formatting/{sample}/{sample}.nwk"
+        pastml=rules.aggregatepastml.output.annotation,
+        systems=rules.reformat_csv.output.out,
+        tree=rules.reformat_tree.output.out
     output:
-        annotation = "3-Objects/{sample}/simphyni_results.csv"
+        annotation=f"{outdir}/{{sample}}/simphyni_results.csv"
     params:
-        outdir = "3-Objects/{sample}/",
-        runtype = lambda wildcards: run_dict.get(wildcards.sample, 0),
-        min_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[0],
-        max_prev = lambda wildcards: prev_dict.get(wildcards.sample, 0)[1],
+        outdir=f"{outdir}/{{sample}}/",
+        runtype=lambda w: run_dict.get(w.sample, 0),
+        min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
+        max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1],
+        threads=lambda wildcards, threads: threads
     conda:
-        'envs/simphyni.yaml'
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/runSimPhyNI.py \
-            -p {input.pastml} \
-            -s {input.systems} \
-            -t {input.tree} \
-            -o {params.outdir} \
-            -r {params.runtype} \
-            -c {workflow.cores} \
-            --min_prev {params.min_prev} \
-            --max_prev {params.max_prev} \
-            --{prefilter} \
-            --{plot} \
-        "
-
+        "python {SCRIPTS_DIRECTORY}/runSimPhyNI.py "
+        "-p {input.pastml} -s {input.systems} -t {input.tree} "
+        "-o {params.outdir} -r {params.runtype} "
+        "-c {params.threads} "
+        "--min_prev {params.min_prev} --max_prev {params.max_prev} "
+        "--{prefilter} --{plot}"

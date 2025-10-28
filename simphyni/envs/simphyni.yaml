@@ -1,36 +1,9 @@
-name: phylo
 channels:
   - conda-forge
   - bioconda
   - defaults
 dependencies:
-  - ete3=3.1.3
-  - joblib=1.4.2
-  - matplotlib=3.10.1
-  - numpy=2.2.3
-  - pandas=2.2.3
   - pip=25.0.1
-  - plotly=6.0.0
-  - python=3.11.11
-  - scikit-learn=1.6.1
-  - seaborn=0.13.2
-  - seaborn-base=0.13.2
-  - setuptools=75.8.0
-  - statsmodels=0.14.4
-  - wheel=0.45.1
+  - python=3.11
   - pip:
-      - annotated-types==0.7.0
-      - biopython==1.85
-      - certifi==2025.1.31
-      - charset-normalizer==3.4.1
-      - idna==3.10
-      - itolapi==4.1.5
-      - jinja2==3.1.6
-      - markupsafe==3.0.2
-      - pastml==1.9.50
-      - pydantic==2.10.6
-      - pydantic-core==2.27.2
-      - requests==2.32.3
-      - scipy==1.14.0
-      - urllib3==2.4.0
-prefix: /Users/jpeyemi/opt/miniconda3/envs/phylo
+      - simphyni==0.1.3
