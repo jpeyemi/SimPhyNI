@@ -69,7 +69,7 @@ class TreeSimulator:
         assert "dist" in self.pastml, "pastml file should have label `dist`"
         assert "loss_dist" in self.pastml, "pastml file should have label `loss_dist`"
 
-    def initialize_simulation_parameters(self, prevalence_threshold = 0.05, collapse_theshold = 0.000, single_trait = False, vars = None, targets = None, pre_filter = True):
+    def initialize_simulation_parameters(self, prevalence_threshold = 0.00, collapse_theshold = 0.000, run_traits = 0, vars = None, targets = None, pre_filter = True):
         """
         Initializes simulation parameters from pastml file and sets the pair_statistic method for run
         Must be run before each simulation
@@ -98,8 +98,10 @@ class TreeSimulator:
 
         self.obsdf_modified = self._collapse_tree_tips(collapse_theshold)
         if not vars: vars = self.obsdf_modified.columns
-        if single_trait: vars = [vars[0]]
         if not targets: targets = self.obsdf_modified.columns
+        if run_traits > 0: 
+            vars = vars[:run_traits]
+            targets = targets[run_traits:]
         self.set_pairs(vars,targets, prevalence_threshold=prevalence_threshold, pre_filter = pre_filter)
 
     def set_pairs(self, vars, targets, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = True):
@@ -226,9 +228,15 @@ class TreeSimulator:
         else:
             X, Y = np.meshgrid(valid_vars, valid_targets, indexing='ij')
             pairs = np.column_stack((X.ravel(), Y.ravel()))
-
-        pairs = pairs[pairs[:, 0] != pairs[:, 1]]
-        pairs = pairs[pairs[:, 0] < pairs[:, 1]]
+        
+        keep, seen = [], set()
+        for a, b in pairs:
+            if a == b or (b, a) in seen:
+                continue
+            seen.add((a, b))
+            keep.append((a, b))
+        pairs = np.array(keep)
+        
         self.total_tests = len(valid_vars) * len(valid_targets) - len(set(valid_vars) & set(valid_targets))
             
 

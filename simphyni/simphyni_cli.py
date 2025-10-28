@@ -72,13 +72,13 @@ def run_simphyni(args):
         if not os.path.exists(samples_file):
             sys.exit(f"Samples file not found: {samples_file}")
         samples = pd.read_csv(samples_file)
-    elif args.traits and args.tree and args.runtype is not None:
-        sample_name = os.path.splitext(os.path.basename(args.traits))[0]
+    elif args.traits and args.tree and args.run_traits is not None:    
+        sample_name = args.sample_name or os.path.splitext(os.path.basename(args.traits))[0]
         samples = pd.DataFrame([{
             "Sample": sample_name,
             "Traits": os.path.abspath(args.traits),
             "Tree": os.path.abspath(args.tree),
-            "RunType": args.runtype
+            "run_traits": args.run_traits,
         }])
     else:
         sys.exit("Must provide either --samples OR -T, -t, and -r for single run.")
@@ -99,6 +99,7 @@ def run_simphyni(args):
         f"prefilter={args.prefilter}",
         f"plot={args.plot}",
         f"directory={outdir}",
+        f"save_object={args.save_object}"
     ]
 
     # Slurm flag handling
@@ -182,16 +183,18 @@ def main():
     run_parser.add_argument("--samples", "-S", help="Path to CSV file with columns: Sample, Traits, Tree, RunType (batch mode)")
     run_parser.add_argument("-T", "--traits", help="Path to a single traits CSV file (single-run mode)")
     run_parser.add_argument("-t", "--tree", help="Path to a single tree file (single-run mode)")
-    run_parser.add_argument("-r", "--runtype", type=int, choices=[0,1], help="Run type (0=Test all against all, 1=Test first against all)")
+    run_parser.add_argument("-r","--run-traits", default = 'All', help="Comma-separated list of column indices (0 is first trait) in traits CSV specifying traits for a traits against all comparison (Default: 'All' for all agianst all)")
+    run_parser.add_argument("--sample-name", "-s", default = '', help="Sample name (single-run mode)")
 
-    run_parser.add_argument("--outdir", default="simphyni_outs", help="Main output directory")
-    run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: )")
-    run_parser.add_argument("-c","--cores", type=int, default=8, help="Maximum cores for execution")
-    run_parser.add_argument("--snakefile", default=os.path.join(os.path.dirname(__file__), "Snakefile"), help="Path to Snakefile")
-    run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering")
-    run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting")
+    run_parser.add_argument("--outdir", default="simphyni_outs", help="Main output directory (Default: simphyni_outs)")
+    run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: tmp)")
+    run_parser.add_argument("-c","--cores", type=int, default=1, help="Maximum cores for execution (Default: 1)")
+    run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
+    run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting (Default: disabled)")
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
     run_parser.add_argument("--slurm", action="store_true", help="Use cluster config in downloaded folder cluster_scripts to sun SimPhyNI using SLURM job scheduling")
+    run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
+
 
     args = parser.parse_args()
 
