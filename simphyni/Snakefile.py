@@ -21,7 +21,7 @@ if samples_file is None:
     raise ValueError("Must specify samples=... via --config")
 
 samples = pd.read_csv(samples_file)
-required_cols = {"Sample", "Traits", "Tree", "RunType"}
+required_cols = {"Sample", "Traits", "Tree"}
 if not required_cols.issubset(samples.columns):
     raise ValueError(f"Samples file must contain columns: {required_cols}")
 
@@ -29,6 +29,7 @@ outdir = config.get("directory")
 base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
+save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
 
 samples["MinPrev"] = samples.get("MinPrev", 0.05)
 samples["MaxPrev"] = samples.get("MaxPrev", 0.95)
@@ -38,9 +39,22 @@ samples["MaxPrev"] = samples["MaxPrev"].fillna(0.95)
 SAMPLE_ls = samples['Sample']
 OBS_ls = samples['Traits']
 TREE_ls = samples['Tree']
-RUNTYPE = samples['RunType']
 
-run_dict = dict(zip(SAMPLE_ls, RUNTYPE))
+
+TRAITS_ls_raw = samples.get("run_traits", pd.Series("ALL", index=samples.index))
+
+def parse_trait_cols(val):
+    """Convert a comma-separated string to a list of ints; use [] as default."""
+    if pd.isna(val) or str(val).strip() == "" or str(val).strip() == "ALL":
+        return []
+    try:
+        return [int(x) for x in str(val).split(",")]
+    except ValueError:
+        sys.exit(f"trait_cols must be ALL or a comma-separated list of integers, got: {val}")
+
+TRAITS_ls = TRAITS_ls_raw.apply(parse_trait_cols)
+
+run_dict = dict(zip(SAMPLE_ls, TRAITS_ls))
 prev_dict = dict(zip(SAMPLE_ls, list(zip(samples['MinPrev'], samples['MaxPrev']))))
 
 def copy_files_to_inputs(file_paths, name):
@@ -72,16 +86,17 @@ rule reformat_csv:
         out= f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.csv'
     params:
         min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
-        max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1]
+        max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1],
+        run_cols=lambda w: ",".join(map(str, run_dict.get(w.sample,[])))
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev}"
+        "python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev} {params.run_cols}"
 
 rule reformat_tree:
     threads: 1
     input:
-        inp="inputs/{sample}.nwk"
+        inp=f"{outdir}/inputs/{{sample}}.nwk"
     output:
         out=f"{base_tmp}/{{sample}}/0-formatting/{{sample}}.nwk"
     conda:
@@ -99,7 +114,7 @@ rule pastml:
     params:
         outdir=lambda w: os.path.join(base_tmp, w.sample, "1-PastML"),
         max_workers=lambda wildcards, threads: threads,
-        runtype=lambda w: run_dict.get(w.sample, 0)
+        runtype=lambda w: len(run_dict.get(w.sample, []))
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
@@ -138,10 +153,8 @@ rule SimPhyNI:
         annotation=f"{outdir}/{{sample}}/simphyni_results.csv"
     params:
         outdir=f"{outdir}/{{sample}}/",
-        runtype=lambda w: run_dict.get(w.sample, 0),
-        min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
-        max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1],
-        threads=lambda wildcards, threads: threads
+        runtype=lambda w: len(run_dict.get(w.sample, [])),
+        threads=lambda wildcards, threads: threads,
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
@@ -149,5 +162,5 @@ rule SimPhyNI:
         "-p {input.pastml} -s {input.systems} -t {input.tree} "
         "-o {params.outdir} -r {params.runtype} "
         "-c {params.threads} "
-        "--min_prev {params.min_prev} --max_prev {params.max_prev} "
-        "--{prefilter} --{plot}"
+        "--{prefilter} --{plot} "
+        "--{save_object}"

@@ -21,8 +21,7 @@ parser.add_argument(
         default=True,
         help="Enable or disable prefiltering (default: enabled)",
     )
-parser.add_argument("-r", "--runtype", type=int, choices=[0, 1], default=0,
-                    help="1 for single trait mode, 0 for multi-trait [default: 0]")
+parser.add_argument("-r", "--run_traits", type=int, default=0)
 args = parser.parse_args()
 
 def prefiltering(obs):
@@ -72,11 +71,12 @@ def prefiltering(obs):
         sig_pvals = p_two[i_idx, j_idx]
 
         return sig_pairs, sig_pvals
-
-    if args.runtype == 0:
-        pairs, pvals = fisher_significant_pairs(obs[[valid_obs[0]]],obs,np.array([valid_obs[0]]),valid_obs)
-    else:
+    
+    if args.run_traits == 0:
         pairs, pvals = fisher_significant_pairs(obs,obs,valid_obs,valid_obs)
+    else:
+        pairs, pvals = fisher_significant_pairs(obs[valid_obs[:args.run_traits]],obs[valid_obs[args.run_traits:]],valid_obs[:args.run_traits],valid_obs[args.run_traits:])
+
     filtered_obs = np.unique(pairs.flatten())
     return filtered_obs
 

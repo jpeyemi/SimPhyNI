@@ -43,33 +43,53 @@ simphyni version
 
 ```bash
 simphyni run \
+  --sample-name my_sample \
   --tree path/to/tree.nwk \
   --traits path/to/traits.csv \
-  --runtype 0 \
+  --run-traits 0,1,2 \
   --outdir my_analysis \
   --cores 4 \
-  --temp_dir ./temp \
+  --temp_dir ./tmp \
   --min_prev 0.05 \
   --max_prev 0.95 \
   --prefilter \
   --plot
 ```
 
+* --run-traits specifies a comma-separated list of column indices (0-indexed) in the traits CSV for “trait against all” comparisons. Use 'ALL' (default) to include all traits.
+
+
 ### Run mode (batch)
 
-Create a `samples.csv` file like:
+Create a `samples.csv` file:
 
 ```csv
-Sample,Tree,Traits,RunType,MinPrev,MaxPrev
-run1,tree1.nwk,traits1.csv,0,0.05,0.95
-run2,tree2.nwk,traits2.csv,1,0.05,0.90
+Sample,Tree,Traits,run_traits,MinPrev,MaxPrev
+run1,tree1.nwk,traits1.csv,All,0.05,0.95
+run2,tree2.nwk,traits2.csv,"0,1,2",0.05,0.90
 ```
+* run_traits, MinPrev, and MaxPrev are optional columns that will use default values if not provided
 
 Then execute:
 
 ```bash
-simphyni run --samples samples.csv --cores 8 --temp_dir ./temp
+simphyni run --samples samples.csv --cores 16
 ```
+
+### Run with SLURM on HPC
+
+First, download example cluster scripts:
+```bash
+simphyni download-cluster-scripts
+```
+
+Edit cluster config files for your hpc then run simphyni with the --slurm flag:
+```bash
+simphyni run --samples samples.csv --slurm
+```
+
+This will automatically use the downloaded cluster configuration files (cluster.args and cluster.slurm.json) to schedule jobs via SLURM.
+*HPC mode is useful for laarge batch jobs to parralelize execution across multiple compute nodes
 
 For all run options:
 
@@ -88,10 +108,10 @@ simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefi
 
 ## Outputs
 
-Outputs are placed in structured folders in the working directory or specified output directory in the `3-Objects/` subdirectory, including:
+Outputs for each sample are placed in structured folders in the working directory or specified output directory in subdirectories by sample name, including:
 
 * `simphyni_result.csv` contianing all tested trait pairs with their infered interaction direction, p-value, and effect size
-* `simphyni_object.pkl` containing the completed analysis, parsable with the attached environment (not recommended for large analyses, > 1,000,000 comparisons)
+* `simphyni_object.pkl` optional file containing the completed analysis, parsable with an active SimPhyNI evironment. Contorlled with the --save-object flag (not recommended for large analyses, > 1,000,000 comparisons)
 * heatmap summaries of tested associations if --plot is enabled
 
 ---
@@ -101,11 +121,12 @@ Outputs are placed in structured folders in the working directory or specified o
 ```
 SimPhyNI/
 ├── simphyni/               # Core package
-│   ├── Simulation/          # Simulation scripts
-│   ├── scripts/             # Workflow scripts
-│   └── envs/simphyni.yaml   # Conda environment (used in snakemake)
+│   ├── Simulation/         # Simulation scripts
+│   ├── scripts/            # Workflow scripts
+│   └── envs/simphyni.yaml  # Conda environment (used in snakemake)
 ├── conda-recipe/           # Build recipe 
-├── snakemake_cluster_files # Cluster configs for Snakemake
+├── cluster_scripts         # Cluster configs for SLURM
+├── example_inputs 
 └── pyproject.toml
 ```
 

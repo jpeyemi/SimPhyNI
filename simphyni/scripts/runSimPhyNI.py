@@ -12,11 +12,9 @@ parser.add_argument("-p", "--pastml", required=True, help="Path to PastML output
 parser.add_argument("-s", "--systems", required=True, help="Path to input traits CSV")
 parser.add_argument("-t", "--tree", required=True, help="Path to rooted Newick tree")
 parser.add_argument("-o", "--outdir", required=True, help="Output path to save the Sim object")
-parser.add_argument("-r", "--runtype", type=int, choices=[0, 1], default=0,
-                    help="1 for single trait mode, 0 for multi-trait [default: 0]")
+parser.add_argument("-r", "--run_traits", type=int, default=0,
+                    help="First run_traits traits against the rest")
 parser.add_argument("-c", "--cores", type=int, default=-1, help="number of cores for parallelization")
-parser.add_argument("--min_prev", type=float, default=0.05, help="minimum prevalence for trait simuation")
-parser.add_argument("--max_prev", type=float, default=0.95, help="maximum prevalence for trait ismulation")
 parser.add_argument(
         "--prefilter",
         action=argparse.BooleanOptionalAction,
@@ -29,8 +27,8 @@ parser.add_argument(
         default=False,
         help="Enable or disable plotting of results (default: disabled)",
     )
+parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
 args = parser.parse_args()
-single_trait = bool(args.runtype)
 
 # ----------------------
 # Simulation Setup
@@ -44,7 +42,7 @@ Sim = TreeSimulator(
 print("Initializing SimPhyNI...")
 
 Sim.initialize_simulation_parameters(
-    single_trait=single_trait,
+    run_traits = args.run_traits,
     pre_filter=args.prefilter
 )
 
@@ -60,8 +58,9 @@ Sim.run_simulation(cores = args.cores)
 output_dir = Path(args.outdir)
 output_dir.mkdir(parents=True, exist_ok=True)
 
-with open(output_dir / 'simphyni_object.pkl', 'wb') as f:
-    pickle.dump(Sim, f)
+if args.save_object:
+    with open(output_dir / 'simphyni_object.pkl', 'wb') as f:
+        pickle.dump(Sim, f)
 
 Sim.get_results().to_csv(output_dir / 'simphyni_results.csv')
 print("Simulation completed.")
