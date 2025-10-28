@@ -1,0 +1,58 @@
+# === GENERAL EXECUTOR SETTINGS ===
+executor: slurm
+jobs: 490
+latency-wait: 120
+
+# === ENVIRONMENT MANAGEMENT ===
+use-conda: true
+conda-frontend: conda
+conda-prefix: /home/iobal/mit_lieberman/tools/conda_snakemake
+
+# === DEFAULT SLURM SUBMISSION SETTINGS ===
+slurm:
+  sbatch_default:
+    - "--no-requeue"
+    - "--parsable"
+
+  sbatch_flags:
+    - "--cpus-per-task={resources.cpus}"
+    - "--mem={resources.mem_mb}"
+    - "--time={resources.runtime}"
+    - "--partition={resources.partition}"
+    - "--job-name={rule}-{wildcards}"
+    - "--output=logs/{rule}.{wildcards}.out"
+    - "--error=logs/{rule}.{wildcards}.err"
+
+# === DEFAULT RESOURCE VALUES ===
+default-resources:
+  - mem_mb=16000
+  - runtime="01:00:00"
+  - cpus=1
+  - partition="newnodes,sched_mit_hill,sched_any,mit_normal"
+
+# === RULE-SPECIFIC RESOURCE OVERRIDES ===
+set-resources:
+  reformat_csv:
+    mem_mb: 16000
+    runtime: "0:30:00"
+    cpus: 1
+
+  reformat_tree:
+    mem_mb: 16000
+    runtime: "0:30:00"
+    cpus: 1
+
+  pastml:
+    mem_mb: 64000
+    runtime: "12:00:00"
+    cpus: 64
+
+  aggregatepastml:
+    mem_mb: 64000
+    runtime: "1:30:00"
+    cpus: 64
+
+  SimPhyNI:
+    mem_mb: 64000
+    runtime: "12:00:00"
+    cpus: 64

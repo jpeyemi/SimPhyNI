@@ -1,9 +1,0 @@
-# This file contains additional arguments to run SimPhyNI using a SLURM scheduler.
-# Minimally edit cluster status and conda prefix
-# See also cluster.slurm.json to edit partitions and compute resourses
---latency-wait 120
---jobs 490
---cluster-status /home/iobal/mit_lieberman/scripts/slurm_status.py
---use-conda
---conda-frontend conda
---conda-prefix /home/iobal/mit_lieberman/tools/conda_snakemake

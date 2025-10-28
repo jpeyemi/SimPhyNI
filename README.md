@@ -76,20 +76,17 @@ Then execute:
 simphyni run --samples samples.csv --cores 16
 ```
 
-### Run with SLURM on HPC
+### Run with HPC
 
 First, download example cluster scripts:
 ```bash
 simphyni download-cluster-scripts
 ```
 
-Edit cluster config files for your hpc then run simphyni with the --slurm flag:
+Edit cluster config file for your computing cluster then run simphyni with the --profile flag:
 ```bash
-simphyni run --samples samples.csv --slurm
+simphyni run --samples samples.csv --profile cluster_profile
 ```
-
-This will automatically use the downloaded cluster configuration files (cluster.args and cluster.slurm.json) to schedule jobs via SLURM.
-*HPC mode is useful for laarge batch jobs to parralelize execution across multiple compute nodes
 
 For all run options:
 
