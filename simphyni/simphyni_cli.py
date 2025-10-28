@@ -36,7 +36,7 @@ def download_all_examples():
     print(f"All examples downloaded to {EXAMPLES_DIR}")
 
 
-CLUST_DIR = os.path.join(os.getcwd(), "cluster_scripts")
+CLUST_DIR = os.path.join(os.getcwd(), "cluster_profile")
 GITHUB_CLUSTER_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/cluster_profile"
 CLUSTER_FILES = [
     "config.yaml",
@@ -147,7 +147,7 @@ def main():
     subparsers.add_parser("download-examples", help="Download example input files from GitHub")
 
     # Download template cluster scripts
-    subparsers.add_parser("download-cluster-scripts", help="Download template cluster scripts from GitHub")
+    subparsers.add_parser("download-cluster-profile", help="Download template cluster profile from GitHub")
 
     # Run
     run_parser = subparsers.add_parser("run", help="Run SimPhyNI workflow")
@@ -175,7 +175,7 @@ def main():
     elif args.command == "download-examples":
         download_all_examples()
         sys.exit(0)
-    elif args.command == "download-cluster-scripts":
+    elif args.command == "download-cluster-profile":
         download_all_cluster_files()
         sys.exit(0)
     elif args.command == "run":

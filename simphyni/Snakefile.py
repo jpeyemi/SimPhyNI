@@ -105,7 +105,7 @@ rule reformat_tree:
         "python {SCRIPTS_DIRECTORY}/reformat_tree.py {input.inp} {output.out}"
 
 rule pastml:
-    threads: lambda wildcards, attempt: min(64, workflow.cores)
+    threads: 64
     input:
         inputsFile=rules.reformat_csv.output.out,
         tree=rules.reformat_tree.output.out
@@ -128,7 +128,7 @@ rule pastml:
         "--{prefilter}"
 
 rule aggregatepastml:
-    threads: lambda wildcards, attempt: min(64, workflow.cores)
+    threads: 64
     input:
         inputsFile=rules.pastml.input.inputsFile,
         tree=rules.pastml.input.tree,
@@ -144,7 +144,7 @@ rule aggregatepastml:
         "{input.inputsFile} {input.tree} {params.pastml_folder} {output.annotation}"
 
 rule SimPhyNI:
-    threads: lambda wildcards, attempt: min(64, workflow.cores)
+    threads: 64
     input:
         pastml=rules.aggregatepastml.output.annotation,
         systems=rules.reformat_csv.output.out,
@@ -154,7 +154,8 @@ rule SimPhyNI:
     params:
         outdir=f"{outdir}/{{sample}}/",
         runtype=lambda w: len(run_dict.get(w.sample, [])),
-        threads=lambda wildcards, threads: threads,
+        threads=lambda wildcards, threads: threads
+
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
