@@ -48,7 +48,6 @@ def sim_bit(tree, trait_params, trials = 64):
     """
 
     gains,losses,dists,loss_dists,gain_subsize,loss_subsize,root_states = unpack_trait_params(trait_params)
-    multiplier = 1e12
 
     # Preprocess and setup
     node_map = {node: ind for ind, node in enumerate(tree.traverse())}
@@ -59,8 +58,8 @@ def sim_bit(tree, trait_params, trials = 64):
     sim = np.zeros((num_nodes, num_traits), dtype=nptype)
     trials = bits
 
-    gain_rates = gains / (gain_subsize * multiplier)
-    loss_rates = losses / (loss_subsize * multiplier)
+    gain_rates = gains / (gain_subsize)
+    loss_rates = losses / (loss_subsize)
     np.nan_to_num(gain_rates, copy = False)
     np.nan_to_num(loss_rates, copy = False)
 
@@ -83,7 +82,6 @@ def sim_bit(tree, trait_params, trials = 64):
             continue
         
         parent = sim[node_map[node.up], :]
-        node_dist_multiplier = node.dist * multiplier
         node_total_dist = node_dists[node]  # Total distance from the root to the current node
 
         # Zero out gain and loss rates for traits where the node's distance is less than the specified threshold
@@ -91,8 +89,8 @@ def sim_bit(tree, trait_params, trials = 64):
         applicable_traits_losses = node_total_dist >= loss_dists 
         gain_events = np.zeros((num_traits), dtype=nptype)
         loss_events = np.zeros((num_traits), dtype=nptype)
-        gain_events[applicable_traits_gains] = np.packbits((np.random.binomial(node_dist_multiplier, gain_rates[applicable_traits_gains, np.newaxis], (applicable_traits_gains.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
-        loss_events[applicable_traits_losses] = np.packbits((np.random.binomial(node_dist_multiplier, loss_rates[applicable_traits_losses, np.newaxis], (applicable_traits_losses.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
+        gain_events[applicable_traits_gains] = np.packbits((np.random.poisson(node.dist * gain_rates[applicable_traits_gains, np.newaxis], (applicable_traits_gains.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
+        loss_events[applicable_traits_losses] = np.packbits((np.random.poisson(node.dist * loss_rates[applicable_traits_losses, np.newaxis], (applicable_traits_losses.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
         updated_state = np.bitwise_or(parent, gain_events)  # Gain new traits
         updated_state = np.bitwise_and(updated_state, np.bitwise_not(loss_events))  # Remove lost traits
         sim[node_map[node], :] = updated_state # Store updated node state
@@ -162,7 +160,7 @@ def compile_results_KDE_bit_async(sim: np.ndarray, pairs: np.ndarray, obspairs: 
         med = np.median(simulated_values)
         q75, q25 = np.percentile(simulated_values, [75, 25])
         iqr = q75 - q25
-        return kde_pval_ant, kde_pval_syn, med, iqr
+        return kde_pval_ant, kde_pval_syn, med, iqr # type: ignore
 
     def process_batch(index: int, sim_readonly: np.ndarray) -> Dict[str, List]:
         """Process a single batch of data, ensuring memory-efficient sim access."""
@@ -177,7 +175,7 @@ def compile_results_KDE_bit_async(sim: np.ndarray, pairs: np.ndarray, obspairs: 
         noised_batch_cooc = batch_cooc + np.random.normal(0, 1e-12, size=batch_cooc.shape)
 
         # Compute KDE statistics in parallel
-        results = Parallel(n_jobs=-1, verbose=0, batch_size=25)(
+        results = Parallel(n_jobs=-1, verbose=0, batch_size=25)( # type: ignore
             delayed(compute_kde_stats)(obspairs[index + i], noised_batch_cooc[i])
             for i in range(len(pair_batch))
         )
@@ -210,6 +208,6 @@ def compile_results_KDE_bit_async(sim: np.ndarray, pairs: np.ndarray, obspairs: 
     # Merge batch results
     for batch_res in batch_results:
         for key in res.keys():
-            res[key].extend(batch_res[key])
+            res[key].extend(batch_res[key]) # type: ignore
 
     return pd.DataFrame.from_dict(res)

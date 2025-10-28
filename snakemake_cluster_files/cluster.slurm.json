@@ -35,12 +35,8 @@
     },
     "SimPhyNI" : {
         "time"           : "12:00:00",
-        "mem"            : 128000,
+        "mem"            : 64000,
         "cpus-per-task"  : 64,
-    },
-    "prepare_tree" : {
-        "time"           : "0:10:00",
-        "mem"            : 8000,
     },
     
 }
