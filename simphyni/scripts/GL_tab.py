@@ -36,9 +36,11 @@ def process_gene(c):
         'loss_subsize': loss_subsize, 'root_state': int(root)
     }
 
+# Only process genes that have PastML reconstructions
+available_genes = [c for c in data.columns if os.path.exists(os.path.join(pastml_dir, c))]
 
 with ThreadPoolExecutor() as executor:
-    future_to_gene = {executor.submit(process_gene, c): c for c in data.columns}
+    future_to_gene = {executor.submit(process_gene, c): c for c in available_genes}
     for future in as_completed(future_to_gene):
         c = future_to_gene[future]
         try:
@@ -52,7 +54,7 @@ with ThreadPoolExecutor() as executor:
 # Save the aggregated results to a CSV file
 df = pd.DataFrame.from_dict(to_df)
 df = df.set_index('gene')  # Set 'gene' as the index for alignment
-df = df.loc[data.columns]  # Reindex based on data.columns
+df = df.loc[available_genes]  # Reindex based on data.columns
 df = df.reset_index()
 df.rename(columns={'index': 'gene'}, inplace=True)
 os.makedirs(os.path.dirname(outannot), exist_ok=True)

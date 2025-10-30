@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 import subprocess
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
@@ -107,6 +107,9 @@ def run_simphyni(args):
         extra_args += [
             "--profile", args.profile,
         ]
+    
+    if args.cores:
+        extra_args += ["--cores", str(args.cores),]
 
 
     snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py") 
@@ -114,7 +117,6 @@ def run_simphyni(args):
     snakemake_cmd = [
         "snakemake",
         "--snakefile", snakefile_path,
-        "--cores", str(args.cores),
         "--rerun-incomplete",
         "--printshellcmds",
         "--nolock",
@@ -159,7 +161,7 @@ def main():
 
     run_parser.add_argument("--outdir", default="simphyni_outs", help="Main output directory (Default: simphyni_outs)")
     run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: tmp)")
-    run_parser.add_argument("-c","--cores", type=int, default=1, help="Maximum cores for execution (Default: 1)")
+    run_parser.add_argument("-c","--cores", type=int, help="Maximum cores for execution (Default: All when not provided)")
     run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
     run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting (Default: disabled)")
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
