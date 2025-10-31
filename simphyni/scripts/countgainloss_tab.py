@@ -1,6 +1,10 @@
 import os
 import numpy as np
-from ete3 import Tree
+from numpy import matlib
+from scipy import stats
+import math
+from ete3 import Tree, ProfileFace
+import sys
 import pandas as pd
 
 def countgainloss(treepath, gene):
@@ -17,8 +21,7 @@ def countgainloss(treepath, gene):
     loss_dist = float('inf')
     if '-' in gene: gene = ''.join(gene.split('-'))
     a[gene] = a[gene].astype(int)
-
-
+    root = a[gene].loc[t.get_tree_root().name]
 
     def iter(tree_root):
         nonlocal dist
@@ -38,12 +41,13 @@ def countgainloss(treepath, gene):
             else:
                 # Process the node
                 if node.is_leaf():
-                    if a[gene].loc[node.name] == 1:
-                        ndist = node.get_distance(t)
-                        dist = min(dist, ndist)
-                    elif node.up and a[gene].loc[node.up.name] == 1:
-                        ndist = node.get_distance(t)
-                        loss_dist = min(loss_dist, ndist)
+                    state = a[gene].loc[node.name]
+                    node_dist = node.get_distance(tree_root)
+
+                    if state == 1 and (root == 0 or node is not tree_root):
+                        dist = min(dist, node_dist)
+                    if state == 0 and (root == 1 or node is not tree_root):
+                        loss_dist = min(loss_dist, node_dist)
 
                     node_data[node] = (0, 0)
                 else:
@@ -63,13 +67,13 @@ def countgainloss(treepath, gene):
                     else:
                         num_gains += (1 if 1 in child_syst and a[gene].loc[node.name] == 0 else 0)
                         num_losses += (1 if 0 in child_syst and a[gene].loc[node.name] == 1 else 0)
-
-                    if a[gene].loc[node.name] == 1:
-                        ndist = node.get_distance(t)
-                        dist = min(dist, ndist)
-                    elif node.up and a[gene].loc[node.up.name] == 1:
-                        ndist = node.get_distance(t)
-                        loss_  = min(loss_dist, ndist)
+                    
+                    state = a[gene].loc[node.name]
+                    node_dist = node.get_distance(tree_root)
+                    if state == 1 and (root == 0 or node is not tree_root):
+                        dist = min(dist, node_dist)
+                    if state == 0 and (root == 1 or node is not tree_root):
+                        loss_dist = min(loss_dist, node_dist)
 
                     node_data[node] = (num_gains, num_losses)
 
@@ -102,7 +106,7 @@ def countgainloss(treepath, gene):
     for n in t.traverse():
         if a[gene].loc[n.name] == 1 and n.dist < upper_bound: loss_subsize += n.dist
 
-    root = a[gene].loc[t.get_tree_root().name]
+    
     # Return the number of gains, losses, and the minimum distance where a gain and loss occur
     return gains, losses, dist, loss_dist, gain_subsize, loss_subsize, root
 
