@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 import subprocess
 
-__version__ = "0.1.6"
+__version__ = "0.1.12"
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
@@ -78,6 +78,8 @@ def run_simphyni(args):
             "Traits": os.path.abspath(args.traits),
             "Tree": os.path.abspath(args.tree),
             "run_traits": args.run_traits,
+            "MinPrev": args.min_prev,
+            "MaxPrev": args.max_prev,
         }])
     else:
         sys.exit("Must provide either --samples OR -T, -t, and -r for single run.")
@@ -109,7 +111,10 @@ def run_simphyni(args):
         ]
     
     if args.cores:
-        extra_args += ["--cores", str(args.cores),]
+        extra_args += ["--cores", str(args.cores)]
+    else:
+        extra_args += ["--cores", 'all']
+
 
 
     snakefile_path = os.path.join(os.path.dirname(__file__), "Snakefile.py") 
@@ -121,6 +126,7 @@ def run_simphyni(args):
         "--printshellcmds",
         "--nolock",
         *extra_args,
+        *args.snakemake_args,
         "--config",
         *config_args
     ]
@@ -156,10 +162,12 @@ def main():
     run_parser.add_argument("--samples", "-S", help="Path to CSV file with columns: Sample, Traits, Tree, RunType (batch mode)")
     run_parser.add_argument("-T", "--traits", help="Path to a single traits CSV file (single-run mode)")
     run_parser.add_argument("-t", "--tree", help="Path to a single tree file (single-run mode)")
-    run_parser.add_argument("-r","--run-traits", default = 'All', help="Comma-separated list of column indices (0 is first trait) in traits CSV specifying traits for a traits against all comparison (Default: 'All' for all agianst all)")
+    run_parser.add_argument("-r","--run-traits", default = 'ALL', help="Comma-separated list of column indices (0 is first trait) in traits CSV specifying traits for a traits against all comparison (Default: 'ALL' for all agianst all)")
     run_parser.add_argument("--sample-name", "-s", default = '', help="Sample name (single-run mode)")
+    run_parser.add_argument("--min_prev",type=float,default=0.05,help="Minimum prevanece required by a trait to be analyzed (recommended: 0.05)")
+    run_parser.add_argument("--max_prev",type=float,default=0.95,help="Maximum prevanece allowed for a trait to be analyzed (recommended: 0.95)")
 
-    run_parser.add_argument("--outdir", default="simphyni_outs", help="Main output directory (Default: simphyni_outs)")
+    run_parser.add_argument("-o","--outdir", default="simphyni_outs", help="Main output directory (Default: simphyni_outs)")
     run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: tmp)")
     run_parser.add_argument("-c","--cores", type=int, help="Maximum cores for execution (Default: All when not provided)")
     run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
@@ -167,7 +175,11 @@ def main():
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
     run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
-
+    run_parser.add_argument(
+        "snakemake_args",
+        nargs=argparse.REMAINDER,
+        help="Extra arguments passed directly to snakemake"
+    )
 
     args = parser.parse_args()
 

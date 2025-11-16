@@ -62,7 +62,8 @@ def copy_files_to_inputs(file_paths, name):
     os.makedirs(input_dir, exist_ok=True)
     for file_path, n in zip(file_paths,name):
         file_name = os.path.basename(file_path)
-        destination_path = os.path.join(input_dir, n + '.' + file_name.split('.')[-1])
+        name, ext = os.path.splitext(file_name)
+        destination_path = os.path.join(input_dir, f"{n}{ext}")
         if not os.path.exists(destination_path):
             shutil.copy(file_path, destination_path)
             print(f"Copied {file_path} to {destination_path}")

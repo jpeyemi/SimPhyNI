@@ -10,4 +10,4 @@
 #SBATCH --mem=8000
 
 # Modify for input paths
-simphyni run --samples example_inputs/simphyni_sample_info.csv --outdir simphyni_results --profile cluster_scripts -c 32 #in this case -c is the max cpus that can be allocated to a single job
+simphyni run --samples example_inputs/simphyni_sample_info.csv --outdir simphyni_results --profile cluster_profile -c 32 #in this case -c is the max cpus that can be allocated to a single job

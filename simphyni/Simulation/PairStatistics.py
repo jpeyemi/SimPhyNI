@@ -114,7 +114,7 @@ class PairStatistics:
 
     @staticmethod
     def _log_odds_ratio_statistic(tp: np.ndarray, tq: np.ndarray) -> np.ndarray:
-        epsilon = 1e-2
+        epsilon = 1#e-2
         a = np.logical_and(tp, tq).sum(axis=0) + epsilon # Both traits present
         b = np.logical_and(tp, np.logical_not(tq)).sum(axis=0)  + epsilon# First trait present, second absent
         c = np.logical_and(np.logical_not(tp), tq).sum(axis=0) + epsilon # First trait absent, second present

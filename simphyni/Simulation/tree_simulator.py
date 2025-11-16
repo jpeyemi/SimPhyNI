@@ -56,6 +56,8 @@ class TreeSimulator:
         self.obsdf[self.obsdf > 0.5] = 1
         self.obsdf.fillna(0, inplace=True)
         self.obsdf = self.obsdf.astype(int)
+        self.obsdf.index = self.obsdf.index.astype(str)
+
         
 
     def _check_pastml_data(self):
@@ -69,7 +71,7 @@ class TreeSimulator:
         assert "dist" in self.pastml, "pastml file should have label `dist`"
         assert "loss_dist" in self.pastml, "pastml file should have label `loss_dist`"
 
-    def initialize_simulation_parameters(self, prevalence_threshold = 0.00, collapse_theshold = 0.000, run_traits = 0, vars = None, targets = None, pre_filter = True):
+    def initialize_simulation_parameters(self, prevalence_threshold = 0.00, collapse_threshold = 0.000, run_traits = 0, vars = None, targets = None, pre_filter = True):
         """
         Initializes simulation parameters from pastml file and sets the pair_statistic method for run
         Must be run before each simulation
@@ -96,7 +98,7 @@ class TreeSimulator:
 
         self.pair_statistic = PairStatistics._log_odds_ratio_statistic
 
-        self.obsdf_modified = self._collapse_tree_tips(collapse_theshold)
+        self.obsdf_modified = self._collapse_tree_tips(collapse_threshold)
         if not vars: vars = self.obsdf_modified.columns
         if not targets: targets = self.obsdf_modified.columns
         if run_traits > 0: 
@@ -105,7 +107,7 @@ class TreeSimulator:
         self.set_pairs(vars,targets, prevalence_threshold=prevalence_threshold, pre_filter = pre_filter)
 
     def set_pairs(self, vars, targets, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = True):
-        self.pairs, self.obspairs = self._get_pair_data(self.obsdf[vars],self.obsdf[targets], prevalence_threshold=prevalence_threshold,batch_size=batch_size,pre_filter = pre_filter)
+        self.pairs, self.obspairs = self._get_pair_data(self.obsdf_modified[vars],self.obsdf_modified[targets], prevalence_threshold=prevalence_threshold,batch_size=batch_size,pre_filter = pre_filter)
 
 
     def _collapse_tree_tips(self, threshold):
@@ -117,10 +119,10 @@ class TreeSimulator:
         :returns: new dataframe of combined leaves
         """
         assert(type(self.tree) == TreeNode)
-        if threshold == 0: 
-            treeleaves = set(self.tree.get_leaf_names())
-            self.tree.prune([i for i in self.obsdf.index if i in treeleaves], preserve_branch_length=True)
-            return self.obsdf.copy()
+        # if threshold == 0: 
+        #     treeleaves = set(self.tree.get_leaf_names())
+        #     self.tree.prune([i for i in self.obsdf.index if i in treeleaves], preserve_branch_length=True)
+        #     return self.obsdf.copy()
         
         threshold = self.tree.get_distance(self.tree,self.tree.get_farthest_leaf()[0]) * threshold
         obsdf = self.obsdf.copy()
@@ -134,7 +136,7 @@ class TreeSimulator:
                 to_prune.add(current_node)
                 continue
             distance = current_node.dist + sibling.dist
-            if distance < threshold:
+            if distance <= threshold:
                 if current_node.up:
                     # Choosing first node seen as rep
                     obsdf.loc[current_node.up.name] = obsdf.loc[current_node.name]
@@ -325,7 +327,7 @@ class TreeSimulator:
     def _multiple_test_correction(self,alpha = 0.05):
         # get uncorrected results
         res = self.simulation_result
-        prev = self.obsdf.mean()
+        prev = self.obsdf_modified.mean()
         res['prevalence_T1'] = res['first'].map(prev)
         res['prevalence_T2'] = res['second'].map(prev)
         res['effect size'] = abs(res['effect size'])

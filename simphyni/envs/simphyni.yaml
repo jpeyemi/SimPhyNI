@@ -7,4 +7,4 @@ dependencies:
   - gcc_linux-64
   - gxx_linux-64
   - pip:
-      - simphyni==0.1.4
+      - simphyni==0.1.9

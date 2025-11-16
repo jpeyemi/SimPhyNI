@@ -1,5 +1,5 @@
 {% set name = "simphyni" %}
-{% set version = "0.1.6" %}
+{% set version = "0.1.12" %}
 
 package:
   name: {{ name|lower }}
@@ -25,8 +25,8 @@ requirements:
     - joblib>=1.4.2
     - matplotlib>=3.10.1
     - numpy>=2.2.3
+    - numba>=0.62.0
     - pandas>=2.2.3
-    - plotly>=6.0.0
     - scikit-learn>=1.6.1
     - seaborn>=0.13.0,<0.14
     - setuptools>=75.8.0
