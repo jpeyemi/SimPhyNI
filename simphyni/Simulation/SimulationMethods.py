@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 import seaborn as sns
 from typing import List, Tuple, Set, Dict
+from numba import njit, prange
+import os
+
 
 ### Helper funcs
 
@@ -31,7 +34,7 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
 
-    res = compile_results_KDE_bit_async(sim, pairs_index, obspairs, bits = 64)
+    res = compres(sim, pairs_index, obspairs, bits = 64)
 
     res['first'] = res['first'].map(mappingr)
     res['second'] = res['second'].map(mappingr)
@@ -104,103 +107,162 @@ def sim_bit(tree, trait_params, trials = 64):
 
 # Compiling results
 
-def compile_results_KDE_bit_async(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000,bits = 64,nptype = np.uint64, cores = -1) -> pd.DataFrame:
-    """
-    Compile KDE results asynchronously using parallel batch processing, optimizing `sim` memory handling.
+@njit
+def circular_bitshift_right(arr: np.ndarray, k: int, bits: int = 64) -> np.ndarray:
+    k = k % bits
+    n_rows, n_cols = arr.shape
+    out = np.empty_like(arr)
+    mask = 18446744073709551615 #Max integer  # integer mask, not np.uint64 — faster and correct
 
-    :param sim: Large NumPy array storing simulation data.
-    :param obspairs: Observed pairs statistics.
-    :param batch_size: Size of each batch for processing.
-    :return: DataFrame with compiled results.
+    for i in prange(n_rows):
+        for j in range(n_cols):
+            val = arr[i, j]
+            right = val >> k
+            left = (val << (bits - k)) & mask
+            out[i, j] = np.uint64((right | left) & mask)
+    
+    return out
+
+@njit
+def sum_all_bits(arr, bits=64):
+    n_nodes, n_traits = arr.shape
+    bit_sums = np.zeros((bits, n_traits), dtype=np.float64)
+    for j in range(n_traits):
+        for i in range(bits):
+            s = 0
+            for n in range(n_nodes):
+                s += (arr[n, j] >> i) & 1
+            bit_sums[i, j] = s
+    return bit_sums
+
+@njit
+def get_bit_sums_and_neg_sums(arr: np.ndarray, bits: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate bitwise sums for arr and ~arr (used for co-occurrence derivations)."""
+    n_nodes = arr.shape[0]
+    sum_arr = sum_all_bits(arr, bits)
+    sum_neg_arr = n_nodes - sum_arr
+    return sum_arr, sum_neg_arr
+
+@njit
+def compute_bitwise_cooc(tp: np.ndarray, tq: np.ndarray, bits: int = 64) -> np.ndarray:
     """
-    # Use Joblib Memory to avoid redundant copies
-    memory = Memory(location=None, verbose=0)  # No disk caching, just memory optimization
+    Numba-optimized bitwise co-occurrence statistics calculation.
+    Replicates the NumPy logic: computes a (bits, N_traits) matrix for each shift k, 
+    then conceptually stacks them horizontally.
+    """
+    n_nodes, n_traits = tp.shape
+    out_cols = bits * bits 
+    cooc_matrix = np.empty((n_traits, out_cols), dtype=np.float64)
+
+    sum_tp_1s, sum_tp_0s = get_bit_sums_and_neg_sums(tp, bits)
+    epsilon = 1#e-2
+
+    for k in prange(bits): 
+        shifted = circular_bitshift_right(tq, k)
+        sum_shifted_1s, sum_shifted_0s = get_bit_sums_and_neg_sums(shifted, bits)
+
+        a = sum_all_bits(tp & shifted, bits)
+        b = sum_tp_1s - a + epsilon 
+        c = sum_shifted_1s - a
+        d = sum_tp_0s - c + epsilon 
+
+        a += epsilon
+        c+= epsilon
+
+        log_ratio_matrix = np.log((a * d) / (b * c))
+        
+        start_col = k * bits
+        end_col = (k + 1) * bits
+        
+        cooc_matrix[:, start_col:end_col] = log_ratio_matrix.T
+
+    return cooc_matrix
+
+
+def compute_kde_stats(observed_value: float, simulated_values: np.ndarray) -> Tuple[float, float, float, float]:
+    """Compute KDE statistics for a single pair."""
+
+    # kde = gaussian_kde(simulated_values, bw_method='silverman')
+    # cdf_func_ant = lambda x: kde.integrate_box_1d(-np.inf, x)
+    # cdf_func_syn = lambda x: kde.integrate_box_1d(x,np.inf)
+    
+    # kde_pval_ant = cdf_func_ant(observed_value)  # P(X ≤ observed)
+    # kde_pval_syn = cdf_func_syn(observed_value) # P(X > observed)
+
+    kde = gaussian_kde(simulated_values,bw_method='silverman')
+    cdf_func_ant = lambda x: kde.integrate_box_1d(-np.inf, x)
+    kde_syn = gaussian_kde(-1*simulated_values, bw_method='silverman')
+    cdf_func_syn = lambda x: kde_syn.integrate_box_1d(-np.inf,-x)
+
+    kde_pval_ant = cdf_func_ant(observed_value)
+    kde_pval_syn = cdf_func_syn(observed_value)
+    
+    med = np.median(simulated_values)
+    q75, q25 = np.percentile(simulated_values, [75, 25])
+    iqr = q75 - q25
+    
+    return kde_pval_ant, kde_pval_syn, med, max(iqr * 1.349,1)
+
+
+def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int) -> Dict[str, List]:
+    """
+    Process a single batch of data.
+    """
+    pair_batch = pairs[index: index + batch_size]
+    current_obspairs = obspairs[index: index + len(pair_batch)]
+    
+    tp = sim_readonly[:, pair_batch[:, 0]]
+    tq = sim_readonly[:, pair_batch[:, 1]]
+
+
+    batch_cooc = compute_bitwise_cooc(tp, tq)
+    noised_batch_cooc = batch_cooc + np.random.normal(0, 1e-12, size=batch_cooc.shape)
+
+    results = [
+        compute_kde_stats(current_obspairs[i], noised_batch_cooc[i])
+        for i in range(len(pair_batch))
+    ]
+
+    kde_pvals_ant, kde_pvals_syn, medians, normalization_factors = map(np.array, zip(*results))
+
+    # Vectorized calculation of final results
+    min_pvals = np.minimum(kde_pvals_syn, kde_pvals_ant)
+    directions = np.where(kde_pvals_ant < kde_pvals_syn, -1, 1)
+    effect_sizes = (current_obspairs - medians) / normalization_factors
+
+    batch_res = {
+        "pair": [tuple(p) for p in pair_batch],
+        "first": pair_batch[:, 0].tolist(),
+        "second": pair_batch[:, 1].tolist(),
+        "p-value": min_pvals.tolist(),
+        "direction": directions.tolist(),
+        "effect size": effect_sizes.tolist(),
+    }
+
+    return batch_res
+
+def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000, bits: int = 64, cores: int = -1) -> pd.DataFrame:
+    """
+    Compile KDE results asynchronously using parallel batch processing.
+    Optimized for time (no nested parallelism) and memory (read-only array setup).
+    """
     res: Dict[str, List] = {
         "pair": [], "first": [], "second": [], 
         "direction": [], "p-value": [], "effect size": []
     }
 
-    # Convert sim to read-only memory-mapped array to reduce memory duplication
-    sim = np.asarray(sim, order="C")  # Ensure contiguous memory
-    sim.setflags(write=False)  # Set as read-only to avoid unintended copies
-
-    def circular_bitshift_right(arr: np.ndarray, k: int) -> np.ndarray:
-        """Perform a circular right bit shift on all np.uint64 entries in an array."""
-        k %= bits
-        return np.bitwise_or(np.right_shift(arr, k), np.left_shift(arr, bits - k))
-    
-    def sum_all_bits(arr: np.ndarray) -> np.ndarray:
-        """Compute the sum of 1s for all 64 bit positions in an array of uint64 values."""
-        bit_sums = np.zeros((bits, arr.shape[-1]), dtype=np.float64)
-        for i in range(bits):
-            bit_sums[i] = np.sum((arr >> i) & 1, axis=0, dtype=nptype)
-        return bit_sums
-
-    def compute_bitwise_cooc(tp: np.ndarray, tq: np.ndarray) -> np.ndarray:
-        """Compute bitwise co-occurrence statistics for a batch."""
-        cooc_batch = []
-        for k in range(bits):
-            shifted = circular_bitshift_right(tq, k)
-            a = sum_all_bits(tp & shifted) + 1e-2
-            b = sum_all_bits(tp & ~shifted) + 1e-2
-            c = sum_all_bits(~tp & shifted) + 1e-2
-            d = sum_all_bits(~tp & ~shifted) + 1e-2
-            cooc_batch.append(np.log((a * d) / (b * c)))
-        return np.vstack(cooc_batch).T  # Shape: (batch_size, bits)
-
-    def compute_kde_stats(observed_value: float, simulated_values: np.ndarray) -> Tuple[float, float, float, float]:
-        """Compute KDE statistics for a single pair."""
-        kde = gaussian_kde(simulated_values, bw_method='silverman')
-        cdf_func_ant = lambda x: kde.integrate_box_1d(-np.inf, x)
-        kde_syn = gaussian_kde(-1*simulated_values, bw_method='silverman')
-        cdf_func_syn = lambda x: kde_syn.integrate_box_1d(-np.inf,-x)
-        kde_pval_ant = cdf_func_ant(observed_value)  # P(X ≤ observed)
-        kde_pval_syn = cdf_func_syn(observed_value)  # P(X ≥ observed)
-            
-        med = np.median(simulated_values)
-        q75, q25 = np.percentile(simulated_values, [75, 25])
-        iqr = q75 - q25
-        return kde_pval_ant, kde_pval_syn, med, iqr # type: ignore
-
-    def process_batch(index: int, sim_readonly: np.ndarray) -> Dict[str, List]:
-        """Process a single batch of data, ensuring memory-efficient sim access."""
-        pair_batch = pairs[index: index + batch_size]
-        tp = sim_readonly[:, pair_batch[:, 0]]
-        tq = sim_readonly[:, pair_batch[:, 1]]
-
-        # Compute bitwise co-occurrence in batches
-        batch_cooc = compute_bitwise_cooc(tp, tq)
-
-        # Add small noise
-        noised_batch_cooc = batch_cooc + np.random.normal(0, 1e-12, size=batch_cooc.shape)
-
-        # Compute KDE statistics in parallel
-        results = Parallel(n_jobs=-1, verbose=0, batch_size=25)( # type: ignore
-            delayed(compute_kde_stats)(obspairs[index + i], noised_batch_cooc[i])
-            for i in range(len(pair_batch))
-        )
-
-        kde_pvals_ant, kde_pvals_syn, medians, iqrs = map(np.array, zip(*results))
-
-        batch_res = {
-            "pair": [tuple(p) for p in pair_batch],
-            "first": pair_batch[:, 0].tolist(),
-            "second": pair_batch[:, 1].tolist(),
-            "p-value": np.minimum(kde_pvals_syn, kde_pvals_ant).tolist(),
-            "direction": np.where(kde_pvals_ant < kde_pvals_syn, -1, 1).tolist(),
-            "effect size": ((obspairs[index: index + len(pair_batch)]-medians) / np.maximum(iqrs * 1.349, 1)).tolist(),
-        }
-
-        return batch_res
+    sim = np.asarray(sim, order="C") 
+    sim.setflags(write=False) 
 
     num_pairs = len(pairs)
+    batch_size = min(int(np.ceil(num_pairs/(os.cpu_count() or 1))),batch_size)
     batch_indices = range(0, num_pairs, batch_size)
 
     print(f"Processing Batches, Total: {num_pairs//batch_size + 1}")
 
-    # Run batches in parallel, passing a read-only copy of sim
     batch_results = Parallel(n_jobs=cores, verbose=10)(
-        delayed(process_batch)(index, sim) for index in batch_indices
+        delayed(process_batch)(index, sim, pairs, obspairs, batch_size) 
+        for index in batch_indices
     )
 
     print("Aggregating Results...")
@@ -208,6 +270,6 @@ def compile_results_KDE_bit_async(sim: np.ndarray, pairs: np.ndarray, obspairs: 
     # Merge batch results
     for batch_res in batch_results:
         for key in res.keys():
-            res[key].extend(batch_res[key]) # type: ignore
+            res[key].extend(batch_res[key])
 
     return pd.DataFrame.from_dict(res)

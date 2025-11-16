@@ -1,9 +1,7 @@
 import os
 import numpy as np
-from numpy import matlib
-from scipy import stats
 import math
-from ete3 import Tree, ProfileFace
+from ete3 import Tree
 import sys
 import pandas as pd
 
@@ -99,11 +97,9 @@ def countgainloss(treepath, gene):
     upper_bound = 10 ** log_upper_bound
 
     gain_subsize = 0
-    for n in t.traverse():
-        if a[gene].loc[n.name] == 0 and n.dist < upper_bound: gain_subsize += n.dist
-
     loss_subsize = 0
     for n in t.traverse():
+        if a[gene].loc[n.name] == 0 and n.dist < upper_bound: gain_subsize += n.dist
         if a[gene].loc[n.name] == 1 and n.dist < upper_bound: loss_subsize += n.dist
 
     
