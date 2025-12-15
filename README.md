@@ -19,7 +19,7 @@ This pipeline is designed to:
 First create a new environment:
 
 ```bash
-conda create -n simphyni python=3.11
+conda create -n simphyni python=3.11 numba llvmlite
 conda activate simphyni
 ```
 
