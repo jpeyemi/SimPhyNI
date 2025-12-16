@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 import subprocess
 
-__version__ = "0.1.12"
+__version__ = "0.1.13"
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
