@@ -94,6 +94,10 @@ def sim_bit(tree, trait_params, trials = 64):
         loss_events = np.zeros((num_traits), dtype=nptype)
         gain_events[applicable_traits_gains] = np.packbits((np.random.poisson(node.dist * gain_rates[applicable_traits_gains, np.newaxis], (applicable_traits_gains.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
         loss_events[applicable_traits_losses] = np.packbits((np.random.poisson(node.dist * loss_rates[applicable_traits_losses, np.newaxis], (applicable_traits_losses.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
+
+        gain_events &= ~parent
+        loss_events &= parent   
+
         updated_state = np.bitwise_or(parent, gain_events)  # Gain new traits
         updated_state = np.bitwise_and(updated_state, np.bitwise_not(loss_events))  # Remove lost traits
         sim[node_map[node], :] = updated_state # Store updated node state
