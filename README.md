@@ -16,17 +16,24 @@ This pipeline is designed to:
 
 ### Installation
 
-First create a new environment:
+First, ensure bioconda and conda-forge are channels are configured:
 
 ```bash
-conda create -n simphyni python=3.11 numba llvmlite
+conda config --add channels conda-forge
+conda config --add channels bioconda
+```
+
+Create a new environment:
+
+```bash
+conda create -n simphyni
 conda activate simphyni
 ```
 
-then install using using PyPI
+then install SimPhyNI from bioconda:
 
 ```bash
-pip install simphyni
+conda install simphyni
 ```
 
 test installation:
