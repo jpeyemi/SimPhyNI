@@ -2,7 +2,7 @@
 
 ## Overview
 
-**SimPhyNI** (Simulation-based Phylogenetic iNteraction Inference) is a phylogenetically-aware framework for detecting evolutionary associations between binary traits (e.g., gene presence/absence, major/minor alleles, binary phenotypes) on microbial phylogenetic trees. This tool leverages phylogenetic infromation to correct for spurious associations caused by the relatedness of sister taxa. 
+**SimPhyNI** (Simulation-based Phylogenetic iNteraction Inference) is a phylogenetically-aware framework for detecting evolutionary associations between binary traits (e.g., gene presence/absence, major/minor alleles, binary phenotypes) on microbial phylogenetic trees. This tool leverages phylogenetic information to correct for spurious associations caused by the relatedness of sister taxa. 
 
 This pipeline is designed to:
 
@@ -42,7 +42,35 @@ test installation:
 simphyni version
 ```
 
+### Input Specifications
+
+**1. Phylogenetic Tree (`.nwk`)**
+
+* Standard Newick format.
+* Must be **rooted** (both outgroup and midpoint are acceptable).
+* Tip labels must match the `Sample` column in your traits file.
+* Branch lengths are required for accurate rate estimation.
+
+**2. Traits File (`.csv`)**
+
+* **Rows:** Genomes/Samples (matching tree tips).
+* **Columns:** Binary traits (0 = Absent, 1 = Present; non numerical values will be st to 1 and blank values will be set to 0).
+* **Header:** Required (Trait names).
+* **Index:** The first column must contain sample names.
+
+*Example `traits.csv`:*
+
+```csv
+Sample,PhenotypeX,GeneA,GeneB
+E_coli_1,1,0,1
+E_coli_2,1,1,0
+E_coli_3,0,0,1
+
+```
+
 ---
+
+
 
 ## Usage
 
@@ -59,11 +87,10 @@ simphyni run \
   --temp_dir ./tmp \
   --min_prev 0.05 \
   --max_prev 0.95 \
-  --prefilter \
   --plot
 ```
 
-* --run-traits specifies a comma-separated list of column indices (0-indexed) in the traits CSV for “trait against all” comparisons. Use 'ALL' (default) to include all traits.
+* `--run-traits` specifies a comma-separated list of column indices (0-indexed) in the traits CSV for “trait against all” comparisons. Use 'ALL' (default) to include all traits.
 
 
 ### Run mode (batch)
@@ -75,7 +102,8 @@ Sample,Tree,Traits,run_traits,MinPrev,MaxPrev
 run1,tree1.nwk,traits1.csv,All,0.05,0.95
 run2,tree2.nwk,traits2.csv,"0,1,2",0.05,0.90
 ```
-* run_traits, MinPrev, and MaxPrev are optional columns that will use default values if not provided
+
+* `run_traits`, `MinPrev`, and `MaxPrev` are optional columns that will use default values if not provided.
 
 Then execute:
 
@@ -111,7 +139,7 @@ simphyni run --help
 Download and run example inputs using:
 ```bash
 simphyni download-examples
-simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefilter --plot
+simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --plot
 ```
 ---
 
@@ -119,9 +147,26 @@ simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --prefi
 
 Outputs for each sample are placed in structured folders in the working directory or specified output directory in subdirectories by sample name, including:
 
-* `simphyni_result.csv` contianing all tested trait pairs with their infered interaction direction, p-value, and effect size
-* `simphyni_object.pkl` optional file containing the completed analysis, parsable with an active SimPhyNI evironment. Contorlled with the --save-object flag (not recommended for large analyses, > 1,000,000 comparisons)
-* heatmap summaries of tested associations if --plot is enabled
+### Main Result Files
+
+**`simphyni_result.csv`**
+Contains the statistical results for all tested trait pairs.
+
+| Column | Description |
+| --- | --- |
+| `T1` / `T2` | Identifiers for the two traits being compared. |
+| `direction` | Direction of association: `1` = Positive, `-1` = Negative. |
+| `effect size` | Variance adjusted magnitude of the association. |
+| `pval_naive` | Raw empirical P-value from the simulation. |
+| `pval_bh` | P-value corrected using the Benjamini-Hochberg FDR method (recommended for phenotype-genotype tests). |
+| `pval_by` | P-value corrected using the Benjamini-Yekutieli FDR method. (recommended for genotype-genotype tests)|
+| `pval_bonf` | P-value corrected using the strict Bonferroni method. |
+| `prevalence_T1` / `_T2` | Fraction of samples containing the trait (0.0 to 1.0). |
+
+### Additional Outputs
+
+* **`simphyni_object.pkl`**: Optional file containing the completed analysis object, parsable with an active SimPhyNI environment. Controlled with the `--save-object` flag (not recommended for large analyses > 1,000,000 comparisons).
+* **Plots**: Heatmap summaries of tested associations (if `--plot` is enabled).
 
 ---
 
@@ -131,11 +176,14 @@ Outputs for each sample are placed in structured folders in the working director
 SimPhyNI/
 ├── simphyni/               # Core package
 │   ├── Simulation/         # Simulation scripts
-│   ├── scripts/            # Workflow scripts
+│   ├── scripts/            # Snakemake scripts
+│   ├── Snakefile.py/       # Workflow build file
+│   ├── simphyni_cli.py/    # Command line entry points
 │   └── envs/simphyni.yaml  # Conda environment (used in snakemake)
+├── test/                   # Testing suite
 ├── conda-recipe/           # Build recipe 
 ├── cluster_scripts         # Cluster configs for SLURM
-├── example_inputs 
+├── example_inputs          # Example inputs to run SimPhyNI
 └── pyproject.toml
 ```
 

@@ -97,7 +97,7 @@ def run_simphyni(args):
     config_args = [
         f"samples={samples_file_out}",
         f"temp_dir={args.temp_dir}",
-        f"prefilter={args.prefilter}",
+        f"prefilter=False", #{args.prefilter}", #Top level removal of prefilter funtion due to variable performance and minimal efficiency gains. May reimplement in later version
         f"plot={args.plot}",
         f"directory={outdir}",
         f"save_object={args.save_object}"
@@ -170,7 +170,7 @@ def main():
     run_parser.add_argument("-o","--outdir", default="simphyni_outs", help="Main output directory (Default: simphyni_outs)")
     run_parser.add_argument("--temp-dir", default="tmp", help="Temporary directory for intermediate files (Default: tmp)")
     run_parser.add_argument("-c","--cores", type=int, help="Maximum cores for execution (Default: All when not provided)")
-    run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
+    # run_parser.add_argument("--prefilter", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable prefiltering (Default: enabled)")
     run_parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="Enable/disable plotting (Default: disabled)")
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
     run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")

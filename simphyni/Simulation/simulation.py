@@ -61,10 +61,12 @@ def sim_bit(tree, trait_params, trials = 64):
     sim = np.zeros((num_nodes, num_traits), dtype=nptype)
     trials = bits
 
-    gain_rates = gains / (gain_subsize)
-    loss_rates = losses / (loss_subsize)
-    np.nan_to_num(gain_rates, copy = False)
-    np.nan_to_num(loss_rates, copy = False)
+    gain_rates = np.zeros_like(gains, dtype=float)
+    loss_rates = np.zeros_like(losses, dtype=float)
+    valid_gains = gain_subsize > 0
+    valid_losses = loss_subsize > 0
+    gain_rates[valid_gains] = gains[valid_gains] / gain_subsize[valid_gains]
+    loss_rates[valid_losses] = losses[valid_losses] / loss_subsize[valid_losses]
 
     # Distance calculations
     node_dists = {}

@@ -1,15 +1,16 @@
 import numpy as np
 import pandas as pd
 from ete3 import Tree
-from .SimulationMethods import *
+from .simulation import *
 from .Utils import *
 import statsmodels.stats.multitest as sm
 from matplotlib.colors import LinearSegmentedColormap
 from typing import Literal
 from typing import List, Tuple, Set, Dict
-from .PairStatistics import *
+from .pair_statistics import *
 import numpy as np
 from scipy.special import loggamma
+from scipy.stats import hypergeom
 
 class TreeSimulator:
 
@@ -96,7 +97,7 @@ class TreeSimulator:
                     name = f"internal_{idx}"
                     node.name = name
 
-        self.pair_statistic = PairStatistics._log_odds_ratio_statistic
+        self.pair_statistic = pair_statistics._log_odds_ratio_statistic
 
         self.obsdf_modified = self._collapse_tree_tips(collapse_threshold)
         if not vars: vars = self.obsdf_modified.columns
@@ -177,7 +178,6 @@ class TreeSimulator:
         if valid_vars.size == 0 or valid_targets.size == 0:
             return np.array([]), np.array([])
 
-
         def fisher_significant_pairs(vars: pd.DataFrame, targets: pd.DataFrame, valid_vars, valid_targets, pval_threshold: float = 0.05):
             X = vars.to_numpy().astype(bool)
             Y = targets.to_numpy().astype(bool)
@@ -218,15 +218,17 @@ class TreeSimulator:
             # Get indices of significant pairs
             i_idx, j_idx = np.where(sig_mask)
 
+            print(p_two)
+
             sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
             sig_pvals = p_two[i_idx, j_idx]
 
             return sig_pairs, sig_pvals
-
-
+        
         # Filter by fishers exact test if prefilter enabled
         if pre_filter:
             pairs, pvals = fisher_significant_pairs(vars[valid_vars],targets[valid_targets],valid_vars,valid_targets)
+            print(pairs)
         else:
             X, Y = np.meshgrid(valid_vars, valid_targets, indexing='ij')
             pairs = np.column_stack((X.ravel(), Y.ravel()))

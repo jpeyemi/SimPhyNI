@@ -1,7 +1,11 @@
 from .tree_simulator import TreeSimulator
-from .PairStatistics import PairStatistics
+from .pair_statistics import pair_statistics
+from .simulation import (simulate_glrates_bit, sim_bit, compres)
 
 __all__ = [
     "TreeSimulator",
-    "PairStatistics"
+    "pair_statistics",
+    "simulate_glrates_bit",
+    "sim_bit",
+    "compres",
 ]

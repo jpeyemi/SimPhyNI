@@ -75,6 +75,8 @@ copy_files_to_inputs(TREE_ls, SAMPLE_ls)
 
 # Snakemake Rules
 
+# Snakemake Rules
+
 rule all:
     input:
         expand(f"{outdir}/{{sample}}/simphyni_results.csv", sample=SAMPLE_ls),
@@ -92,7 +94,8 @@ rule reformat_csv:
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/reformat_csv.py {input.inp} {output.out} {params.min_prev} {params.max_prev} {params.run_cols}"
+        # Quote script path, input, output, and string parameters
+        'python "{SCRIPTS_DIRECTORY}/reformat_csv.py" "{input.inp}" "{output.out}" {params.min_prev} {params.max_prev} "{params.run_cols}"'
 
 rule reformat_tree:
     threads: 1
@@ -103,7 +106,7 @@ rule reformat_tree:
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/reformat_tree.py {input.inp} {output.out}"
+        'python "{SCRIPTS_DIRECTORY}/reformat_tree.py" "{input.inp}" "{output.out}"'
 
 rule pastml:
     threads: 64
@@ -119,14 +122,15 @@ rule pastml:
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/pastml.py "
-        "--inputs_file {input.inputsFile} "
-        "--tree_file {input.tree} "
-        "--outdir {params.outdir} "
-        "--max_workers {params.max_workers} "
-        "--summary_file {output.outfile} "
-        "-r {params.runtype} "
-        "--{prefilter}"
+        # Note: We do not typically quote flags (e.g. --{prefilter}), only their values if they exist
+        'python "{SCRIPTS_DIRECTORY}/pastml.py" '
+        '--inputs_file "{input.inputsFile}" '
+        '--tree_file "{input.tree}" '
+        '--outdir "{params.outdir}" '
+        '--max_workers {params.max_workers} '
+        '--summary_file "{output.outfile}" '
+        '-r {params.runtype} '
+        '--{prefilter}'
 
 rule aggregatepastml:
     threads: 64
@@ -141,8 +145,8 @@ rule aggregatepastml:
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/GL_tab.py "
-        "{input.inputsFile} {input.tree} {params.pastml_folder} {output.annotation}"
+        'python "{SCRIPTS_DIRECTORY}/GL_tab.py" '
+        '"{input.inputsFile}" "{input.tree}" "{params.pastml_folder}" "{output.annotation}"'
 
 rule SimPhyNI:
     threads: 64
@@ -160,9 +164,12 @@ rule SimPhyNI:
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
-        "python {SCRIPTS_DIRECTORY}/runSimPhyNI.py "
-        "-p {input.pastml} -s {input.systems} -t {input.tree} "
-        "-o {params.outdir} -r {params.runtype} "
-        "-c {params.threads} "
-        "--{prefilter} --{plot} "
-        "--{save_object}"
+        'python "{SCRIPTS_DIRECTORY}/runSimPhyNI.py" '
+        '-p "{input.pastml}" '
+        '-s "{input.systems}" '
+        '-t "{input.tree}" '
+        '-o "{params.outdir}" '
+        '-r {params.runtype} '
+        '-c {params.threads} '
+        '--{prefilter} --{plot} '
+        '--{save_object}'
