@@ -6,7 +6,7 @@ import sys
 import pandas as pd
 
 def countgainloss(treepath, gene):
-    if not os.path.exists(treepath): return (np.float('NaN'),np.float('NaN'),np.float('NaN'),np.float('NaN'))
+    if not os.path.exists(treepath): return (np.float64(np.nan),np.float64(np.nan),np.float64(np.nan),np.float64(np.nan) )
     tree = treepath + '/' + [i for i in os.listdir(treepath) if '.nwk' in i][-1]
     with open(tree) as f:
         newick_str = f.read()

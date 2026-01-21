@@ -1,7 +1,7 @@
 import numpy as np
 from sklearn.metrics import mutual_info_score
 
-class PairStatistics:
+class pair_statistics:
 
     @staticmethod
     def count_statistic(trait1: np.ndarray, trait2: np.ndarray) -> np.ndarray:
