@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simphyni"
-version = "1.0.1"
+version = "1.0.2"
 description = "SimPhyni: a tool for phylogenetic trait simulation and inference."
 authors = [
   { name="Ishaq Balogun", email="ishaqobalogun@gmail.com" }
@@ -55,6 +55,7 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["simphyni*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "simphyni" = [
