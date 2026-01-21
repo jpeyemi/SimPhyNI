@@ -193,3 +193,14 @@ SimPhyNI/
 ## Contact
 
 For questions, please open an issue or contact Ishaq Balogun at https://github.com/jpeyemi.
+
+## Citation
+
+If you use SimPhyNI in your research, please cite:
+
+
+> **High Precision Binary Trait Association on Phylogenetic Trees**
+> Ishaq O Balogun, Christopher P Mancuso, Tami D Lieberman
+> bioRxiv 2025.12.24.696407; doi: https://doi.org/10.64898/2025.12.24.696407
+
+
