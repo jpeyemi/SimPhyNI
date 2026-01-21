@@ -8,7 +8,10 @@ This pipeline is designed to:
 
 * Infer evolutionary parameters for traits (gain/loss rates, time to emergence, ancestral states)
 * Estimate trait co-occurence null models through independent simulation of traits
-* Output statistical results for associations 
+* Output statistical results for associations
+
+**Graphical Workflow:**
+<img width="2332" height="594" alt="Figure2gh" src="https://github.com/user-attachments/assets/7d2dc282-c988-4d7a-93ae-cd041cf6d931" />
 
 ---
 
