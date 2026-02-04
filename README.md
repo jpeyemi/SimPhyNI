@@ -71,9 +71,22 @@ E_coli_3,0,0,1
 
 ```
 
+#### Starting from FASTA files and looking for gene-gene or gene-phenotype associations?
+
+If you have raw genome assemblies (FASTA) and need to generate the necessary inputs (gene presence/absence and a phylogenetic tree), we provide a dedicated pipeline: **[SimPhyNI-Prelude](https://github.com/jpeyemi/SimPhyNI-Prelude)**.
+
+This Snakemake workflow is configured for HPC and automates the following steps:
+
+* **Annotation** (Prokka)
+* **Pangenome Analysis** (Panaroo)
+* **Tree Construction** (PopPUNK or RAxML)
+* **Formatting** (Preparation for SimPhyNI)
+* **SimPhyNI Analysis (This repository)
+
+Any steps may be bypassed by providing existing data (e.g. Gene annotations, phylogenetic tree)
+For those familiar with Snakemake, rules can be edited, added, or removed to suit your needs
+
 ---
-
-
 
 ## Usage
 
