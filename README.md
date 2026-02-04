@@ -84,6 +84,7 @@ This Snakemake workflow is configured for HPC and automates the following steps:
 * **SimPhyNI Analysis** (This repository)
 
 Any steps may be bypassed by providing existing data (e.g. Gene annotations, phylogenetic tree)
+
 For those familiar with Snakemake, rules can be edited, added, or removed to suit your needs
 
 ---
