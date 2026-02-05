@@ -1,12 +1,12 @@
 # === GENERAL EXECUTOR SETTINGS ===
 executor: slurm
-jobs: 490
+jobs: 200
 latency-wait: 120
 
 # === ENVIRONMENT MANAGEMENT ===
-use-conda: true
+use-conda: false # Uses local simphyni env to save time, set to true if new env is needed
 conda-frontend: conda
-conda-prefix: /home/iobal/mit_lieberman/tools/conda_snakemake
+conda-prefix: .snakemake/conda
 
 # === DEFAULT SLURM SUBMISSION SETTINGS ===
 slurm-logdir: logs
@@ -16,8 +16,9 @@ default-resources:
   mem_mb: 16000
   runtime: "1h"
   cpus: 1
-  slurm_partition: "newnodes,sched_mit_hill,sched_any,mit_normal"
-  slurm_account: "mit_general"
+  # set partitions and accounts as needed
+  # slurm_partition: "newnodes,sched_mit_hill,sched_any,mit_normal"
+  # slurm_account: "mit_general"
 
 # === RULE-SPECIFIC RESOURCE OVERRIDES ===
 set-threads:
