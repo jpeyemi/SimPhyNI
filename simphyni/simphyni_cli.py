@@ -184,7 +184,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "version":
-        print(f"SimPhyNI CLI version {__version__}")
+        print(f"SimPhyNI version {__version__}")
         sys.exit(0)
     elif args.command == "download-examples":
         download_all_examples()
