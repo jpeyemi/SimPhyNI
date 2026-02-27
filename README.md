@@ -132,7 +132,7 @@ simphyni run --samples samples.csv --cores 16
 
 First, download example cluster scripts:
 ```bash
-simphyni download-cluster-scripts
+simphyni download-cluster-profile
 ```
 
 Edit cluster config file for your computing cluster then install the approprate snakemake executor from the avalible catalog: https://snakemake.github.io/snakemake-plugin-catalog/index.html (slurm shown below): 
