@@ -13,6 +13,18 @@ import os
 
 ### Helper funcs
 
+# Column names that signal marginal-probability uncertainty mode
+_MARGINAL_COLS = frozenset([
+    'gains_marginal', 'losses_marginal',
+    'gain_subsize_marginal', 'loss_subsize_marginal',
+    'dist_marginal', 'loss_dist_marginal', 'root_prob',
+])
+
+def _has_marginal_cols(tp: pd.DataFrame) -> bool:
+    """Return True if the trait params DataFrame carries marginal-uncertainty columns."""
+    return bool(_MARGINAL_COLS & set(tp.columns))
+
+
 def unpack_trait_params(tp: pd.DataFrame):
     gains = np.array(tp['gains'])
     losses = np.array(tp['losses'])
@@ -24,6 +36,30 @@ def unpack_trait_params(tp: pd.DataFrame):
     dists[dists == np.inf] = 0
     loss_dists[loss_dists == np.inf] = 0
     return gains,losses,dists,loss_dists,gain_subsize,loss_subsize,root_states
+
+
+def unpack_trait_params_marginal(tp: pd.DataFrame):
+    """
+    Extract marginal-probability-derived simulation parameters.
+
+    Uses soft gain/loss rates and root probabilities when available;
+    falls back to threshold-mode columns otherwise so the function is
+    always callable regardless of which columns are present.
+    """
+    gains       = np.array(tp.get('gains_marginal',   tp['gains']))
+    losses      = np.array(tp.get('losses_marginal',  tp['losses']))
+    dists       = np.array(tp.get('dist_marginal',    tp['dist']))
+    loss_dists  = np.array(tp.get('loss_dist_marginal', tp['loss_dist']))
+    gain_subsize  = np.array(tp.get('gain_subsize_marginal',  tp['gain_subsize']))
+    loss_subsize  = np.array(tp.get('loss_subsize_marginal',  tp['loss_subsize']))
+    # root_prob: continuous probability; fallback converts hard 0/1 state
+    if 'root_prob' in tp.columns:
+        root_probs = np.array(tp['root_prob'], dtype=float)
+    else:
+        root_probs = np.array(tp['root_state'], dtype=float)
+    dists[dists == np.inf] = 0
+    loss_dists[loss_dists == np.inf] = 0
+    return gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_probs
 
 ### Simulation Methods
 
@@ -43,14 +79,33 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
 
 def sim_bit(tree, trait_params, trials = 64):
     """
-    Simulates trees based off gains and losses inferred on observed data by pastml
-    Sums gains and losses to a total number of events then allocates each event to a 
-    branch on the tree with probability proportional to the length of the branch
-    For each trait only simulates on branches beyond a certain distance from the root, 
-    This threshold is chosen as the first branch where a trait arises in the ancestral trait reconstruction
-    """
+    Simulates trees based off gains and losses inferred on observed data by pastml.
 
-    gains,losses,dists,loss_dists,gain_subsize,loss_subsize,root_states = unpack_trait_params(trait_params)
+    Automatically detects whether `trait_params` carries marginal-probability
+    uncertainty columns (gains_marginal, root_prob, etc.) and switches to
+    marginal mode when they are present.
+
+    Threshold mode (default / no marginal cols)
+    -------------------------------------------
+    Root is initialised to a hard 0/1 state. Gain/loss rates use the hard
+    JOINT-reconstruction event counts.  Emergence thresholds (dist / loss_dist)
+    gate which branches can produce events.
+
+    Marginal mode (marginal cols present)
+    --------------------------------------
+    Root state is *sampled* for each of the 64 simulation trials from
+    Bernoulli(root_prob), propagating reconstruction uncertainty at the root.
+    Rates use soft expected gain/loss counts from MPPA marginal probabilities.
+    Emergence thresholds use the softer dist_marginal / loss_dist_marginal.
+    """
+    use_marginal = _has_marginal_cols(trait_params)
+
+    if use_marginal:
+        gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
+            unpack_trait_params_marginal(trait_params)
+    else:
+        gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
+            unpack_trait_params(trait_params)
 
     # Preprocess and setup
     node_map = {node: ind for ind, node in enumerate(tree.traverse())}
@@ -78,33 +133,38 @@ def sim_bit(tree, trait_params, trials = 64):
     print("Simulating Trees...")
     for node in tree.traverse():
 
-        if node.up == None:
-            root = root_states > 0
-            root_mask = np.zeros(num_traits, dtype=bool)
-            root_mask[root] = True
-            full_mask_value = (1 << trials) - 1
-            sim[node_map[node], root_mask] = full_mask_value
+        if node.up is None:
+            if use_marginal:
+                # Marginal mode: sample each of the 64 trial bits from Bernoulli(root_prob)
+                # root_values contains continuous probabilities in [0, 1]
+                root_bits = (np.random.random((num_traits, bits)) < root_values[:, None]).astype(np.uint8)
+                root_packed = np.packbits(root_bits, axis=-1, bitorder='little').view(nptype).flatten()
+                sim[node_map[node], :] = root_packed
+            else:
+                # Threshold mode: hard 0/1 root state
+                root = root_values > 0
+                root_mask = np.zeros(num_traits, dtype=bool)
+                root_mask[root] = True
+                full_mask_value = (1 << trials) - 1
+                sim[node_map[node], root_mask] = full_mask_value
             continue
-        
-        parent = sim[node_map[node.up], :]
-        node_total_dist = node_dists[node]  # Total distance from the root to the current node
 
-        # Zero out gain and loss rates for traits where the node's distance is less than the specified threshold
+        parent = sim[node_map[node.up], :]
+        node_total_dist = node_dists[node]
+
         applicable_traits_gains = node_total_dist >= dists
-        applicable_traits_losses = node_total_dist >= loss_dists 
+        applicable_traits_losses = node_total_dist >= loss_dists
         gain_events = np.zeros((num_traits), dtype=nptype)
         loss_events = np.zeros((num_traits), dtype=nptype)
         gain_events[applicable_traits_gains] = np.packbits((np.random.poisson(node.dist * gain_rates[applicable_traits_gains, np.newaxis], (applicable_traits_gains.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
         loss_events[applicable_traits_losses] = np.packbits((np.random.poisson(node.dist * loss_rates[applicable_traits_losses, np.newaxis], (applicable_traits_losses.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()
 
         gain_events &= ~parent
-        loss_events &= parent   
+        loss_events &= parent
 
-        updated_state = np.bitwise_or(parent, gain_events)  # Gain new traits
-        updated_state = np.bitwise_and(updated_state, np.bitwise_not(loss_events))  # Remove lost traits
-        sim[node_map[node], :] = updated_state # Store updated node state
-
-        # print(f"Node {node.name} Completed")
+        updated_state = np.bitwise_or(parent, gain_events)
+        updated_state = np.bitwise_and(updated_state, np.bitwise_not(loss_events))
+        sim[node_map[node], :] = updated_state
 
     print("Completed Tree Simulation Sucessfully")
 

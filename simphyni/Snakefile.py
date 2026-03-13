@@ -108,6 +108,15 @@ rule reformat_tree:
     shell:
         'python "{SCRIPTS_DIRECTORY}/reformat_tree.py" "{input.inp}" "{output.out}"'
 
+# reconstruction_method controls which ancestral reconstruction pipeline is used:
+#   'legacy'   -> original pastml CLI + GL_tab.py  (two-step, subprocess-based)
+#   'api'      -> run_ancestral_reconstruction.py  (single-step, Python API)
+# Default: 'api'.  Override with --config reconstruction_method=legacy
+reconstruction_method = config.get('reconstruction_method', 'api')
+uncertainty_mode      = config.get('uncertainty', 'threshold')
+
+# --- Legacy pipeline: pastml CLI + GL_tab aggregation (unchanged) ----------
+
 rule pastml:
     threads: 64
     input:
@@ -148,10 +157,43 @@ rule aggregatepastml:
         'python "{SCRIPTS_DIRECTORY}/GL_tab.py" '
         '"{input.inputsFile}" "{input.tree}" "{params.pastml_folder}" "{output.annotation}"'
 
+# --- API pipeline: single script, Python API, optional marginal uncertainty -
+
+rule ancestral_reconstruction:
+    threads: 64
+    input:
+        inputsFile=rules.reformat_csv.output.out,
+        tree=rules.reformat_tree.output.out
+    output:
+        annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
+    params:
+        outdir=lambda w: os.path.join(base_tmp, w.sample, "1-PastML-api"),
+        max_workers=lambda wildcards, threads: threads,
+        runtype=lambda w: len(run_dict.get(w.sample, []))
+    conda:
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+    shell:
+        'python "{SCRIPTS_DIRECTORY}/run_ancestral_reconstruction.py" '
+        '--inputs_file "{input.inputsFile}" '
+        '--tree_file "{input.tree}" '
+        '--output_csv "{output.annotation}" '
+        '--outdir "{params.outdir}" '
+        '--max_workers {params.max_workers} '
+        '-r {params.runtype} '
+        '--uncertainty ' + uncertainty_mode + ' '
+        '--{prefilter}'
+
+# --- Route SimPhyNI to the selected pipeline output ---------------------
+
+def _pastml_annotation(wildcards):
+    if reconstruction_method == 'legacy':
+        return f"{base_tmp}/{wildcards.sample}/2-Events/pastmlout.csv"
+    return f"{base_tmp}/{wildcards.sample}/1-PastML-api/pastmlout.csv"
+
 rule SimPhyNI:
     threads: 64
     input:
-        pastml=rules.aggregatepastml.output.annotation,
+        pastml=_pastml_annotation,
         systems=rules.reformat_csv.output.out,
         tree=rules.reformat_tree.output.out
     output:
