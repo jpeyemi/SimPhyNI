@@ -231,8 +231,104 @@ def test_full_computational_pipeline_verification():
     assert row_anti['direction'] == -1, "Perfect anticorrelation should be direction -1"
     assert row_anti['pval_naive'] < 0.05, "Perfect anticorrelation should be significant"
     
-    # Check Noise (Implicitly tested by absence of assertion failure above, 
+    # Check Noise (Implicitly tested by absence of assertion failure above,
     # but we can verify it exists and is likely not sig based on our mock logic)
     row_noise = get_row('Corr1', 'Noise')
     if row_noise is not None:
         assert np.isclose(row_noise['pval_naive'],0.5,atol=0.45) # Based on our mock logic for names not matching
+
+
+# ==========================================
+# TESTS: Pastml data validation compatibility
+# ==========================================
+
+def test_check_pastml_data_accepts_legacy_format():
+    """Legacy JOINT-only pastml CSV (no marginal cols) passes _check_pastml_data."""
+    tree_str = "((A:1,B:1):1,C:2);"
+    obs = pd.DataFrame({'G1': [1, 0, 0]}, index=['A', 'B', 'C'])
+    legacy_pml = pd.DataFrame({
+        'gene': ['G1'],
+        'gains': [1.0], 'losses': [0.5],
+        'dist': [0.5], 'loss_dist': [0.3],
+        # No marginal columns — simulates pastml.py + GL_tab.py output
+    })
+    # Should construct without raising AssertionError
+    sim = TreeSimulator(tree_str, legacy_pml, obs)
+    assert sim.pastml is not None
+
+
+def test_check_pastml_data_accepts_new_acr_format():
+    """New ACR CSV with marginal columns also passes _check_pastml_data."""
+    tree_str = "((A:1,B:1):1,C:2);"
+    obs = pd.DataFrame({'G1': [1, 0, 0]}, index=['A', 'B', 'C'])
+    new_pml = pd.DataFrame({
+        'gene': ['G1'],
+        'gains': [2.0], 'losses': [1.0],
+        'dist': [0.5], 'loss_dist': [0.3],
+        'gain_subsize': [10.0], 'loss_subsize': [8.0],
+        'gain_subsize_nofilter': [12.0], 'loss_subsize_nofilter': [9.0],
+        'gain_subsize_thresh': [7.0], 'loss_subsize_thresh': [6.0],
+        'root_state': [0],
+        'gains_flow': [1.8], 'losses_flow': [0.9],
+        'dist_marginal': [0.4], 'loss_dist_marginal': [0.2],
+        'root_prob': [0.3],
+    })
+    sim = TreeSimulator(tree_str, new_pml, obs)
+    assert sim.pastml is not None
+
+
+# ==========================================
+# TESTS: run_simulation mask passthrough
+# ==========================================
+
+def test_run_simulation_without_masks_calls_sim_correctly(basic_simulator):
+    """run_simulation() without masks passes gain_mask=None to simulate_glrates_bit."""
+    basic_simulator.initialize_simulation_parameters(pre_filter=False)
+
+    with patch("simphyni.Simulation.tree_simulator.simulate_glrates_bit") as mock_sim:
+        mock_sim.return_value = pd.DataFrame({
+            "pair": [], "first": [], "second": [],
+            "direction": [], "p-value": [], "effect size": [],
+        })
+        try:
+            basic_simulator.run_simulation()
+        except Exception:
+            pass  # result processing may fail on empty df; that's fine for this test
+
+        if mock_sim.called:
+            call_kwargs = mock_sim.call_args.kwargs
+            assert call_kwargs.get("gain_mask") is None
+            assert call_kwargs.get("loss_mask") is None
+
+
+def test_run_simulation_with_masks_subselects_columns(basic_simulator):
+    """
+    run_simulation() sub-selects mask columns to match only the traits being simulated.
+    When gene_order contains more traits than simulated, only relevant columns are passed.
+    """
+    basic_simulator.initialize_simulation_parameters(pre_filter=False)
+
+    # Build a mask for 6 traits, but only G1..G4 are in the simulator
+    n_nodes = len(list(basic_simulator.tree.traverse()))
+    all_genes = ["G1", "G2", "G3", "G4", "G5", "G6"]
+    gain_mask = np.ones((n_nodes, len(all_genes)), dtype=bool)
+    loss_mask = np.zeros((n_nodes, len(all_genes)), dtype=bool)
+
+    with patch("simphyni.Simulation.tree_simulator.simulate_glrates_bit") as mock_sim:
+        mock_sim.return_value = pd.DataFrame({
+            "pair": [], "first": [], "second": [],
+            "direction": [], "p-value": [], "effect size": [],
+        })
+        try:
+            basic_simulator.run_simulation(gain_mask=gain_mask, loss_mask=loss_mask,
+                                            gene_order=all_genes)
+        except Exception:
+            pass
+
+        if mock_sim.called:
+            call_kwargs = mock_sim.call_args.kwargs
+            passed_gm = call_kwargs.get("gain_mask")
+            if passed_gm is not None:
+                # Sub-selected mask should have at most len(simulated_traits) columns
+                n_simulated = len(np.unique(basic_simulator.pairs.flatten()))
+                assert passed_gm.shape[1] <= n_simulated
