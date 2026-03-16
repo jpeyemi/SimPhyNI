@@ -4,10 +4,11 @@ import pandas as pd
 from ete3 import Tree
 from unittest.mock import MagicMock, patch
 
-# Import your module here. 
+# Import your module here.
 # Assuming the file provided is named 'simulation_methods.py' inside 'simphyni' package
-from simphyni import sim_bit, simulate_glrates_bit, compres
+from simphyni import sim_bit, simulate_glrates_bit, compres, build_sim_params
 from simphyni.Simulation.simulation import unpack_trait_params, circular_bitshift_right, compute_kde_stats, sum_all_bits, compute_bitwise_cooc, process_batch
+from simphyni.scripts.run_ancestral_reconstruction import build_path_mask, label_internal_nodes
 
 # ==========================================
 # 1. FIXTURES: Complex Data Setup
@@ -409,23 +410,23 @@ def test_compres_smoke_test(simple_tree, trait_params):
     """
     # 1. Run the simulation part
     sim_result = sim_bit(simple_tree, trait_params, trials=64)
-    
+
     # 2. Setup inputs for compres
     # We have 2 traits (indices 0 and 1). Let's pair them.
     pairs = np.array([[0, 1]])
     obspairs = np.array([0.5]) # Arbitrary observed value
-    
+
     # 3. Run compres (Force cores=1 to avoid joblib overhead in tests)
     # We mock os.cpu_count to ensure batch logic works even if we force 1 core
     with patch("os.cpu_count", return_value=1):
         df_res = compres(
-            sim=sim_result, 
-            pairs=pairs, 
-            obspairs=obspairs, 
-            batch_size=10, 
+            sim=sim_result,
+            pairs=pairs,
+            obspairs=obspairs,
+            batch_size=10,
             cores=1
         )
-    
+
     # 4. Assertions
     assert isinstance(df_res, pd.DataFrame)
     assert len(df_res) == 1
@@ -433,3 +434,240 @@ def test_compres_smoke_test(simple_tree, trait_params):
     assert "direction" in df_res.columns
     # Check bounds
     assert 0 <= df_res.iloc[0]["p-value"] <= 1
+
+
+# ==========================================
+# 6. PATH MASK: build_path_mask correctness
+# ==========================================
+
+class TestBuildPathMask:
+    """
+    Tests for the path-based upstream presence/absence mask.
+
+    Uses a minimal star tree (root → A, root → B) with hand-crafted
+    marginal probability DataFrames so no PastML run is needed.
+    """
+
+    @pytest.fixture
+    def minimal_tree(self):
+        """Root → A (leaf), Root → B (leaf)."""
+        t = Tree("(A:1.0,B:1.0);")
+        label_internal_nodes(t)
+        return t
+
+    def _mp_df(self, tree, p1_map: dict) -> pd.DataFrame:
+        """Build a marginal_prob_df from a {node_name: p1} dict."""
+        names = [n.name for n in tree.traverse()]
+        p1_vals = [p1_map.get(n, 0.0) for n in names]
+        return pd.DataFrame(
+            {"0": [1 - p for p in p1_vals], "1": p1_vals},
+            index=names,
+        )
+
+    def test_no_upstream_presence_blocks_gains(self, minimal_tree):
+        """Clade with trait never present and no upstream presence → no gains allowed."""
+        # All nodes: P(state=1) = 0 — trait never observed, no upstream context
+        mp = self._mp_df(minimal_tree, {n.name: 0.0 for n in minimal_tree.traverse()})
+        gain_mask, _ = build_path_mask(minimal_tree, {"T": mp}, ["T"])
+        assert not gain_mask[:, 0].any(), \
+            "Gains allowed in fully-absent clade with no upstream presence"
+
+    def test_full_presence_blocks_losses(self, minimal_tree):
+        """Clade with trait always present and no upstream absence → no losses allowed."""
+        # All nodes: P(state=1) = 1 — trait always present, no upstream absence
+        mp = self._mp_df(minimal_tree, {n.name: 1.0 for n in minimal_tree.traverse()})
+        _, loss_mask = build_path_mask(minimal_tree, {"T": mp}, ["T"])
+        assert not loss_mask[:, 0].any(), \
+            "Losses allowed in fully-present clade with no upstream absence"
+
+    def test_first_emergence_allows_gain(self, minimal_tree):
+        """P(parent=0)>0.5 AND P(child=1)>0.5 (first emergence) → gain eligible."""
+        # Root absent (p1=0), leaves present (p1=0.9) — classic first emergence
+        p1_map = {n.name: (0.9 if n.is_leaf() else 0.0) for n in minimal_tree.traverse()}
+        mp = self._mp_df(minimal_tree, p1_map)
+        gain_mask, _ = build_path_mask(minimal_tree, {"T": mp}, ["T"])
+        assert gain_mask[:, 0].any(), "First emergence point not detected as gain-eligible"
+
+    def test_upstream_presence_enables_regain(self):
+        """
+        Re-gain scenario: root present → internal absent → leaf present again.
+        The leaf branch must be gain-eligible because upstream_presence=True
+        (the root had the trait), even though the immediate parent is absent.
+
+        Requires a chain tree (not a star tree) so there is an intermediate node
+        that can go absent between a present ancestor and a present leaf.
+        """
+        chain = Tree("((Leaf:1.0)Internal:1.0)Root;", format=1)
+        label_internal_nodes(chain)
+        # Root present (p1=0.9), Internal absent (p1=0.05), Leaf present again (p1=0.9)
+        p1_map = {"Root": 0.9, "Internal": 0.05, "Leaf": 0.9}
+        mp = self._mp_df(chain, p1_map)
+        gain_mask, _ = build_path_mask(chain, {"T": mp}, ["T"])
+        # The Leaf branch (parent=Internal which is absent, upstream root was present)
+        # should be eligible for a gain
+        assert gain_mask[:, 0].any(), "Re-gain after upstream presence not enabled"
+
+    def test_missing_mp_df_defaults_to_all_eligible(self, minimal_tree):
+        """When mp_df is absent for a trait, all nodes default to fully eligible."""
+        gain_mask, loss_mask = build_path_mask(minimal_tree, {}, ["T"])
+        assert gain_mask[:, 0].all(), "Missing mp_df should default all nodes to gain-eligible"
+        assert loss_mask[:, 0].all(), "Missing mp_df should default all nodes to loss-eligible"
+
+
+# ==========================================
+# 7. BUILD_SIM_PARAMS: column selection
+# ==========================================
+
+@pytest.fixture
+def wide_params():
+    """
+    One-row DataFrame containing all columns that count_joint_stats +
+    count_all_marginal_stats produce (standard + marginal + entropy variants).
+    Values are arbitrary non-zero floats so we can verify mapping.
+    """
+    data = {
+        # Standard JOINT columns
+        "gene": ["GeneA"],
+        "gains": [2.0], "losses": [1.0],
+        "dist": [0.5], "loss_dist": [0.3],
+        "gain_subsize": [10.0], "loss_subsize": [8.0],
+        "gain_subsize_nofilter": [12.0], "loss_subsize_nofilter": [9.0],
+        "gain_subsize_thresh": [7.0], "loss_subsize_thresh": [6.0],
+        "root_state": [0],
+        # FLOW / MARKOV / ENTROPY gain columns
+        "gains_flow": [1.8], "losses_flow": [0.9],
+        "gains_markov": [1.5], "losses_markov": [0.7],
+        "gains_entropy": [1.2], "losses_entropy": [0.6],
+        # Marginal subsize variants
+        "gain_subsize_marginal": [9.0], "loss_subsize_marginal": [7.5],
+        "gain_subsize_marginal_nofilter": [11.0], "loss_subsize_marginal_nofilter": [8.5],
+        "gain_subsize_marginal_thresh": [6.5], "loss_subsize_marginal_thresh": [5.5],
+        # Entropy subsize variants
+        "gain_subsize_entropy": [4.0], "loss_subsize_entropy": [3.5],
+        "gain_subsize_entropy_nofilter": [5.0], "loss_subsize_entropy_nofilter": [4.5],
+        "gain_subsize_entropy_thresh": [3.0], "loss_subsize_entropy_thresh": [2.5],
+        # Marginal dist and root prob
+        "dist_marginal": [0.4], "loss_dist_marginal": [0.2],
+        "root_prob": [0.3],
+    }
+    return pd.DataFrame(data)
+
+
+def test_build_sim_params_joint_original(wide_params):
+    """JOINT+ORIGINAL maps standard columns unchanged."""
+    out = build_sim_params(wide_params, counting="JOINT", subsize="ORIGINAL")
+    assert out["gains"].iloc[0] == pytest.approx(2.0)
+    assert out["gain_subsize"].iloc[0] == pytest.approx(10.0)
+    assert out["dist"].iloc[0] == pytest.approx(0.5)
+    assert out["root_state"].iloc[0] == 0
+
+
+def test_build_sim_params_flow_original(wide_params):
+    """FLOW+ORIGINAL maps flow columns into the standard output names."""
+    out = build_sim_params(wide_params, counting="FLOW", subsize="ORIGINAL")
+    assert out["gains"].iloc[0] == pytest.approx(1.8)        # from gains_flow
+    assert out["gain_subsize"].iloc[0] == pytest.approx(9.0)  # from gain_subsize_marginal
+    assert out["dist"].iloc[0] == pytest.approx(0.4)          # from dist_marginal
+
+
+def test_build_sim_params_entropy_thresh(wide_params):
+    """ENTROPY+THRESH maps entropy counting + thresh subsize."""
+    out = build_sim_params(wide_params, counting="ENTROPY", subsize="THRESH")
+    assert out["gains"].iloc[0] == pytest.approx(1.2)        # from gains_entropy
+    assert out["gain_subsize"].iloc[0] == pytest.approx(3.0)  # from gain_subsize_entropy_thresh
+
+
+def test_build_sim_params_no_threshold_zeros_dist(wide_params):
+    """no_threshold=True sets dist and loss_dist to 0 regardless of input."""
+    out = build_sim_params(wide_params, counting="JOINT", subsize="ORIGINAL", no_threshold=True)
+    assert out["dist"].iloc[0] == 0.0
+    assert out["loss_dist"].iloc[0] == 0.0
+
+
+def test_build_sim_params_root_state_from_root_prob(wide_params):
+    """Non-JOINT counting uses root_prob ≥ 0.5 → root_state."""
+    # root_prob = 0.3 → root_state = 0
+    out = build_sim_params(wide_params, counting="FLOW", subsize="ORIGINAL")
+    assert out["root_state"].iloc[0] == 0
+
+    wide_params["root_prob"] = 0.8  # above threshold
+    out2 = build_sim_params(wide_params, counting="FLOW", subsize="ORIGINAL")
+    assert out2["root_state"].iloc[0] == 1
+
+
+def test_build_sim_params_markov_nofilter(wide_params):
+    """MARKOV+NO_FILTER maps to the nofilter subsize columns."""
+    out = build_sim_params(wide_params, counting="MARKOV", subsize="NO_FILTER")
+    assert out["gain_subsize"].iloc[0] == pytest.approx(11.0)  # gain_subsize_marginal_nofilter
+
+
+def test_build_sim_params_output_feeds_sim_bit(simple_tree, wide_params):
+    """build_sim_params output is accepted by sim_bit without error."""
+    out = build_sim_params(wide_params, counting="JOINT", subsize="ORIGINAL")
+    out.index = ["GeneA"]
+    # Should run without raising
+    result = sim_bit(simple_tree, out, trials=64)
+    # sim_bit returns one row per leaf tip (iterating `tree` yields leaves in ETE3)
+    assert result.shape[0] == len(simple_tree.get_leaves())
+
+
+# ---------------------------------------------------------------------------
+# Additional build_sim_params coverage: all counting × subsize combos
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("counting,subsize,expected_gains,expected_subsize", [
+    ("JOINT",   "ORIGINAL",  2.0,  10.0),
+    ("JOINT",   "NO_FILTER", 2.0,  12.0),
+    ("JOINT",   "THRESH",    2.0,   7.0),
+    ("FLOW",    "ORIGINAL",  1.8,   9.0),
+    ("FLOW",    "NO_FILTER", 1.8,  11.0),
+    ("FLOW",    "THRESH",    1.8,   6.5),
+    ("MARKOV",  "ORIGINAL",  1.5,   9.0),
+    ("MARKOV",  "NO_FILTER", 1.5,  11.0),
+    ("MARKOV",  "THRESH",    1.5,   6.5),
+    ("ENTROPY", "ORIGINAL",  1.2,   4.0),
+    ("ENTROPY", "NO_FILTER", 1.2,   5.0),
+    ("ENTROPY", "THRESH",    1.2,   3.0),
+])
+def test_build_sim_params_all_combinations(wide_params, counting, subsize,
+                                            expected_gains, expected_subsize):
+    """Every counting × subsize combination maps to the correct source column."""
+    out = build_sim_params(wide_params, counting=counting, subsize=subsize)
+    assert out["gains"].iloc[0] == pytest.approx(expected_gains), \
+        f"{counting}+{subsize}: gains mismatch"
+    assert out["gain_subsize"].iloc[0] == pytest.approx(expected_subsize), \
+        f"{counting}+{subsize}: gain_subsize mismatch"
+
+
+@pytest.mark.parametrize("counting,expected_dist", [
+    ("JOINT",   0.5),
+    ("FLOW",    0.4),
+    ("MARKOV",  0.4),
+    ("ENTROPY", 0.4),
+])
+def test_build_sim_params_dist_columns(wide_params, counting, expected_dist):
+    """JOINT uses dist; FLOW/MARKOV/ENTROPY use dist_marginal."""
+    out = build_sim_params(wide_params, counting=counting, subsize="ORIGINAL")
+    assert out["dist"].iloc[0] == pytest.approx(expected_dist), \
+        f"{counting}: dist mismatch"
+
+
+def test_build_sim_params_legacy_joint_only():
+    """Legacy JOINT-only DataFrame (no marginal columns) passes through cleanly."""
+    legacy = pd.DataFrame({
+        "gene": ["G1"],
+        "gains": [3.0], "losses": [1.5],
+        "dist": [0.6], "loss_dist": [0.4],
+        "gain_subsize": [15.0], "loss_subsize": [12.0],
+        "gain_subsize_nofilter": [18.0], "loss_subsize_nofilter": [14.0],
+        "gain_subsize_thresh": [10.0], "loss_subsize_thresh": [8.0],
+        "root_state": [1],
+        # No gains_flow, no marginal columns — simulates old pastml + GL_tab output
+    })
+    out = build_sim_params(legacy, counting="JOINT", subsize="ORIGINAL")
+    assert out["gains"].iloc[0] == pytest.approx(3.0)
+    assert out["dist"].iloc[0] == pytest.approx(0.6)
+    assert out["root_state"].iloc[0] == 1
+    # All required base columns must be present
+    for col in ("gains", "losses", "gain_subsize", "loss_subsize", "dist", "loss_dist", "root_state"):
+        assert col in out.columns

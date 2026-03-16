@@ -113,7 +113,25 @@ rule reformat_tree:
 #   'api'      -> run_ancestral_reconstruction.py  (single-step, Python API)
 # Default: 'api'.  Override with --config reconstruction_method=legacy
 reconstruction_method = config.get('reconstruction_method', 'api')
-uncertainty_mode      = config.get('uncertainty', 'threshold')
+
+# uncertainty controls what run_ancestral_reconstruction.py writes to the ACR CSV,
+# which in turn determines which counting method runSimPhyNI.py can use:
+#
+#   'marginal' (default) — runs JOINT + MPPA reconstruction; writes the full
+#              wide-format CSV including gains_flow, gains_markov, gains_entropy,
+#              marginal subsizes, dist_marginal, root_prob, etc.
+#              runSimPhyNI.py detects gains_flow and selects FLOW counting
+#              (the recommended, best-calibrated method per benchmark_reconstruction.py).
+#
+#   'threshold' — runs JOINT reconstruction only; writes only the JOINT columns
+#              (gains, losses, gain_subsize, dist, …).  runSimPhyNI.py falls back
+#              to JOINT counting.  Use for legacy-compatible output or to reproduce
+#              pre-marginal pipeline results.
+#
+#   'both'     — identical to 'marginal'; retained for backward compatibility only.
+#
+# Override the default: --config uncertainty=threshold
+uncertainty_mode = config.get('uncertainty', 'marginal')
 
 # --- Legacy pipeline: pastml CLI + GL_tab aggregation (unchanged) ----------
 
@@ -132,7 +150,7 @@ rule pastml:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
         # Note: We do not typically quote flags (e.g. --{prefilter}), only their values if they exist
-        'python "{SCRIPTS_DIRECTORY}/pastml.py" '
+        'python "{SCRIPTS_DIRECTORY}/run_pastml.py" '
         '--inputs_file "{input.inputsFile}" '
         '--tree_file "{input.tree}" '
         '--outdir "{params.outdir}" '
@@ -167,7 +185,6 @@ rule ancestral_reconstruction:
     output:
         annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
     params:
-        outdir=lambda w: os.path.join(base_tmp, w.sample, "1-PastML-api"),
         max_workers=lambda wildcards, threads: threads,
         runtype=lambda w: len(run_dict.get(w.sample, []))
     conda:
@@ -177,7 +194,6 @@ rule ancestral_reconstruction:
         '--inputs_file "{input.inputsFile}" '
         '--tree_file "{input.tree}" '
         '--output_csv "{output.annotation}" '
-        '--outdir "{params.outdir}" '
         '--max_workers {params.max_workers} '
         '-r {params.runtype} '
         '--uncertainty ' + uncertainty_mode + ' '

@@ -1,8 +1,86 @@
+"""
+simulation.py — SimPhyNI trait co-evolution simulation engine
+=============================================================
+
+Pipeline overview
+-----------------
+1. **Ancestral reconstruction** (``run_ancestral_reconstruction.py``)
+   Runs PastML JOINT and/or MPPA reconstruction for each trait, then counts
+   gains, losses, subsizes, emergence thresholds, and marginal probabilities.
+   Outputs a CSV with both legacy JOINT columns and (optionally) marginal columns.
+
+2. **Parameter normalisation** (``build_sim_params()``)
+   Selects the appropriate counting and subsize columns from the ACR CSV and
+   renames them to the canonical base names used by ``sim_bit()``.
+   Call signature::
+
+       trait_params = build_sim_params(df, counting='FLOW', subsize='ORIGINAL')
+
+3. **Bit-packed simulation** (``sim_bit()``)
+   Simulates gain/loss events along every branch of the tree using Poisson
+   sampling, packing 64 independent trials into a single uint64 per node × trait.
+
+4. **Result compilation** (``compres()`` via ``simulate_glrates_bit()``)
+   Computes KDE-based p-values for each observed pair against its simulated
+   null distribution and applies multiple-testing correction.
+
+Counting methods
+----------------
+The active counting method is determined automatically by ``runSimPhyNI.py``
+based on the columns present in the ACR CSV:
+
+  ACR run with ``--uncertainty marginal`` (Snakefile default)
+      → writes ``gains_flow`` + all marginal columns
+      → ``runSimPhyNI.py`` selects **FLOW** counting
+
+  ACR run with ``--uncertainty threshold`` (legacy)
+      → writes only JOINT columns; ``gains_flow`` absent
+      → ``runSimPhyNI.py`` falls back to **JOINT** counting
+
+All four methods are available via ``build_sim_params(df, counting, subsize)``:
+
+FLOW (pipeline default)
+    Soft probability-flow rates: Σ max(0, P(child=1) − P(parent=1)) over
+    all branches.  Active when ACR was run with ``--uncertainty marginal``
+    (the Snakefile default).  Best-calibrated per ``dev/benchmark_reconstruction.py``.
+    Source columns: ``gains_flow``, ``losses_flow``, marginal subsize and dist variants.
+
+JOINT (legacy fallback)
+    Discrete gain/loss events counted from the JOINT ML ancestral state
+    reconstruction.  Active when ACR was run with ``--uncertainty threshold``
+    or via the legacy pastml CLI pipeline.
+    Source columns: ``gains``, ``losses``, ``gain_subsize``, ``loss_subsize``,
+    ``dist``, ``loss_dist``.
+
+MARKOV
+    Branch-length-weighted Markov transition rates:
+    Σ P(parent=0) × P(child=1) × branch_length.
+    Uses the same marginal subsize/distance columns as FLOW.
+
+ENTROPY
+    FLOW rates weighted by parent certainty (1 − H(parent)).
+    Uses entropy-specific subsize columns.
+
+Subsize variants (``subsize`` parameter)
+-----------------------------------------
+ORIGINAL  — P-weighted subsize with IQR outlier filtering (pipeline default)
+NO_FILTER — P-weighted subsize without outlier cap
+THRESH    — Only branches downstream of the first emergence event
+
+Development / benchmarking
+--------------------------
+All 36 counting × subsize × masking combinations are explored in
+``dev/benchmark_reconstruction.py`` using ``_build_method_specs()`` +
+``build_all_method_dfs()``.  The ACR CSV is produced once with
+``uncertainty='marginal'``; all method variants are derived from it by column
+selection via ``build_sim_params()`` — no re-running ACR per combination.
+"""
+
 from typing import List
 import numpy as np
 import pandas as pd
 from ete3 import Tree
-from joblib import Parallel, delayed, parallel_backend, Memory
+from joblib import Parallel, delayed
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 import seaborn as sns
@@ -12,17 +90,6 @@ import os
 
 
 ### Helper funcs
-
-# Column names that signal marginal-probability uncertainty mode
-_MARGINAL_COLS = frozenset([
-    'gains_marginal', 'losses_marginal',
-    'gain_subsize_marginal', 'loss_subsize_marginal',
-    'dist_marginal', 'loss_dist_marginal', 'root_prob',
-])
-
-def _has_marginal_cols(tp: pd.DataFrame) -> bool:
-    """Return True if the trait params DataFrame carries marginal-uncertainty columns."""
-    return bool(_MARGINAL_COLS & set(tp.columns))
 
 
 def unpack_trait_params(tp: pd.DataFrame):
@@ -38,34 +105,126 @@ def unpack_trait_params(tp: pd.DataFrame):
     return gains,losses,dists,loss_dists,gain_subsize,loss_subsize,root_states
 
 
-def unpack_trait_params_marginal(tp: pd.DataFrame):
-    """
-    Extract marginal-probability-derived simulation parameters.
+# ---------------------------------------------------------------------------
+# build_sim_params: standardise columns for any counting/subsize/masking combo
+# ---------------------------------------------------------------------------
 
-    Uses soft gain/loss rates and root probabilities when available;
-    falls back to threshold-mode columns otherwise so the function is
-    always callable regardless of which columns are present.
+_GAIN_COL = {
+    'JOINT':   'gains',
+    'FLOW':    'gains_flow',
+    'MARKOV':  'gains_markov',
+    'ENTROPY': 'gains_entropy',
+}
+_LOSS_COL = {
+    'JOINT':   'losses',
+    'FLOW':    'losses_flow',
+    'MARKOV':  'losses_markov',
+    'ENTROPY': 'losses_entropy',
+}
+_GAIN_SUB_COL = {
+    ('JOINT',   'ORIGINAL'):  'gain_subsize',
+    ('JOINT',   'NO_FILTER'): 'gain_subsize_nofilter',
+    ('JOINT',   'THRESH'):    'gain_subsize_thresh',
+    ('FLOW',    'ORIGINAL'):  'gain_subsize_marginal',
+    ('FLOW',    'NO_FILTER'): 'gain_subsize_marginal_nofilter',
+    ('FLOW',    'THRESH'):    'gain_subsize_marginal_thresh',
+    ('MARKOV',  'ORIGINAL'):  'gain_subsize_marginal',
+    ('MARKOV',  'NO_FILTER'): 'gain_subsize_marginal_nofilter',
+    ('MARKOV',  'THRESH'):    'gain_subsize_marginal_thresh',
+    ('ENTROPY', 'ORIGINAL'):  'gain_subsize_entropy',
+    ('ENTROPY', 'NO_FILTER'): 'gain_subsize_entropy_nofilter',
+    ('ENTROPY', 'THRESH'):    'gain_subsize_entropy_thresh',
+}
+_LOSS_SUB_COL = {k: v.replace('gain', 'loss') for k, v in _GAIN_SUB_COL.items()}
+
+_DIST_COL = {
+    'JOINT':   ('dist',         'loss_dist'),
+    'FLOW':    ('dist_marginal', 'loss_dist_marginal'),
+    'MARKOV':  ('dist_marginal', 'loss_dist_marginal'),
+    'ENTROPY': ('dist_marginal', 'loss_dist_marginal'),
+}
+
+
+def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
+                     no_threshold: bool = False) -> pd.DataFrame:
     """
-    gains       = np.array(tp.get('gains_marginal',   tp['gains']))
-    losses      = np.array(tp.get('losses_marginal',  tp['losses']))
-    dists       = np.array(tp.get('dist_marginal',    tp['dist']))
-    loss_dists  = np.array(tp.get('loss_dist_marginal', tp['loss_dist']))
-    gain_subsize  = np.array(tp.get('gain_subsize_marginal',  tp['gain_subsize']))
-    loss_subsize  = np.array(tp.get('loss_subsize_marginal',  tp['loss_subsize']))
-    # root_prob: continuous probability; fallback converts hard 0/1 state
-    if 'root_prob' in tp.columns:
-        root_probs = np.array(tp['root_prob'], dtype=float)
+    Build a standardised trait_params DataFrame for sim_bit by selecting the
+    appropriate counting and subsize columns for a given method combination.
+
+    Output always uses the base column names (gains, losses, gain_subsize,
+    loss_subsize, dist, loss_dist, root_state) so sim_bit's standard unpacker
+    is used regardless of which ACR columns were selected.
+
+    Parameters
+    ----------
+    df            : wide-format params DataFrame produced by
+                    ``run_ancestral_reconstruction.py`` (all columns present),
+                    or a legacy pastml CSV (JOINT columns only).
+    counting      : 'JOINT' | 'FLOW' | 'MARKOV' | 'ENTROPY'
+    subsize       : 'ORIGINAL' | 'NO_FILTER' | 'THRESH'
+    no_threshold  : if True, set dist = loss_dist = 0.0 (no emergence gate)
+
+    Column mapping reference
+    ------------------------
+    counting  subsize     gains col        loss col        gain_subsize col
+    --------  ----------  ---------------  --------------  --------------------------
+    JOINT     ORIGINAL    gains            losses          gain_subsize
+    JOINT     NO_FILTER   gains            losses          gain_subsize_nofilter
+    JOINT     THRESH      gains            losses          gain_subsize_thresh
+    FLOW      ORIGINAL    gains_flow       losses_flow     gain_subsize_marginal
+    FLOW      NO_FILTER   gains_flow       losses_flow     gain_subsize_marginal_nofilter
+    FLOW      THRESH      gains_flow       losses_flow     gain_subsize_marginal_thresh
+    MARKOV    ORIGINAL    gains_markov     losses_markov   gain_subsize_marginal
+    MARKOV    NO_FILTER   gains_markov     losses_markov   gain_subsize_marginal_nofilter
+    MARKOV    THRESH      gains_markov     losses_markov   gain_subsize_marginal_thresh
+    ENTROPY   ORIGINAL    gains_entropy    losses_entropy  gain_subsize_entropy
+    ENTROPY   NO_FILTER   gains_entropy    losses_entropy  gain_subsize_entropy_nofilter
+    ENTROPY   THRESH      gains_entropy    losses_entropy  gain_subsize_entropy_thresh
+
+    Distance columns (dist / loss_dist):
+      JOINT   → dist, loss_dist
+      FLOW / MARKOV / ENTROPY → dist_marginal, loss_dist_marginal
+
+    Root state:
+      JOINT   → root_state (int)
+      others  → root_prob >= 0.5 thresholded to 0/1 (falls back to root_state
+                if root_prob column absent)
+    """
+    src = df.set_index('gene') if 'gene' in df.columns else df
+
+    out = pd.DataFrame(index=range(len(src)))
+    if 'gene' in df.columns:
+        out.insert(0, 'gene', df['gene'].values)
+
+    out['gains']        = src[_GAIN_COL[counting]].values
+    out['losses']       = src[_LOSS_COL[counting]].values
+    out['gain_subsize'] = src[_GAIN_SUB_COL[(counting, subsize)]].values
+    out['loss_subsize'] = src[_LOSS_SUB_COL[(counting, subsize)]].values
+
+    dist_col, loss_dist_col = _DIST_COL[counting]
+    if no_threshold:
+        out['dist']      = 0.0
+        out['loss_dist'] = 0.0
     else:
-        root_probs = np.array(tp['root_state'], dtype=float)
-    dists[dists == np.inf] = 0
-    loss_dists[loss_dists == np.inf] = 0
-    return gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_probs
+        out['dist']      = src[dist_col].replace([np.inf], 0.0).values
+        out['loss_dist'] = src[loss_dist_col].replace([np.inf], 0.0).values
+
+    # Root state: for marginal counting methods use root_prob thresholded at 0.5
+    if counting != 'JOINT' and 'root_prob' in src.columns:
+        out['root_state'] = (src['root_prob'].values >= 0.5).astype(int)
+    else:
+        out['root_state'] = src['root_state'].values.astype(int)
+
+    return out
+
 
 ### Simulation Methods
 
-def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1):
-    
-    sim = sim_bit(tree=tree,trait_params=trait_params, trials = 64)
+def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
+                         gain_mask=None, loss_mask=None):
+
+    sim = sim_bit(tree=tree, trait_params=trait_params, trials=64,
+                  gain_mask=gain_mask, loss_mask=loss_mask)
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
@@ -77,35 +236,56 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
     return res
 
 
-def sim_bit(tree, trait_params, trials = 64):
+def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None):
     """
-    Simulates trees based off gains and losses inferred on observed data by pastml.
+    Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
-    Automatically detects whether `trait_params` carries marginal-probability
-    uncertainty columns (gains_marginal, root_prob, etc.) and switches to
-    marginal mode when they are present.
+    Recommended call path::
 
-    Threshold mode (default / no marginal cols)
-    -------------------------------------------
-    Root is initialised to a hard 0/1 state. Gain/loss rates use the hard
-    JOINT-reconstruction event counts.  Emergence thresholds (dist / loss_dist)
-    gate which branches can produce events.
+        trait_params = build_sim_params(acr_df, counting='FLOW', subsize='ORIGINAL')
+        lineages = sim_bit(tree, trait_params)
 
-    Marginal mode (marginal cols present)
-    --------------------------------------
-    Root state is *sampled* for each of the 64 simulation trials from
-    Bernoulli(root_prob), propagating reconstruction uncertainty at the root.
-    Rates use soft expected gain/loss counts from MPPA marginal probabilities.
-    Emergence thresholds use the softer dist_marginal / loss_dist_marginal.
+    ``build_sim_params`` normalises any counting/subsize combination into the
+    canonical column names (gains, losses, gain_subsize, loss_subsize, dist,
+    loss_dist, root_state) expected here.
+
+    Operating modes
+    ---------------
+    1. **Mask mode** — ``gain_mask`` / ``loss_mask`` provided (n_nodes × n_traits bool)
+       Per-node, per-trait eligibility built by ``build_path_mask()`` from
+       ``run_ancestral_reconstruction.py``.  Each node is gated individually
+       based on its ancestral lineage rather than a single global distance.
+       Use this for the ENTROPY counting method or when fine-grained path-based
+       masking is desired.
+
+    2. **Distance mode** — no mask provided; dist / loss_dist > 0 in trait_params
+       A global cumulative-distance threshold gates eligible branches: a branch
+       at total depth ``d`` from the root is eligible for a gain event only if
+       ``d >= dist``.  Thresholds are inferred from ACR output and stored in the
+       params DataFrame by ``run_ancestral_reconstruction.py``.
+
+    3. **No-threshold mode** — no mask; dist = loss_dist = 0 (via
+       ``build_sim_params(..., no_threshold=True)``)
+       Every branch is eligible from the root, equivalent to a fully homogeneous
+       Poisson process with no emergence constraint.
+
+    Parameters
+    ----------
+    tree         : ETE3 Tree (internal nodes must be labelled before calling)
+    trait_params : DataFrame indexed by gene; canonical column names expected.
+                   Prepare with ``build_sim_params(df, counting, subsize, no_threshold)``.
+    trials       : ignored (always 64 for bit-packing); kept for API compatibility
+    gain_mask    : optional (n_nodes, n_traits) bool array — Mask mode
+    loss_mask    : optional (n_nodes, n_traits) bool array — Mask mode
+
+    Returns
+    -------
+    lineages : np.ndarray (n_tips, n_traits) dtype=uint64
+        Each uint64 encodes 64 independent simulated tip states as bit flags.
     """
-    use_marginal = _has_marginal_cols(trait_params)
-
-    if use_marginal:
-        gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
-            unpack_trait_params_marginal(trait_params)
-    else:
-        gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
-            unpack_trait_params(trait_params)
+    gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
+        unpack_trait_params(trait_params)
+    use_mask = (gain_mask is not None) and (loss_mask is not None)
 
     # Preprocess and setup
     node_map = {node: ind for ind, node in enumerate(tree.traverse())}
@@ -134,26 +314,27 @@ def sim_bit(tree, trait_params, trials = 64):
     for node in tree.traverse():
 
         if node.up is None:
-            if use_marginal:
-                # Marginal mode: sample each of the 64 trial bits from Bernoulli(root_prob)
-                # root_values contains continuous probabilities in [0, 1]
-                root_bits = (np.random.random((num_traits, bits)) < root_values[:, None]).astype(np.uint8)
-                root_packed = np.packbits(root_bits, axis=-1, bitorder='little').view(nptype).flatten()
-                sim[node_map[node], :] = root_packed
-            else:
-                # Threshold mode: hard 0/1 root state
-                root = root_values > 0
-                root_mask = np.zeros(num_traits, dtype=bool)
-                root_mask[root] = True
-                full_mask_value = (1 << trials) - 1
-                sim[node_map[node], root_mask] = full_mask_value
+            # Root state: hard 0/1 (build_sim_params thresholds root_prob at 0.5)
+            root = root_values > 0
+            root_mask = np.zeros(num_traits, dtype=bool)
+            root_mask[root] = True
+            full_mask_value = (1 << trials) - 1
+            sim[node_map[node], root_mask] = full_mask_value
             continue
 
         parent = sim[node_map[node.up], :]
         node_total_dist = node_dists[node]
 
-        applicable_traits_gains = node_total_dist >= dists
-        applicable_traits_losses = node_total_dist >= loss_dists
+        if use_mask:
+            # Mask mode: per-node, per-trait eligibility from entropy mask
+            node_idx = node_map[node]
+            applicable_traits_gains  = gain_mask[node_idx, :]
+            applicable_traits_losses = loss_mask[node_idx, :]
+        else:
+            # Distance mode: global threshold gate
+            applicable_traits_gains  = node_total_dist >= dists
+            applicable_traits_losses = node_total_dist >= loss_dists
+
         gain_events = np.zeros((num_traits), dtype=nptype)
         loss_events = np.zeros((num_traits), dtype=nptype)
         gain_events[applicable_traits_gains] = np.packbits((np.random.poisson(node.dist * gain_rates[applicable_traits_gains, np.newaxis], (applicable_traits_gains.sum(), trials)) > 0).astype(np.uint8),axis=-1, bitorder='little').view(nptype).flatten()

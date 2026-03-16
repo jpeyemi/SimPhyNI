@@ -312,16 +312,40 @@ class TreeSimulator:
 
         return valid_pairs, stats
 
-    def run_simulation(self, cores = -1):
+    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None):
         """
         Runs the tree simulation and stores results.
+
+        :param gain_mask: Optional boolean array (n_nodes, n_traits) — per-node gain eligibility.
+                          Must be aligned to gene_order (the full ordered list of trait names used
+                          when the mask was built). Columns are sub-selected automatically for the
+                          traits actually simulated.
+        :param loss_mask: Matching loss eligibility mask.
+        :param gene_order: List of trait names corresponding to mask columns.
         """
-        self._simulate_and_evaluate(cores)
-    
-    def _simulate_and_evaluate(self,alpha = 0.05,cores=-1):
+        self._gain_mask  = gain_mask
+        self._loss_mask  = loss_mask
+        self._gene_order = gene_order or []
+        self._simulate_and_evaluate(cores=cores)
+
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1):
         traits_to_simulate = np.unique(self.pairs.flatten())
         traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
-        self.simulation_result = simulate_glrates_bit(tree = self.tree, trait_params = traits_to_simulate_pastml, pairs = self.pairs, obspairs=self.obspairs, cores = cores)
+
+        # Sub-select mask columns for the traits being simulated
+        gm = lm = None
+        if getattr(self, '_gain_mask', None) is not None and self._gene_order:
+            col_idx = [self._gene_order.index(g) for g in traits_to_simulate
+                       if g in self._gene_order]
+            if col_idx:
+                gm = self._gain_mask[:, col_idx]
+                lm = self._loss_mask[:, col_idx]
+
+        self.simulation_result = simulate_glrates_bit(
+            tree=self.tree, trait_params=traits_to_simulate_pastml,
+            pairs=self.pairs, obspairs=self.obspairs, cores=cores,
+            gain_mask=gm, loss_mask=lm,
+        )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
         self._multiple_test_correction(alpha)
