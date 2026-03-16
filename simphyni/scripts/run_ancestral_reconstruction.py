@@ -57,7 +57,7 @@ selection — no re-running ACR per method combination.
 import argparse
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -201,7 +201,7 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
     loss_dist = float("inf")   # first loss distance from root
     gain_subsize = 0.0
     loss_subsize = 0.0
-    gain_subsize_nofilter = 0.0   # same but without upper_bound outlier cap
+    gain_subsize_nofilter = 0.0
     loss_subsize_nofilter = 0.0
     node_data = {}  # node.name -> (num_gains, num_losses)
 
@@ -250,10 +250,7 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
 
     gains, losses = node_data.get(root_node.name, (0, 0))
 
-    # Second pass: threshold-consistent subsizes — only count branches that are
-    # actually eligible for gain/loss events in sim_bit (node_dist >= dist/loss_dist).
-    # Using the full gain_subsize (which includes pre-emergence state-0 branches) as the
-    # rate denominator causes rate dilution and miscalibrated null distributions.
+    # Second pass: threshold-consistent subsizes
     gain_subsize_thresh = 0.0
     loss_subsize_thresh = 0.0
     for node in tree.traverse():
@@ -262,9 +259,9 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
         nd = node_dists[node.name]
         s, _ = _state(node)
         if node.dist < upper_bound:
-            if s == 0 and nd >= dist:        # post-emergence and state eligible for gain
+            if s == 0 and nd >= dist:
                 gain_subsize_thresh += node.dist
-            if s == 1 and nd >= loss_dist:   # post-emergence and state eligible for loss
+            if s == 1 and nd >= loss_dist:
                 loss_subsize_thresh += node.dist
 
     return {
@@ -297,36 +294,18 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
                               upper_bound: float, p_threshold: float = 0.5,
                               node_dists: dict | None = None) -> dict:
     """
-    Compute ALL marginal counting and subsize variants in two passes over pre-built data.
+    Compute ALL marginal counting and subsize variants in a single pass.
 
-    Counting methods
-    ----------------
-    FLOW   gains_flow   = Σ max(0, P(child=1) − P(parent=1))
-    MARKOV gains_markov = Σ P(parent=0) × P(child=1) × bl   (branch-length weighted)
-    ENTROPY gains_entropy = Σ flow_gain × (1 − H(parent))   (entropy-certainty weighted)
-
-    Subsize denominator variants
-    ----------------------------
-    For FLOW / MARKOV (P-weighted):
-      marginal          = Σ P(parent=0) × min(bl, upper_bound)   [outlier-filtered]
-      marginal_nofilter = Σ P(parent=0) × bl                     [no filter]
-      marginal_thresh   = above, restricted to edges downstream of dist_marginal
-    For ENTROPY (P × certainty-weighted):
-      entropy           = Σ P(parent=0) × (1−H) × min(bl, upper_bound)
-      entropy_nofilter  = Σ P(parent=0) × (1−H) × bl
-      entropy_thresh    = above, restricted to edges downstream of dist_marginal
-
-    Also returns: dist_marginal, loss_dist_marginal, root_prob
-
-    node_dists : optional pre-computed {node.name: dist_from_root} dict;
-                 computed internally when not provided.
+    node_dists : pre-computed {node.name: dist_from_root} dict.
+                 NOTE: safe to reuse from the JOINT tree because both trees
+                 share identical topology and branch lengths (same newick source,
+                 only internal annotations differ after acr()).
     """
     if node_dists is None:
         node_dists = _node_dists_from_root(tree)
 
-    # Pre-compute node_name → P(state=1) mapping to avoid per-edge DataFrame lookups
-    mp_df = mp_df.copy()
-    mp_df.columns = [str(c) for c in mp_df.columns]
+    mp_df = mp_df.rename(columns=str)
+
     p1_map: dict[str, float] = {
         name: float(row.get("1", row.get(1, np.nan)))
         for name, row in mp_df.iterrows()
@@ -337,7 +316,6 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     if np.isnan(root_prob):
         root_prob = 0.0
 
-    # First-pass accumulators
     gains_flow = losses_flow = 0.0
     gains_markov = losses_markov = 0.0
     gains_entropy = losses_entropy = 0.0
@@ -345,11 +323,13 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     gain_subsize_marginal_nofilter = loss_subsize_marginal_nofilter = 0.0
     gain_subsize_entropy = loss_subsize_entropy = 0.0
     gain_subsize_entropy_nofilter = loss_subsize_entropy_nofilter = 0.0
+    gain_subsize_marginal_thresh = loss_subsize_marginal_thresh = 0.0
+    gain_subsize_entropy_thresh  = loss_subsize_entropy_thresh  = 0.0
     dist_m = float("inf")
     loss_dist_m = float("inf")
 
-    # Cache filtered-edge data for thresh subsize computation (avoids second traversal)
-    _thresh_cache: list = []   # (nd, p0_parent, p1_parent, cert, effective_bl)
+    # First pass: accumulate all stats except thresh (dist_m not yet known)
+    edge_data: list = []  # (nd, p0_parent, p1_parent, cert, effective_bl) for thresh pass
 
     for node in tree.traverse():
         if node.is_root():
@@ -371,17 +351,17 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
         gains_flow  += gain_flow
         losses_flow += loss_flow
 
-        # ---- MARKOV: P(parent=0) × P(child=1) × bl ----
+        # ---- MARKOV ----
         gains_markov  += p0_parent * p1_child * bl
         losses_markov += p1_parent * (1.0 - p1_child) * bl
 
-        # ---- ENTROPY: flow weighted by parent certainty (1 − H) ----
+        # ---- ENTROPY ----
         h_parent = _entropy(p1_parent)
         cert = 1.0 - h_parent
         gains_entropy  += gain_flow * cert
         losses_entropy += loss_flow * cert
 
-        # ---- Subsize: marginal (P-weighted) ----
+        # ---- Subsize: marginal ----
         gain_subsize_marginal  += p0_parent * effective_bl
         loss_subsize_marginal  += p1_parent * effective_bl
         gain_subsize_marginal_nofilter += p0_parent * bl
@@ -399,14 +379,11 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
         if p1_child < p_threshold and (root_prob >= p_threshold or not node.is_root()):
             loss_dist_m = min(loss_dist_m, nd)
 
-        # Cache edge for thresh subsize computation
         if bl < upper_bound:
-            _thresh_cache.append((nd, p0_parent, p1_parent, cert, effective_bl))
+            edge_data.append((nd, p0_parent, p1_parent, cert, effective_bl))
 
-    # Thresh variants: iterate over cached edges instead of re-traversing the tree
-    gain_subsize_marginal_thresh = loss_subsize_marginal_thresh = 0.0
-    gain_subsize_entropy_thresh  = loss_subsize_entropy_thresh  = 0.0
-    for nd, p0_parent, p1_parent, cert, effective_bl in _thresh_cache:
+    # Second pass: thresh subsizes — dist_m / loss_dist_m now finalised
+    for nd, p0_parent, p1_parent, cert, effective_bl in edge_data:
         if nd >= dist_m:
             gain_subsize_marginal_thresh += p0_parent * effective_bl
             gain_subsize_entropy_thresh  += p0_parent * cert * effective_bl
@@ -439,7 +416,6 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     }
 
 
-
 # ---------------------------------------------------------------------------
 # Per-trait reconstruction worker
 # ---------------------------------------------------------------------------
@@ -447,7 +423,7 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
 def reconstruct_trait(
     gene: str,
     tree_newick: str,
-    df_col: pd.DataFrame,
+    df_col: pd.Series,
     upper_bound: float,
     uncertainty: str,
     gene_count: int,
@@ -457,41 +433,33 @@ def reconstruct_trait(
 
     Parameters
     ----------
-    gene        : trait name (column in df_col)
-    tree_newick : Newick string (used to build a fresh tree per call)
-    df_col      : DataFrame with a single column `gene`, index = tip names
+    gene        : trait name
+    tree_newick : Newick string
+    df_col      : Series with index = tip names, values = trait states
     upper_bound : branch-length upper bound for subsize calculation
     uncertainty : 'threshold', 'marginal', or 'both'
     gene_count  : number of tips with trait = 1 (for 'count' column)
 
     When uncertainty in ('marginal', 'both'), the returned dict also contains
     a '_mp_df' key holding the MPPA marginal_probabilities DataFrame.  This
-    key must be stripped before writing to CSV; it is available in-memory for
-    callers that pass it to build_path_mask().
+    key must be stripped before writing to CSV.
     """
     try:
-        # Each call gets its own tree copy to ensure thread safety
         tree = Tree(tree_newick, format=1)
         label_internal_nodes(tree)
 
-        ann = df_col[[gene]].copy()
-        ann[gene] = ann[gene].astype(str)
+        ann = df_col.astype(str).to_frame(name=gene)
 
         states = sorted(ann[gene].dropna().unique().tolist())
         if len(states) < 2:
             return None  # can't reconstruct a constant trait
 
-        # Compute node distances once; both JOINT and MPPA trees share the same
-        # topology and branch lengths, so the dict is reusable across both.
+        # node_dists computed once on the JOINT tree and reused for MPPA
+        # (safe: both trees share identical topology and branch lengths)
         node_dists = _node_dists_from_root(tree)
 
         # --- JOINT reconstruction ---
-        joint_results = acr(
-            tree,
-            df=ann,
-            prediction_method=JOINT,
-            model="F81",
-        )
+        acr(tree, df=ann, prediction_method=JOINT, model="F81")
 
         stats = count_joint_stats(tree, gene, upper_bound, node_dists=node_dists)
         stats["gene"] = gene
@@ -499,8 +467,7 @@ def reconstruct_trait(
 
         # --- MPPA marginal reconstruction (if requested) ---
         if uncertainty in ("marginal", "both"):
-            tree_mppa = Tree(tree_newick, format=1)
-            label_internal_nodes(tree_mppa)
+            tree_mppa = tree.copy()
 
             mppa_results = acr(
                 tree_mppa,
@@ -510,10 +477,10 @@ def reconstruct_trait(
             )
             mp_df = mppa_results[0]["marginal_probabilities"]
             marginal_stats = count_all_marginal_stats(
-                tree_mppa, gene, mp_df, upper_bound, node_dists=node_dists,
+                tree_mppa, gene, mp_df, upper_bound,
+                node_dists=node_dists,
             )
             stats.update(marginal_stats)
-            # Store mp_df in-memory for build_path_mask(); strip before CSV write
             stats["_mp_df"] = mp_df
 
         return stats
@@ -532,39 +499,8 @@ def build_path_mask(
     """
     Build per-node × per-trait boolean eligibility masks using path-based
     upstream presence/absence tracking (preorder traversal).
-
-    A node is eligible for a gain event on trait t if:
-      P(parent=0, t) > p_threshold
-      AND (P(child=1, t) > p_threshold        # first emergence point
-           OR any ancestor had P(state=1) > p_threshold)  # re-gain after loss
-
-    A node is eligible for a loss event on trait t if:
-      P(parent=1, t) > p_threshold
-      AND (P(child=0, t) > p_threshold        # first loss point
-           OR any ancestor had P(state=0) > p_threshold)  # re-loss after gain
-
-    Clades where the trait never appears in observed data AND no upstream
-    ancestor had the trait will have gain_mask=False throughout, preventing
-    spurious gains. Symmetric logic applies to losses.
-
-    This correctly handles unbalanced trees: each clade's eligibility is governed
-    by its own ancestral lineage rather than a single global distance threshold.
-
-    Parameters
-    ----------
-    tree        : ETE3 Tree (must be labelled with label_internal_nodes())
-    mp_dfs      : {gene_name -> marginal_prob_df}
-    gene_order  : list of gene names; determines column order in output arrays
-    p_threshold : probability threshold for state certainty; default 0.5
-
-    Returns
-    -------
-    gain_mask : np.ndarray (n_nodes, n_traits) bool
-    loss_mask : np.ndarray (n_nodes, n_traits) bool
-
-    Rows follow tree.traverse() preorder — same as sim_bit's internal node_map.
     """
-    node_list = list(tree.traverse())   # preorder
+    node_list = list(tree.traverse())
     n_nodes   = len(node_list)
     n_traits  = len(gene_order)
     node_idx  = {node: i for i, node in enumerate(node_list)}
@@ -575,13 +511,11 @@ def build_path_mask(
     for t_idx, gene in enumerate(gene_order):
         mp_df = mp_dfs.get(gene)
         if mp_df is None:
-            # No MPPA data — allow all branches conservatively
             gain_mask[:, t_idx] = True
             loss_mask[:, t_idx] = True
             continue
 
-        mp_df_s = mp_df.copy()
-        mp_df_s.columns = [str(c) for c in mp_df_s.columns]
+        mp_df_s = mp_df.rename(columns=str)  
 
         def _p1(name):
             if name not in mp_df_s.index:
@@ -589,12 +523,10 @@ def build_path_mask(
             row = mp_df_s.loc[name]
             return float(row.get("1", row.get(1, np.nan)))
 
-        # Upstream flags: has any ancestor (inclusive of current node's parent)
-        # had P(state=1/0) > p_threshold? Keyed by node object for O(1) lookup.
-        upstream_presence: dict = {}  # node -> bool
-        upstream_absence:  dict = {}  # node -> bool
+        upstream_presence: dict = {}
+        upstream_absence:  dict = {}
 
-        for node in node_list:  # preorder: parents always visited before children
+        for node in node_list:
             if node.is_root():
                 p1 = _p1(node.name)
                 upstream_presence[node] = (not np.isnan(p1)) and (p1 > p_threshold)
@@ -615,15 +547,12 @@ def build_path_mask(
             up_pres = upstream_presence.get(parent, False)
             up_abs  = upstream_absence.get(parent, False)
 
-            # gain: parent absent AND (first emergence OR prior upstream presence)
             if (1.0 - p1_parent) > p_threshold and (p1_child > p_threshold or up_pres):
                 gain_mask[node_idx[node], t_idx] = True
 
-            # loss: parent present AND (first loss OR prior upstream absence)
             if p1_parent > p_threshold and ((1.0 - p1_child) > p_threshold or up_abs):
                 loss_mask[node_idx[node], t_idx] = True
 
-            # Propagate flags down to children
             upstream_presence[node] = up_pres or (p1_parent > p_threshold)
             upstream_absence[node]  = up_abs  or ((1.0 - p1_parent) > p_threshold)
 
@@ -645,7 +574,7 @@ def main():
     parser.add_argument("--output_csv", required=True,
                         help="Output CSV path (pastmlout.csv equivalent)")
     parser.add_argument("--max_workers", type=int, default=8,
-                        help="Thread pool size for parallel reconstruction")
+                        help="Process pool size for parallel reconstruction")
     parser.add_argument("--summary_file", default=None,
                         help="Optional text summary of run status")
     parser.add_argument("--uncertainty", choices=["threshold", "marginal", "both"],
@@ -689,22 +618,26 @@ def main():
     upper_bound = compute_branch_upper_bound(master_tree)
     tree_newick = master_tree.write(format=1)
 
-    # Pre-compute per-gene counts (positive tip counts)
-    gene_sums = {g: int(obs_filtered[g].sum()) for g in sample_ids if g in obs_filtered.columns}
     sample_ids = [g for g in sample_ids if g in obs_filtered.columns]
+
+    gene_sums = {g: int(pd.to_numeric(obs_filtered[g], errors="coerce").fillna(0).sum())
+                 for g in sample_ids}
 
     print(f"Running reconstruction for {len(sample_ids)} traits "
           f"(uncertainty={uncertainty}, workers={max_workers}) ...", flush=True)
 
     # ---- Parallel reconstruction ----
     results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    total = len(sample_ids)
+    log_every = max(1, total // 20) 
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 reconstruct_trait,
                 gene,
                 tree_newick,
-                obs_filtered,
+                obs_filtered[gene],         
                 upper_bound,
                 uncertainty,
                 gene_sums.get(gene, 0),
@@ -712,7 +645,6 @@ def main():
             for gene in sample_ids
         }
         done = 0
-        total = len(futures)
         for future in as_completed(futures):
             gene = futures[future]
             done += 1
@@ -720,8 +652,8 @@ def main():
                 res = future.result()
                 if res is not None:
                     results[gene] = res
-                    if done % max(1, total // 10) == 0:
-                        print(f"  [{done}/{total}] {gene}", flush=True)
+                if done % log_every == 0 or done == total:
+                    print(f"  [{done}/{total}] last completed: {gene}", flush=True)
             except Exception as exc:
                 print(f"  [FAILED] {gene}: {exc}", file=sys.stderr)
 
@@ -735,7 +667,7 @@ def main():
             for g in sample_ids if g in results]
     df_out = pd.DataFrame(rows)
 
-    # Canonical column order — core columns first, then all marginal variants
+    # Canonical column order
     core_cols = [
         "gene", "gains", "losses", "count", "dist", "loss_dist",
         "gain_subsize", "loss_subsize",
@@ -756,8 +688,7 @@ def main():
         "dist_marginal", "loss_dist_marginal", "root_prob",
     ]
 
-    present_cols = (core_cols
-                    + [c for c in marginal_cols if c in df_out.columns])
+    present_cols = core_cols + [c for c in marginal_cols if c in df_out.columns]
     df_out = df_out[[c for c in present_cols if c in df_out.columns]]
     df_out.to_csv(output_csv, index=False)
     print(f"\n[OK] Results written -> {output_csv}", flush=True)
