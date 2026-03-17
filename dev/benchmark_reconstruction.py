@@ -308,7 +308,7 @@ def run_api_method(tree_file: str, ann_file: str, traits: list[str],
         futures = {
             ex.submit(
                 reconstruct_trait,
-                gene, tree_newick, obs, upper_bound, uncertainty, gene_sums.get(gene, 0)
+                gene, tree_newick, obs[gene], upper_bound, uncertainty, gene_sums.get(gene, 0)
             ): gene
             for gene in obs.columns
         }
