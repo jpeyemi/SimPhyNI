@@ -465,13 +465,14 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                                   & np.uint64(1)).astype(int)
                     if tip_states.sum() == 0 or tip_states.sum() == len(tip_states):
                         continue   # constant trait — reconstruction undefined
-                    sim_df = pd.DataFrame(
-                        {gene: tip_states.astype(str)},
+                    sim_series = pd.Series(
+                        tip_states.astype(str),
                         index=leaf_names,
+                        name=gene,
                     )
                     fut = executor.submit(
                         reconstruct_trait,
-                        gene, tree_newick, sim_df, upper_bound,
+                        gene, tree_newick, sim_series, upper_bound,
                         "threshold", int(tip_states.sum()),
                     )
                     futures_meta.append((fut, gene, trial, true_gain_rate, true_loss_rate))
