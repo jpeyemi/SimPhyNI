@@ -296,14 +296,21 @@ def _entropy_vec(p1_arr: np.ndarray) -> np.ndarray:
 
 def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
                               upper_bound: float, p_threshold: float = 0.5,
-                              node_dists: dict | None = None) -> dict:
+                              node_dists: dict | None = None,
+                              gain_mask_1d: np.ndarray | None = None,
+                              loss_mask_1d: np.ndarray | None = None) -> dict:
     """
     Compute ALL marginal counting and subsize variants in a single pass.
 
-    node_dists : pre-computed {node.name: dist_from_root} dict.
-                 NOTE: safe to reuse from the JOINT tree because both trees
-                 share identical topology and branch lengths (same newick source,
-                 only internal annotations differ after acr()).
+    node_dists  : pre-computed {node.name: dist_from_root} dict.
+                  NOTE: safe to reuse from the JOINT tree because both trees
+                  share identical topology and branch lengths (same newick source,
+                  only internal annotations differ after acr()).
+    gain_mask_1d : optional bool array of length n_nodes (tree.traverse() order).
+                   When provided, gain counts and gain subsizes are restricted to
+                   mask-eligible edges.  This aligns the denominator with the
+                   simulation's eligible branch set (PATH masking).
+    loss_mask_1d : same for losses.
     """
     if node_dists is None:
         node_dists = _node_dists_from_root(tree)
@@ -320,10 +327,12 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     if np.isnan(root_prob):
         root_prob = 0.0
 
-    # Pre-extract all non-root edges into arrays for vectorized computation
+    # Pre-extract all non-root edges into arrays for vectorized computation.
+    # Use a single traversal so we can also extract per-edge mask eligibility.
+    _trav = list(tree.traverse())
     edges = [
         (node.name, node.up.name, node_dists[node.name], node.dist)
-        for node in tree.traverse()
+        for node in _trav
         if not node.is_root()
     ]
 
@@ -342,6 +351,16 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
             "root_prob": root_prob,
         }
 
+    # Build per-edge mask eligibility (same traversal order as _trav / build_path_mask).
+    if gain_mask_1d is not None:
+        _trav_idx = {node: i for i, node in enumerate(_trav)}
+        edge_gain_elig_raw = np.array(
+            [gain_mask_1d[_trav_idx[n]] for n in _trav if not n.is_root()], dtype=bool)
+        edge_loss_elig_raw = np.array(
+            [loss_mask_1d[_trav_idx[n]] for n in _trav if not n.is_root()], dtype=bool)
+    else:
+        edge_gain_elig_raw = edge_loss_elig_raw = None
+
     names_child, names_parent, nd_arr_raw, bl_arr_raw = zip(*edges)
     p1_c_raw = np.array([p1_map.get(n, np.nan) for n in names_child],  dtype=float)
     p1_p_raw = np.array([p1_map.get(n, np.nan) for n in names_parent], dtype=float)
@@ -355,40 +374,46 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     nd_v = nd_arr_raw[valid]
     bl_v = bl_arr_raw[valid]
 
+    # Eligible-edge masks after the valid filter
+    if edge_gain_elig_raw is not None:
+        gain_elig = edge_gain_elig_raw[valid]
+        loss_elig = edge_loss_elig_raw[valid]
+    else:
+        gain_elig = np.ones(int(valid.sum()), dtype=bool)
+        loss_elig = np.ones(int(valid.sum()), dtype=bool)
+
     p0_p   = 1.0 - p1_p
     eff_bl = np.minimum(bl_v, upper_bound)
 
     # FLOW
     gain_flow_arr = np.maximum(0.0, p1_c - p1_p)
     loss_flow_arr = np.maximum(0.0, p1_p - p1_c)
-    gains_flow  = float(gain_flow_arr.sum())
-    losses_flow = float(loss_flow_arr.sum())
+    gains_flow  = float(gain_flow_arr[gain_elig].sum())
+    losses_flow = float(loss_flow_arr[loss_elig].sum())
 
     # MARKOV
-    gains_markov  = float((p0_p * p1_c * bl_v).sum())
-    losses_markov = float((p1_p * (1.0 - p1_c) * bl_v).sum())
+    gains_markov  = float((p0_p[gain_elig] * p1_c[gain_elig] * bl_v[gain_elig]).sum())
+    losses_markov = float((p1_p[loss_elig] * (1.0 - p1_c[loss_elig]) * bl_v[loss_elig]).sum())
 
     # ENTROPY
     h_p  = _entropy_vec(p1_p)
     cert = 1.0 - h_p
-    gains_entropy  = float((gain_flow_arr * cert).sum())
-    losses_entropy = float((loss_flow_arr * cert).sum())
+    gains_entropy  = float((gain_flow_arr[gain_elig] * cert[gain_elig]).sum())
+    losses_entropy = float((loss_flow_arr[loss_elig] * cert[loss_elig]).sum())
 
     # Subsize: marginal
-    gain_subsize_marginal          = float((p0_p * eff_bl).sum())
-    loss_subsize_marginal          = float((p1_p * eff_bl).sum())
-    gain_subsize_marginal_nofilter = float((p0_p * bl_v).sum())
-    loss_subsize_marginal_nofilter = float((p1_p * bl_v).sum())
+    gain_subsize_marginal          = float((p0_p[gain_elig] * eff_bl[gain_elig]).sum())
+    loss_subsize_marginal          = float((p1_p[loss_elig] * eff_bl[loss_elig]).sum())
+    gain_subsize_marginal_nofilter = float((p0_p[gain_elig] * bl_v[gain_elig]).sum())
+    loss_subsize_marginal_nofilter = float((p1_p[loss_elig] * bl_v[loss_elig]).sum())
 
     # Subsize: entropy-weighted
-    gain_subsize_entropy          = float((p0_p * cert * eff_bl).sum())
-    loss_subsize_entropy          = float((p1_p * cert * eff_bl).sum())
-    gain_subsize_entropy_nofilter = float((p0_p * cert * bl_v).sum())
-    loss_subsize_entropy_nofilter = float((p1_p * cert * bl_v).sum())
+    gain_subsize_entropy          = float((p0_p[gain_elig] * cert[gain_elig] * eff_bl[gain_elig]).sum())
+    loss_subsize_entropy          = float((p1_p[loss_elig] * cert[loss_elig] * eff_bl[loss_elig]).sum())
+    gain_subsize_entropy_nofilter = float((p0_p[gain_elig] * cert[gain_elig] * bl_v[gain_elig]).sum())
+    loss_subsize_entropy_nofilter = float((p1_p[loss_elig] * cert[loss_elig] * bl_v[loss_elig]).sum())
 
-    # Soft emergence thresholds
-    # Non-root nodes only (filtered above), so (root_prob < p_threshold or not is_root)
-    # is always True — the conditions reduce to just the p1_c comparisons.
+    # Soft emergence thresholds (unrestricted — dist_marginal not used in PATH simulation)
     gain_nd = nd_v[p1_c >= p_threshold]
     dist_m = float(gain_nd.min()) if len(gain_nd) else float("inf")
 
@@ -397,14 +422,16 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
 
     # Thresh subsizes: edges within upper_bound, at or beyond threshold distance
     thresh_mask = bl_v < upper_bound
-    nd_t   = nd_v[thresh_mask]
-    p0_t   = p0_p[thresh_mask]
-    p1_t   = p1_p[thresh_mask]
-    cert_t = cert[thresh_mask]
-    eff_t  = eff_bl[thresh_mask]
+    nd_t    = nd_v[thresh_mask]
+    p0_t    = p0_p[thresh_mask]
+    p1_t    = p1_p[thresh_mask]
+    cert_t  = cert[thresh_mask]
+    eff_t   = eff_bl[thresh_mask]
+    gain_t  = gain_elig[thresh_mask]
+    loss_t  = loss_elig[thresh_mask]
 
-    gm = nd_t >= dist_m
-    lm = nd_t >= loss_dist_m
+    gm = (nd_t >= dist_m)      & gain_t
+    lm = (nd_t >= loss_dist_m) & loss_t
     gain_subsize_marginal_thresh = float((p0_t[gm] * eff_t[gm]).sum())
     gain_subsize_entropy_thresh  = float((p0_t[gm] * cert_t[gm] * eff_t[gm]).sum())
     loss_subsize_marginal_thresh = float((p1_t[lm] * eff_t[lm]).sum())
@@ -459,9 +486,13 @@ def reconstruct_trait(
     uncertainty : 'threshold', 'marginal', or 'both'
     gene_count  : number of tips with trait = 1 (for 'count' column)
 
-    When uncertainty in ('marginal', 'both'), the returned dict also contains
-    a '_mp_df' key holding the MPPA marginal_probabilities DataFrame.  This
-    key must be stripped before writing to CSV.
+    When uncertainty in ('marginal', 'both'), the returned dict also contains:
+      '_mp_df'        — MPPA marginal_probabilities DataFrame (strip before CSV)
+      '_gain_mask_1d' — bool array (n_nodes,) PATH gain eligibility mask
+      '_loss_mask_1d' — bool array (n_nodes,) PATH loss eligibility mask
+    The mask is built from the MPPA marginal probabilities and is used by
+    count_all_marginal_stats (denominator alignment) and can be forwarded to
+    sim_bit for the next stability iteration's simulation.
     """
     try:
         tree = Tree(tree_newick, format=1)
@@ -496,12 +527,43 @@ def reconstruct_trait(
                 model="F81",
             )
             mp_df = mppa_results[0]["marginal_probabilities"]
-            marginal_stats = count_all_marginal_stats(
+
+            # First call: standard columns (no mask) — used by DIST and NONE masking.
+            standard_marginal = count_all_marginal_stats(
+                tree, gene, mp_df, upper_bound, node_dists=node_dists,
+            )
+            stats.update(standard_marginal)
+
+            # Second call: PATH-masked columns — restricted to eligible branches.
+            # Written with _path suffix so build_sim_params can select them when
+            # masking='PATH', without corrupting the standard columns.
+            _path_gm, _path_lm = build_path_mask(tree, {gene: mp_df}, [gene])
+            _gm1d = _path_gm[:, 0]
+            _lm1d = _path_lm[:, 0]
+            path_marginal = count_all_marginal_stats(
                 tree, gene, mp_df, upper_bound,
                 node_dists=node_dists,
+                gain_mask_1d=_gm1d,
+                loss_mask_1d=_lm1d,
             )
-            stats.update(marginal_stats)
-            stats["_mp_df"] = mp_df
+            _PATH_SUFFIX_COLS = [
+                "gains_flow", "losses_flow",
+                "gains_markov", "losses_markov",
+                "gains_entropy", "losses_entropy",
+                "gain_subsize_marginal", "loss_subsize_marginal",
+                "gain_subsize_marginal_nofilter", "loss_subsize_marginal_nofilter",
+                "gain_subsize_marginal_thresh", "loss_subsize_marginal_thresh",
+                "gain_subsize_entropy", "loss_subsize_entropy",
+                "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
+                "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
+            ]
+            for col in _PATH_SUFFIX_COLS:
+                if col in path_marginal:
+                    stats[col + "_path"] = path_marginal[col]
+
+            stats["_mp_df"]        = mp_df
+            stats["_gain_mask_1d"] = _gm1d
+            stats["_loss_mask_1d"] = _lm1d
 
         return stats
 
@@ -703,6 +765,16 @@ def main():
         "gain_subsize_entropy", "loss_subsize_entropy",
         "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
         "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
+        # PATH-masked variants (denominator restricted to eligible branches)
+        "gains_flow_path", "losses_flow_path",
+        "gains_markov_path", "losses_markov_path",
+        "gains_entropy_path", "losses_entropy_path",
+        "gain_subsize_marginal_path", "loss_subsize_marginal_path",
+        "gain_subsize_marginal_nofilter_path", "loss_subsize_marginal_nofilter_path",
+        "gain_subsize_marginal_thresh_path", "loss_subsize_marginal_thresh_path",
+        "gain_subsize_entropy_path", "loss_subsize_entropy_path",
+        "gain_subsize_entropy_nofilter_path", "loss_subsize_entropy_nofilter_path",
+        "gain_subsize_entropy_thresh_path", "loss_subsize_entropy_thresh_path",
         "dist_marginal", "loss_dist_marginal", "root_prob",
     ]
 
