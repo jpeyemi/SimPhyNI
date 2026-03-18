@@ -204,6 +204,7 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
     gain_subsize_nofilter = 0.0
     loss_subsize_nofilter = 0.0
     node_data = {}  # node.name -> (num_gains, num_losses)
+    pending_thresh: list = []  # (nd, s, bl) for nodes with bl < upper_bound
 
     for node in tree.traverse("postorder"):
         s, ambiguous = _state(node)
@@ -220,6 +221,7 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
                     gain_subsize += node.dist
                 if s == 1:
                     loss_subsize += node.dist
+                pending_thresh.append((nd, s, node.dist))
             if node.dist > 0:
                 if s == 0:
                     gain_subsize_nofilter += node.dist
@@ -250,19 +252,14 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
 
     gains, losses = node_data.get(root_node.name, (0, 0))
 
-    # Second pass: threshold-consistent subsizes
+    # Second pass: threshold-consistent subsizes (uses pending_thresh from first pass)
     gain_subsize_thresh = 0.0
     loss_subsize_thresh = 0.0
-    for node in tree.traverse():
-        if node.is_root():
-            continue
-        nd = node_dists[node.name]
-        s, _ = _state(node)
-        if node.dist < upper_bound:
-            if s == 0 and nd >= dist:
-                gain_subsize_thresh += node.dist
-            if s == 1 and nd >= loss_dist:
-                loss_subsize_thresh += node.dist
+    for nd, s, bl in pending_thresh:
+        if s == 0 and nd >= dist:
+            gain_subsize_thresh += bl
+        if s == 1 and nd >= loss_dist:
+            loss_subsize_thresh += bl
 
     return {
         "gains": gains,
@@ -290,6 +287,13 @@ def _entropy(p1: float) -> float:
     return -(p0 + eps) * np.log2(p0 + eps) - (p1 + eps) * np.log2(p1 + eps)
 
 
+def _entropy_vec(p1_arr: np.ndarray) -> np.ndarray:
+    """Vectorized Shannon entropy (base-2) for an array of Bernoulli probabilities."""
+    p0 = 1.0 - p1_arr
+    eps = 1e-12
+    return -(p0 + eps) * np.log2(p0 + eps) - (p1_arr + eps) * np.log2(p1_arr + eps)
+
+
 def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
                               upper_bound: float, p_threshold: float = 0.5,
                               node_dists: dict | None = None) -> dict:
@@ -306,90 +310,105 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
 
     mp_df = mp_df.rename(columns=str)
 
-    p1_map: dict[str, float] = {
-        name: float(row.get("1", row.get(1, np.nan)))
-        for name, row in mp_df.iterrows()
-    }
+    if "1" in mp_df.columns:
+        p1_map: dict[str, float] = mp_df["1"].astype(float).to_dict()
+    else:
+        p1_map: dict[str, float] = {}
 
     root_node = tree.get_tree_root()
     root_prob = p1_map.get(root_node.name, np.nan)
     if np.isnan(root_prob):
         root_prob = 0.0
 
-    gains_flow = losses_flow = 0.0
-    gains_markov = losses_markov = 0.0
-    gains_entropy = losses_entropy = 0.0
-    gain_subsize_marginal = loss_subsize_marginal = 0.0
-    gain_subsize_marginal_nofilter = loss_subsize_marginal_nofilter = 0.0
-    gain_subsize_entropy = loss_subsize_entropy = 0.0
-    gain_subsize_entropy_nofilter = loss_subsize_entropy_nofilter = 0.0
-    gain_subsize_marginal_thresh = loss_subsize_marginal_thresh = 0.0
-    gain_subsize_entropy_thresh  = loss_subsize_entropy_thresh  = 0.0
-    dist_m = float("inf")
-    loss_dist_m = float("inf")
+    # Pre-extract all non-root edges into arrays for vectorized computation
+    edges = [
+        (node.name, node.up.name, node_dists[node.name], node.dist)
+        for node in tree.traverse()
+        if not node.is_root()
+    ]
 
-    # First pass: accumulate all stats except thresh (dist_m not yet known)
-    edge_data: list = []  # (nd, p0_parent, p1_parent, cert, effective_bl) for thresh pass
+    if not edges:
+        return {
+            "gains_flow": 0.0, "losses_flow": 0.0,
+            "gains_markov": 0.0, "losses_markov": 0.0,
+            "gains_entropy": 0.0, "losses_entropy": 0.0,
+            "gain_subsize_marginal": 0.0, "loss_subsize_marginal": 0.0,
+            "gain_subsize_marginal_nofilter": 0.0, "loss_subsize_marginal_nofilter": 0.0,
+            "gain_subsize_marginal_thresh": 0.0, "loss_subsize_marginal_thresh": 0.0,
+            "gain_subsize_entropy": 0.0, "loss_subsize_entropy": 0.0,
+            "gain_subsize_entropy_nofilter": 0.0, "loss_subsize_entropy_nofilter": 0.0,
+            "gain_subsize_entropy_thresh": 0.0, "loss_subsize_entropy_thresh": 0.0,
+            "dist_marginal": float("inf"), "loss_dist_marginal": float("inf"),
+            "root_prob": root_prob,
+        }
 
-    for node in tree.traverse():
-        if node.is_root():
-            continue
+    names_child, names_parent, nd_arr_raw, bl_arr_raw = zip(*edges)
+    p1_c_raw = np.array([p1_map.get(n, np.nan) for n in names_child],  dtype=float)
+    p1_p_raw = np.array([p1_map.get(n, np.nan) for n in names_parent], dtype=float)
+    nd_arr_raw = np.array(nd_arr_raw, dtype=float)
+    bl_arr_raw = np.array(bl_arr_raw, dtype=float)
 
-        p1_child  = p1_map.get(node.name,    np.nan)
-        p1_parent = p1_map.get(node.up.name, np.nan)
-        if np.isnan(p1_child) or np.isnan(p1_parent):
-            continue
+    # Restrict to edges where both sides have known probabilities
+    valid = ~(np.isnan(p1_c_raw) | np.isnan(p1_p_raw))
+    p1_c = p1_c_raw[valid]
+    p1_p = p1_p_raw[valid]
+    nd_v = nd_arr_raw[valid]
+    bl_v = bl_arr_raw[valid]
 
-        p0_parent = 1.0 - p1_parent
-        nd = node_dists[node.name]
-        bl = node.dist
-        effective_bl = min(bl, upper_bound)
+    p0_p   = 1.0 - p1_p
+    eff_bl = np.minimum(bl_v, upper_bound)
 
-        # ---- FLOW ----
-        gain_flow = max(0.0, p1_child - p1_parent)
-        loss_flow = max(0.0, p1_parent - p1_child)
-        gains_flow  += gain_flow
-        losses_flow += loss_flow
+    # FLOW
+    gain_flow_arr = np.maximum(0.0, p1_c - p1_p)
+    loss_flow_arr = np.maximum(0.0, p1_p - p1_c)
+    gains_flow  = float(gain_flow_arr.sum())
+    losses_flow = float(loss_flow_arr.sum())
 
-        # ---- MARKOV ----
-        gains_markov  += p0_parent * p1_child * bl
-        losses_markov += p1_parent * (1.0 - p1_child) * bl
+    # MARKOV
+    gains_markov  = float((p0_p * p1_c * bl_v).sum())
+    losses_markov = float((p1_p * (1.0 - p1_c) * bl_v).sum())
 
-        # ---- ENTROPY ----
-        h_parent = _entropy(p1_parent)
-        cert = 1.0 - h_parent
-        gains_entropy  += gain_flow * cert
-        losses_entropy += loss_flow * cert
+    # ENTROPY
+    h_p  = _entropy_vec(p1_p)
+    cert = 1.0 - h_p
+    gains_entropy  = float((gain_flow_arr * cert).sum())
+    losses_entropy = float((loss_flow_arr * cert).sum())
 
-        # ---- Subsize: marginal ----
-        gain_subsize_marginal  += p0_parent * effective_bl
-        loss_subsize_marginal  += p1_parent * effective_bl
-        gain_subsize_marginal_nofilter += p0_parent * bl
-        loss_subsize_marginal_nofilter += p1_parent * bl
+    # Subsize: marginal
+    gain_subsize_marginal          = float((p0_p * eff_bl).sum())
+    loss_subsize_marginal          = float((p1_p * eff_bl).sum())
+    gain_subsize_marginal_nofilter = float((p0_p * bl_v).sum())
+    loss_subsize_marginal_nofilter = float((p1_p * bl_v).sum())
 
-        # ---- Subsize: entropy-weighted ----
-        gain_subsize_entropy  += p0_parent * cert * effective_bl
-        loss_subsize_entropy  += p1_parent * cert * effective_bl
-        gain_subsize_entropy_nofilter += p0_parent * cert * bl
-        loss_subsize_entropy_nofilter += p1_parent * cert * bl
+    # Subsize: entropy-weighted
+    gain_subsize_entropy          = float((p0_p * cert * eff_bl).sum())
+    loss_subsize_entropy          = float((p1_p * cert * eff_bl).sum())
+    gain_subsize_entropy_nofilter = float((p0_p * cert * bl_v).sum())
+    loss_subsize_entropy_nofilter = float((p1_p * cert * bl_v).sum())
 
-        # ---- Soft emergence threshold ----
-        if p1_child >= p_threshold and (root_prob < p_threshold or not node.is_root()):
-            dist_m = min(dist_m, nd)
-        if p1_child < p_threshold and (root_prob >= p_threshold or not node.is_root()):
-            loss_dist_m = min(loss_dist_m, nd)
+    # Soft emergence thresholds
+    # Non-root nodes only (filtered above), so (root_prob < p_threshold or not is_root)
+    # is always True — the conditions reduce to just the p1_c comparisons.
+    gain_nd = nd_v[p1_c >= p_threshold]
+    dist_m = float(gain_nd.min()) if len(gain_nd) else float("inf")
 
-        if bl < upper_bound:
-            edge_data.append((nd, p0_parent, p1_parent, cert, effective_bl))
+    loss_nd = nd_v[p1_c < p_threshold]
+    loss_dist_m = float(loss_nd.min()) if len(loss_nd) else float("inf")
 
-    # Second pass: thresh subsizes — dist_m / loss_dist_m now finalised
-    for nd, p0_parent, p1_parent, cert, effective_bl in edge_data:
-        if nd >= dist_m:
-            gain_subsize_marginal_thresh += p0_parent * effective_bl
-            gain_subsize_entropy_thresh  += p0_parent * cert * effective_bl
-        if nd >= loss_dist_m:
-            loss_subsize_marginal_thresh += p1_parent * effective_bl
-            loss_subsize_entropy_thresh  += p1_parent * cert * effective_bl
+    # Thresh subsizes: edges within upper_bound, at or beyond threshold distance
+    thresh_mask = bl_v < upper_bound
+    nd_t   = nd_v[thresh_mask]
+    p0_t   = p0_p[thresh_mask]
+    p1_t   = p1_p[thresh_mask]
+    cert_t = cert[thresh_mask]
+    eff_t  = eff_bl[thresh_mask]
+
+    gm = nd_t >= dist_m
+    lm = nd_t >= loss_dist_m
+    gain_subsize_marginal_thresh = float((p0_t[gm] * eff_t[gm]).sum())
+    gain_subsize_entropy_thresh  = float((p0_t[gm] * cert_t[gm] * eff_t[gm]).sum())
+    loss_subsize_marginal_thresh = float((p1_t[lm] * eff_t[lm]).sum())
+    loss_subsize_entropy_thresh  = float((p1_t[lm] * cert_t[lm] * eff_t[lm]).sum())
 
     return {
         "gains_flow":   gains_flow,
@@ -467,17 +486,18 @@ def reconstruct_trait(
 
         # --- MPPA marginal reconstruction (if requested) ---
         if uncertainty in ("marginal", "both"):
-            tree_mppa = tree.copy()
-
+            # No need to copy the tree: acr() with df=ann calls preannotate_forest()
+            # unconditionally before any ML computation, which re-annotates all tips
+            # from the DataFrame and overwrites any JOINT annotations.
             mppa_results = acr(
-                tree_mppa,
+                tree,
                 df=ann,
                 prediction_method=MPPA,
                 model="F81",
             )
             mp_df = mppa_results[0]["marginal_probabilities"]
             marginal_stats = count_all_marginal_stats(
-                tree_mppa, gene, mp_df, upper_bound,
+                tree, gene, mp_df, upper_bound,
                 node_dists=node_dists,
             )
             stats.update(marginal_stats)
@@ -515,13 +535,11 @@ def build_path_mask(
             loss_mask[:, t_idx] = True
             continue
 
-        mp_df_s = mp_df.rename(columns=str)  
+        mp_df_s = mp_df.rename(columns=str)
+        _p1_map: dict[str, float] = mp_df_s["1"].astype(float).to_dict() if "1" in mp_df_s.columns else {}
 
         def _p1(name):
-            if name not in mp_df_s.index:
-                return np.nan
-            row = mp_df_s.loc[name]
-            return float(row.get("1", row.get(1, np.nan)))
+            return _p1_map.get(name, np.nan)
 
         upstream_presence: dict = {}
         upstream_absence:  dict = {}

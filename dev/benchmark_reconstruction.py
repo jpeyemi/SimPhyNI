@@ -47,8 +47,10 @@ Usage
 """
 
 import argparse
+import gzip
 import json
 import os
+import pickle
 import subprocess
 import sys
 import tempfile
@@ -167,11 +169,13 @@ def parse_args():
     p.add_argument("--output",      required=True, metavar="DIR",
                    help="Output directory for results and figures")
     p.add_argument("--traits",      default=None, metavar="N", type=int,
-                   help="Subsample N traits for speed (default: all)")
+                   help="Subsample N traits (randomly, prevalence 5%%–95%%) for speed (default: all eligible)")
     p.add_argument("--max_workers", default=8, type=int,
                    help="Threads for API-based methods")
     p.add_argument("--n_stability", default=10, type=int,
-                   help="Number of simulations for stability evaluation")
+                   help="Number of simulations (trials) per stability cycle")
+    p.add_argument("--n_stability_iters", default=1, type=int,
+                   help="Simulate→reconstruct cycles for stability trajectory (default: 1)")
     p.add_argument("--eval_pr",     action="store_true",
                    help="Enable precision/recall evaluation (requires --known_pairs)")
     p.add_argument("--known_pairs", default=None, metavar="FILE",
@@ -403,129 +407,370 @@ def parameter_agreement(dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 # ---------------------------------------------------------------------------
-# Stability: simulate → re-reconstruct → compare parameters
+# Shared pre-computation: tree setup + sim_bit lineages (one pass per method)
 # ---------------------------------------------------------------------------
 
-def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
-                          n_sims: int, max_workers: int) -> pd.DataFrame:
+def precompute_simulations(
+    tree_file: str,
+    dfs: dict[str, pd.DataFrame],
+    n_sample: int,
+    masks_dict: dict = None,
+    specs: list = None,
+) -> dict:
     """
-    For each method, pick up to 10 traits, simulate n_sims trees from the
-    inferred parameters using sim_bit (the same Poisson-process model used
-    by the actual SimPhyNI pipeline), re-reconstruct each simulated trial,
-    and compare the re-estimated gain/loss rates to the originals.
+    Load the tree once and run sim_bit once per method over a sampled trait
+    pool.  The returned cache is passed to stability_evaluation and
+    simulation_accuracy_evaluation so neither function repeats this work.
 
-    n_sims is capped at 64 — sim_bit always generates exactly 64 trials packed
-    as bits in uint64. A value of 10 means 10 trials are re-reconstructed.
+    Returns
+    -------
+    A dict with metadata keys ('_tree', '_upper_bound', '_leaf_names') and
+    one entry per method::
+
+        cache[method_name] = {
+            'trait_params': DataFrame indexed by gene  (≤n_sample rows),
+            'lineages':     ndarray (n_leaves, n_traits) uint64,
+        }
     """
     from simphyni.Simulation.simulation import sim_bit
-    from simphyni.scripts.run_ancestral_reconstruction import reconstruct_trait
-    from concurrent.futures import ProcessPoolExecutor
 
+    specs_by_label = {s.label: s for s in specs} if specs else {}
+
+    print("  Precomputing tree setup and simulations ...", flush=True)
     master_tree = Tree(tree_file, format=1)
     label_internal_nodes(master_tree)
     upper_bound = compute_branch_upper_bound(master_tree)
-    tree_newick = master_tree.write(format=1)
+    leaf_names  = [n.name for n in master_tree.iter_leaves()]
 
-    # Leaf order from master_tree (must match sim_bit's leaf extraction)
-    leaf_names = [n.name for n in master_tree.iter_leaves()]
-    leaf_indices = [i for i, n in enumerate(master_tree.traverse()) if n.is_leaf()]
-
-    records = []
-    n_test_traits = 10
-    n_trials = min(max(n_sims, 1), 64)   # sim_bit always produces 64 packed trials
+    cache: dict = {
+        '_tree':        master_tree,
+        '_upper_bound': upper_bound,
+        '_leaf_names':  leaf_names,
+    }
 
     for method_name, df in dfs.items():
         df = df.copy().dropna(subset=["gains", "losses", "gain_subsize", "loss_subsize"])
         df = df[(df["gain_subsize"] > 0) & (df["loss_subsize"] > 0)]
         df["gain_rate"] = df["gains"] / df["gain_subsize"]
         df["loss_rate"] = df["losses"] / df["loss_subsize"]
-        df = df[(df["gain_rate"] > 0) & (df["loss_rate"] > 0)]
         if df.empty:
-            print(f"  [WARN] {method_name}: no traits with both rates > 0; skipping.", flush=True)
             continue
 
-        sample = df.sample(n=min(n_test_traits, len(df)), random_state=0)
-        if "gene" in sample.columns:
-            trait_params = sample.set_index("gene")
+        sample = df.sample(n=min(n_sample, len(df)), random_state=0)
+        trait_params = sample.set_index("gene") if "gene" in sample.columns else sample
+
+        # Resolve PATH masks for this method
+        gm = lm = None
+        if masks_dict and method_name in masks_dict:
+            full_gm, full_lm = masks_dict[method_name]
+            full_gene_order = masks_dict.get(method_name + "_gene_order", [])
+            if full_gene_order:
+                col_idx = [full_gene_order.index(g) for g in trait_params.index
+                           if g in full_gene_order]
+                if col_idx:
+                    gm = full_gm[:, col_idx]
+                    lm = full_lm[:, col_idx]
+
+        lineages = sim_bit(master_tree, trait_params, gain_mask=gm, loss_mask=lm)
+        cache[method_name] = {'trait_params': trait_params, 'lineages': lineages}
+
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Stability: simulate → re-reconstruct → compare parameters
+# ---------------------------------------------------------------------------
+
+def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
+                          n_sims: int, max_workers: int,
+                          specs: list = None,
+                          masks_dict: dict = None,
+                          sims_cache: dict = None,
+                          n_iters: int = 1,
+                          obs: pd.DataFrame = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For each method, pick up to 10 traits and run n_iters simulate→reconstruct
+    cycles.  At each iteration the full per-trial distribution of parameters is
+    recorded.  The next iteration is seeded from the single most representative
+    trial (closest to the mean gains/losses across trials for that gene).
+
+    Parameters
+    ----------
+    n_sims      : trials decoded per sim_bit call (capped at 64).
+    n_iters     : number of simulate→reconstruct cycles.
+    specs       : list of MethodSpec — controls counting/subsize/uncertainty.
+    masks_dict  : PATH gain/loss masks from build_all_method_dfs.
+    sims_cache  : pre-computed tree + iteration-1 lineages from
+                  precompute_simulations; used only for iteration 1.
+
+    Returns
+    -------
+    stability_df   : existing schema (method, gene, parameter, true_value,
+                     mean_reestimate, std_reestimate, relative_error) derived
+                     from iteration 1 vs 0 — unchanged for ranking/display.
+    trajectory_df  : per-trial rows (method, gene, iteration, trial, gains,
+                     losses, gain_subsize, loss_subsize, gain_rate, loss_rate,
+                     prevalence) — iteration 0 is the seed (prevalence = observed
+                     tip fraction when obs is provided, else NaN).
+    """
+    from simphyni.Simulation.simulation import sim_bit, build_sim_params
+    from simphyni.scripts.run_ancestral_reconstruction import reconstruct_trait
+    from concurrent.futures import ProcessPoolExecutor
+
+    specs_by_label = {s.label: s for s in specs} if specs else {}
+
+    # Tree setup — reuse cache if available
+    if sims_cache and '_tree' in sims_cache:
+        master_tree  = sims_cache['_tree']
+        upper_bound  = sims_cache['_upper_bound']
+        leaf_names   = sims_cache['_leaf_names']
+    else:
+        master_tree = Tree(tree_file, format=1)
+        label_internal_nodes(master_tree)
+        upper_bound = compute_branch_upper_bound(master_tree)
+        leaf_names  = [n.name for n in master_tree.iter_leaves()]
+    tree_newick = master_tree.write(format=1)
+
+    records: list = []            # stability_df rows (relative_error)
+    trajectory_records: list = [] # trajectory_df rows (per trial)
+    n_test_traits = 10
+    n_trials = min(max(n_sims, 1), 64)
+
+    for method_name, df in dfs.items():
+        spec = specs_by_label.get(method_name)
+        counting = spec.counting if spec else 'JOINT'
+        subsize  = spec.subsize  if spec else 'ORIGINAL'
+        masking  = spec.masking  if spec else 'DIST'
+        uncertainty = "threshold" if counting == 'JOINT' else "marginal"
+
+        # ── Resolve initial trait_params (iteration 0) ──────────────────────
+        if sims_cache and method_name in sims_cache:
+            entry        = sims_cache[method_name]
+            trait_params = entry['trait_params'].iloc[:n_test_traits].copy()
         else:
-            trait_params = sample
+            df = df.copy().dropna(subset=["gains", "losses", "gain_subsize", "loss_subsize"])
+            df = df[(df["gain_subsize"] > 0) & (df["loss_subsize"] > 0)]
+            df["gain_rate"] = df["gains"] / df["gain_subsize"]
+            df["loss_rate"] = df["losses"] / df["loss_subsize"]
+            df = df[(df["gain_rate"] > 0) & (df["loss_rate"] > 0)]
+            if df.empty:
+                print(f"  [WARN] {method_name}: no valid traits; skipping.", flush=True)
+                continue
+            sample = df.sample(n=min(n_test_traits, len(df)), random_state=0)
+            trait_params = sample.set_index("gene") if "gene" in sample.columns else sample
 
-        # Simulate all sampled traits together (64 trials each, bit-packed)
-        lineages = sim_bit(master_tree, trait_params)   # (n_leaves, n_traits) uint64
-        leaf_lineages = lineages                         # already leaf-only from sim_bit
+        if trait_params.empty:
+            print(f"  [WARN] {method_name}: no valid traits; skipping.", flush=True)
+            continue
 
-        # Submit all (trait × trial) reconstruction tasks to the process pool
-        futures_meta = []   # (future, gene, trial, true_gain_rate, true_loss_rate)
+        # ── Record iteration 0 (seed values — no simulation) ────────────────
+        for gene in trait_params.index:
+            if obs is not None and gene in obs.columns:
+                seed_prev = float(obs[gene].mean())
+            else:
+                seed_prev = np.nan
+            trajectory_records.append({
+                "method":       method_name,
+                "gene":         gene,
+                "iteration":    0,
+                "trial":        0,
+                "gains":        float(trait_params.loc[gene, "gains"]),
+                "losses":       float(trait_params.loc[gene, "losses"]),
+                "gain_subsize": float(trait_params.loc[gene, "gain_subsize"]),
+                "loss_subsize": float(trait_params.loc[gene, "loss_subsize"]),
+                "gain_rate":    float(trait_params.loc[gene, "gain_rate"]),
+                "loss_rate":    float(trait_params.loc[gene, "loss_rate"]),
+                "prevalence":   seed_prev,
+            })
+
+        # Resolve PATH masks for the sampled traits (reused across all iterations)
+        iter_gain_mask = iter_loss_mask = None
+        if masking == 'PATH' and masks_dict and method_name in masks_dict:
+            full_gm, full_lm = masks_dict[method_name]
+            full_gene_order = masks_dict.get(method_name + "_gene_order", [])
+            if full_gene_order:
+                col_idx = [full_gene_order.index(g) for g in trait_params.index
+                           if g in full_gene_order]
+                if col_idx:
+                    iter_gain_mask = full_gm[:, col_idx]
+                    iter_loss_mask = full_lm[:, col_idx]
+
+        # ── Iteration loop (process pool shared across all iterations) ─────────
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            for col_idx, gene in enumerate(trait_params.index):
-                true_gain_rate = float(trait_params.loc[gene, "gain_rate"])
-                true_loss_rate = float(trait_params.loc[gene, "loss_rate"])
-                for trial in range(n_trials):
-                    tip_states = ((leaf_lineages[:, col_idx] >> np.uint64(trial))
-                                  & np.uint64(1)).astype(int)
-                    if tip_states.sum() == 0 or tip_states.sum() == len(tip_states):
-                        continue   # constant trait — reconstruction undefined
-                    sim_series = pd.Series(
-                        tip_states.astype(str),
-                        index=leaf_names,
-                        name=gene,
-                    )
-                    fut = executor.submit(
-                        reconstruct_trait,
-                        gene, tree_newick, sim_series, upper_bound,
-                        "threshold", int(tip_states.sum()),
-                    )
-                    futures_meta.append((fut, gene, trial, true_gain_rate, true_loss_rate))
+            current_params = trait_params.copy()
 
-            # Collect results
-            gene_gain_rates: dict = {}
-            gene_loss_rates: dict = {}
-            gene_true_gain:  dict = {}
-            gene_true_loss:  dict = {}
-            for fut, gene, trial, tgr, tlr in futures_meta:
-                try:
-                    res = fut.result()
-                except Exception as exc:
-                    print(f"  [FAILED] {gene} trial {trial}: {exc}", file=sys.stderr)
-                    continue
-                if res is None:
-                    continue
-                gene_gain_rates.setdefault(gene, [])
-                gene_loss_rates.setdefault(gene, [])
-                gene_true_gain[gene]  = tgr
-                gene_true_loss[gene]  = tlr
-                gs = res.get("gain_subsize_thresh") or res.get("gain_subsize", 0)
-                ls = res.get("loss_subsize_thresh") or res.get("loss_subsize", 0)
-                if gs > 0:
-                    gene_gain_rates[gene].append(res["gains"] / gs)
-                if ls > 0:
-                    gene_loss_rates[gene].append(res["losses"] / ls)
+            for iteration in range(1, n_iters + 1):
+                print(f"  [{method_name}] stability iteration {iteration}/{n_iters} ...",
+                      flush=True)
 
-        for gene in gene_true_gain:
-            q01 = gene_true_gain[gene]
-            q10 = gene_true_loss[gene]
-            if gene_gain_rates.get(gene):
-                re = gene_gain_rates[gene]
-                records.append({
-                    "method": method_name, "gene": gene,
-                    "parameter": "gain_rate",
-                    "true_value": q01,
-                    "mean_reestimate": float(np.mean(re)),
-                    "std_reestimate":  float(np.std(re)),
-                    "relative_error":  float(abs(np.mean(re) - q01) / max(q01, 1e-9)),
-                })
-            if gene_loss_rates.get(gene):
-                re = gene_loss_rates[gene]
-                records.append({
-                    "method": method_name, "gene": gene,
-                    "parameter": "loss_rate",
-                    "true_value": q10,
-                    "mean_reestimate": float(np.mean(re)),
-                    "std_reestimate":  float(np.std(re)),
-                    "relative_error":  float(abs(np.mean(re) - q10) / max(q10, 1e-9)),
-                })
+                # Simulation — use cache only for iteration 1
+                if iteration == 1 and sims_cache and method_name in sims_cache:
+                    iter_lineages = sims_cache[method_name]['lineages'][:, :n_test_traits]
+                else:
+                    iter_lineages = sim_bit(master_tree, current_params,
+                                            gain_mask=iter_gain_mask,
+                                            loss_mask=iter_loss_mask)
 
-    return pd.DataFrame(records)
+                # ── Submit reconstructions ───────────────────────────────────
+                # futures_meta: (future, gene, trial, tgr, tlr, prevalence)
+                futures_meta = []
+                for col_idx, gene in enumerate(current_params.index):
+                    tgr = float(trait_params.loc[gene, "gain_rate"])  # always vs iter-0
+                    tlr = float(trait_params.loc[gene, "loss_rate"])
+                    for trial in range(n_trials):
+                        tip_states = ((iter_lineages[:, col_idx] >> np.uint64(trial))
+                                      & np.uint64(1)).astype(int)
+                        prevalence = tip_states.sum() / len(tip_states)
+                        # Degenerate (all-0 or all-1): record directly, skip ACR
+                        if tip_states.sum() == 0 or tip_states.sum() == len(tip_states):
+                            gene_true_gain[gene] = tgr
+                            gene_true_loss[gene]  = tlr
+                            gene_trial_data.setdefault(gene, []).append({
+                                "trial":        trial,
+                                "gains":        np.nan,
+                                "losses":       np.nan,
+                                "gain_subsize": np.nan,
+                                "loss_subsize": np.nan,
+                                "gain_rate":    np.nan,
+                                "loss_rate":    np.nan,
+                                "dist":         np.nan,
+                                "loss_dist":    np.nan,
+                                "root_state":   np.nan,
+                                "prevalence":   prevalence,
+                            })
+                            continue
+                        sim_series = pd.Series(
+                            tip_states.astype(str), index=leaf_names, name=gene,
+                        )
+                        fut = executor.submit(
+                            reconstruct_trait,
+                            gene, tree_newick, sim_series, upper_bound,
+                            uncertainty, int(tip_states.sum()),
+                        )
+                        futures_meta.append((fut, gene, trial, tgr, tlr, prevalence))
+
+                # ── Collect results ──────────────────────────────────────────
+                # gene_trial_data[gene] = list of per-trial param dicts
+                gene_trial_data: dict = {}
+                gene_true_gain:  dict = {}
+                gene_true_loss:  dict = {}
+                for fut, gene, trial, tgr, tlr, prev in futures_meta:
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        print(f"  [FAILED] {gene} trial {trial}: {exc}", file=sys.stderr)
+                        continue
+                    if res is None:
+                        continue
+                    try:
+                        res_df = pd.DataFrame([res])
+                        tp = build_sim_params(res_df, counting, subsize,
+                                              no_threshold=(masking == 'NONE'))
+                        gs = float(tp['gain_subsize'].iloc[0])
+                        ls = float(tp['loss_subsize'].iloc[0])
+                        gc = float(tp['gains'].iloc[0])
+                        lc = float(tp['losses'].iloc[0])
+                    except (KeyError, IndexError, ValueError):
+                        continue
+                    gene_true_gain[gene] = tgr
+                    gene_true_loss[gene] = tlr
+                    gene_trial_data.setdefault(gene, []).append({
+                        "trial":        trial,
+                        "gains":        gc,
+                        "losses":       lc,
+                        "gain_subsize": gs,
+                        "loss_subsize": ls,
+                        "gain_rate":    gc / gs if gs > 0 else np.nan,
+                        "loss_rate":    lc / ls if ls > 0 else np.nan,
+                        "dist":         float(tp['dist'].iloc[0]),
+                        "loss_dist":    float(tp['loss_dist'].iloc[0]),
+                        "root_state":   float(tp['root_state'].iloc[0]),
+                        "prevalence":   prev,
+                    })
+
+                # ── Record trajectory rows + stability_df (iteration 1 only) ─
+                # Always emit at least one row per gene per iteration so the
+                # trajectory has no gaps (use NaN when all trials failed).
+                for gene in current_params.index:
+                    trial_list = gene_trial_data.get(gene, [])
+                    if trial_list:
+                        for td in trial_list:
+                            trajectory_records.append({
+                                "method":       method_name,
+                                "gene":         gene,
+                                "iteration":    iteration,
+                                "trial":        td["trial"],
+                                "gains":        td["gains"],
+                                "losses":       td["losses"],
+                                "gain_subsize": td["gain_subsize"],
+                                "loss_subsize": td["loss_subsize"],
+                                "gain_rate":    td["gain_rate"],
+                                "loss_rate":    td["loss_rate"],
+                                "prevalence":   td["prevalence"],
+                            })
+                    else:
+                        # All trials were dropped — record NaN so the iteration
+                        # is present in the trajectory for every gene.
+                        trajectory_records.append({
+                            "method":       method_name,
+                            "gene":         gene,
+                            "iteration":    iteration,
+                            "trial":        np.nan,
+                            "gains":        np.nan,
+                            "losses":       np.nan,
+                            "gain_subsize": np.nan,
+                            "loss_subsize": np.nan,
+                            "gain_rate":    np.nan,
+                            "loss_rate":    np.nan,
+                            "prevalence":   np.nan,
+                        })
+
+                    if iteration == 1:
+                        q01 = gene_true_gain[gene]
+                        q10 = gene_true_loss[gene]
+                        gr_vals = [td["gain_rate"] for td in trial_list]
+                        lr_vals = [td["loss_rate"] for td in trial_list]
+                        records.append({
+                            "method": method_name, "gene": gene,
+                            "parameter": "gain_rate",
+                            "true_value": q01,
+                            "mean_reestimate": float(np.mean(gr_vals)),
+                            "std_reestimate":  float(np.std(gr_vals)),
+                            "relative_error":  float(abs(np.mean(gr_vals) - q01) / max(q01, 1e-9)),
+                        })
+                        records.append({
+                            "method": method_name, "gene": gene,
+                            "parameter": "loss_rate",
+                            "true_value": q10,
+                            "mean_reestimate": float(np.mean(lr_vals)),
+                            "std_reestimate":  float(np.std(lr_vals)),
+                            "relative_error":  float(abs(np.mean(lr_vals) - q10) / max(q10, 1e-9)),
+                        })
+
+                # ── Select representative trial per gene → seed next iteration ─
+                for gene, trial_list in gene_trial_data.items():
+                    if not trial_list:
+                        continue
+                    # Use only non-degenerate trials (finite gains/losses) for seed selection
+                    valid = [td for td in trial_list
+                             if not (np.isnan(td["gains"]) or np.isnan(td["losses"]))]
+                    if not valid:
+                        continue
+                    target_g = float(np.mean([td["gains"]  for td in valid]))
+                    target_l = float(np.mean([td["losses"] for td in valid]))
+                    best_idx = int(np.argmin([
+                        np.sqrt((td["gains"] - target_g) ** 2 + (td["losses"] - target_l) ** 2)
+                        for td in valid
+                    ]))
+                    trial_list = valid
+                    best = trial_list[best_idx]
+                    for col in ["gains", "losses", "gain_subsize", "loss_subsize",
+                                "dist", "loss_dist", "root_state"]:
+                        current_params.loc[gene, col] = best[col]
+                    current_params.loc[gene, "gain_rate"] = best["gain_rate"]
+                    current_params.loc[gene, "loss_rate"] = best["loss_rate"]
+
+    return pd.DataFrame(records), pd.DataFrame(trajectory_records)
 
 # ---------------------------------------------------------------------------
 # Simulation accuracy evaluation
@@ -610,6 +855,7 @@ def simulation_accuracy_evaluation(
     ann_file: str,
     n_sample: int = 50,
     masks_dict: dict = None,
+    sims_cache: dict = None,
 ) -> pd.DataFrame:
     """
     Multi-metric simulation calibration diagnostic.
@@ -632,23 +878,37 @@ def simulation_accuracy_evaluation(
         print(f"[WARN] sim_bit not importable: {exc}")
         return pd.DataFrame()
 
-    master_tree = Tree(tree_file, format=1)
-    label_internal_nodes(master_tree)
+    # Tree setup — reuse cache if available
+    if sims_cache and '_tree' in sims_cache:
+        master_tree = sims_cache['_tree']
+        leaf_list   = sims_cache['_leaf_names']
+    else:
+        master_tree = Tree(tree_file, format=1)
+        label_internal_nodes(master_tree)
+        leaf_list = [n.name for n in master_tree.iter_leaves()]
+
     obs = pd.read_csv(ann_file, index_col=0)
     obs.index = obs.index.astype(str)
 
-    # Ordered leaf list (matches sim_bit's leaf extraction order)
-    leaf_list = [n.name for n in master_tree.iter_leaves()]
-    n_leaves  = len(leaf_list)
+    n_leaves   = len(leaf_list)
     leaf_index = {name: i for i, name in enumerate(leaf_list)}
 
     # ── Pairwise distance matrix (precompute once) ──────────────────────────
     print("  Precomputing pairwise leaf distances ...", flush=True)
-    D = np.zeros((n_leaves, n_leaves), dtype=float)
     leaves_ete = list(master_tree.iter_leaves())
+    # Single preorder pass: root-to-node distances
+    _root_dist: dict = {}
+    for node in master_tree.traverse('preorder'):
+        _root_dist[id(node)] = (0.0 if node.is_root()
+                                else _root_dist[id(node.up)] + node.dist)
+    # LCA formula: d(i,j) = root_dist[i] + root_dist[j] - 2*root_dist[lca(i,j)]
+    D = np.zeros((n_leaves, n_leaves), dtype=float)
     for i in range(n_leaves):
         for j in range(i + 1, n_leaves):
-            d = master_tree.get_distance(leaves_ete[i], leaves_ete[j])
+            lca = leaves_ete[i].get_common_ancestor(leaves_ete[j])
+            d = (_root_dist[id(leaves_ete[i])]
+                 + _root_dist[id(leaves_ete[j])]
+                 - 2.0 * _root_dist[id(lca)])
             D[i, j] = D[j, i] = d
     tree_depth = D.max() / 2.0  # rough estimate for dist_frac
 
@@ -666,30 +926,37 @@ def simulation_accuracy_evaluation(
 
     for method_name, df in dfs.items():
         print(f"  [{method_name}] running simulation accuracy ...", flush=True)
-        df_clean = df.dropna(subset=["gains", "losses", "gain_subsize", "loss_subsize"])
-        df_clean = df_clean[(df_clean["gain_subsize"] > 0) & (df_clean["loss_subsize"] > 0)]
-        if df_clean.empty:
+        # Use pre-computed simulations if available; otherwise run fresh
+        if sims_cache and method_name in sims_cache:
+            entry        = sims_cache[method_name]
+            trait_params = entry['trait_params']
+            lineages     = entry['lineages']
+        else:
+            df_clean = df.dropna(subset=["gains", "losses", "gain_subsize", "loss_subsize"])
+            df_clean = df_clean[(df_clean["gain_subsize"] > 0) & (df_clean["loss_subsize"] > 0)]
+            if df_clean.empty:
+                print(f"    [WARN] no valid traits; skipping.", flush=True)
+                continue
+
+            sample = df_clean.sample(n=min(n_sample, len(df_clean)), random_state=0)
+            trait_params = sample.set_index("gene") if "gene" in sample.columns else sample
+
+            gm = lm = None
+            if masks_dict and method_name in masks_dict:
+                full_gm, full_lm = masks_dict[method_name]
+                full_gene_order = masks_dict.get(method_name + "_gene_order", [])
+                if full_gene_order:
+                    col_idx = [full_gene_order.index(g) for g in trait_params.index
+                               if g in full_gene_order]
+                    if col_idx:
+                        gm = full_gm[:, col_idx]
+                        lm = full_lm[:, col_idx]
+
+            lineages = sim_bit(master_tree, trait_params, gain_mask=gm, loss_mask=lm)
+
+        if trait_params.empty:
             print(f"    [WARN] no valid traits; skipping.", flush=True)
             continue
-
-        sample = df_clean.sample(n=min(n_sample, len(df_clean)), random_state=0)
-        trait_params = sample.set_index("gene") if "gene" in sample.columns else sample
-
-        # Sub-select mask columns for sampled traits (if masks provided for this method)
-        gm = lm = None
-        if masks_dict and method_name in masks_dict:
-            full_gm, full_lm = masks_dict[method_name]
-            # full mask columns correspond to gene_order stored alongside masks
-            gene_order_key = method_name + "_gene_order"
-            full_gene_order = masks_dict.get(gene_order_key, [])
-            if full_gene_order:
-                col_idx = [full_gene_order.index(g) for g in trait_params.index
-                           if g in full_gene_order]
-                if col_idx:
-                    gm = full_gm[:, col_idx]
-                    lm = full_lm[:, col_idx]
-
-        lineages = sim_bit(master_tree, trait_params, gain_mask=gm, loss_mask=lm)  # (n_leaves, n_traits) uint64
 
         for col_idx, gene in enumerate(trait_params.index):
             packed_col = lineages[:, col_idx]   # (n_leaves,) uint64
@@ -1226,9 +1493,10 @@ def main():
 
     # ---- Optional: delete all checkpoints for a fresh run ----
     _CKPT_FILES = [
-        "params_A_legacy.csv", "params_all_acr.csv",
+        "params_A_legacy.csv", "params_all_acr.csv", "params_all_acr.mppdfs.pkl.gz",
         "speed_timings.json", "parameter_agreement.csv", "stability.csv",
         "sim_accuracy.csv", "precision_recall.csv", "method_ranking.csv",
+        "selected_traits.txt",
     ]
     if args.force_rerun:
         print("[--force_rerun] Deleting all checkpoints ...", flush=True)
@@ -1240,9 +1508,28 @@ def main():
 
     # ---- Load and optionally subsample traits ----
     obs = pd.read_csv(args.annotations, index_col=0)
-    traits = list(obs.columns)
-    if args.traits:
-        traits = traits[:args.traits]
+    all_traits = list(obs.columns)
+    traits_ckpt = out_dir / "selected_traits.txt"
+
+    if traits_ckpt.exists():
+        # Reload the exact trait set from a previous run for checkpoint consistency
+        traits = [t for t in traits_ckpt.read_text().splitlines() if t]
+        print(f"Loaded {len(traits)} traits from checkpoint ({traits_ckpt.name})",
+              flush=True)
+    else:
+        # Filter to traits with prevalence in [5%, 95%]
+        n_leaves = obs.shape[0]
+        prev = obs.mean(axis=0)
+        eligible = [t for t in all_traits if 0.05 <= prev[t] <= 0.95]
+        if args.traits and args.traits < len(eligible):
+            rng = np.random.default_rng(seed=0)
+            traits = list(rng.choice(eligible, size=args.traits, replace=False))
+        else:
+            traits = eligible
+        traits_ckpt.write_text("\n".join(traits))
+        print(f"Selected {len(traits)} traits with prevalence in [5%, 95%]"
+              f"{f' (sampled from {len(eligible)})' if args.traits else ''}",
+              flush=True)
     print(f"Benchmarking {len(traits)} traits on tree {args.tree}", flush=True)
 
     timings: dict = {}
@@ -1284,13 +1571,24 @@ def main():
         print("\n[2/2] All-ACR params: loading from checkpoint ...", flush=True)
         df_acr = pd.read_csv(ckpt_acr)
         print(f"  Loaded {len(df_acr)} traits ({len(df_acr.columns)} columns)", flush=True)
-        print("  [NOTE] mp_dfs unavailable from checkpoint — PATH masking methods will "
-              "be skipped.\n         Run with --force_rerun to include PATH masking.",
-              flush=True)
+        mp_dfs_pkl = ckpt_acr.with_suffix('.mppdfs.pkl.gz')
+        if mp_dfs_pkl.exists():
+            with gzip.open(mp_dfs_pkl, 'rb') as _f:
+                mp_dfs_all = pickle.load(_f)
+            print(f"  Loaded mp_dfs for {len(mp_dfs_all)} traits from checkpoint.",
+                  flush=True)
+        else:
+            mp_dfs_all = None
+            print("  [NOTE] mp_dfs checkpoint not found — PATH masking methods will "
+                  "be skipped.\n         Run with --force_rerun to regenerate.",
+                  flush=True)
     else:
         if _ckpt_exists(ckpt_acr):
             print("\n[2/2] All-ACR checkpoint is stale — re-running ...", flush=True)
             ckpt_acr.unlink()
+            _mp_pkl = ckpt_acr.with_suffix('.mppdfs.pkl.gz')
+            if _mp_pkl.exists():
+                _mp_pkl.unlink()
         else:
             print("\n[2/2] Running combined JOINT+MPPA reconstruction ...", flush=True)
         df_acr, t_acr, mp_dfs_all = run_api_method(
@@ -1299,6 +1597,11 @@ def main():
         )
         timings["all_acr"] = t_acr
         df_acr.to_csv(ckpt_acr, index=False)
+        if mp_dfs_all:
+            _mp_pkl = ckpt_acr.with_suffix('.mppdfs.pkl.gz')
+            with gzip.open(_mp_pkl, 'wb') as _f:
+                pickle.dump(mp_dfs_all, _f)
+            print(f"  Saved mp_dfs for {len(mp_dfs_all)} traits.", flush=True)
         print(f"  Done in {t_acr:.1f}s  ({len(df_acr)} traits, "
               f"{len(df_acr.columns)} columns)", flush=True)
 
@@ -1340,19 +1643,38 @@ def main():
         print_agreement_table(agreement_df)
         agreement_df.to_csv(ckpt_agreement, index=False)
 
+    # ---- Pre-compute tree setup + sim_bit lineages (shared by stability and sim_accuracy) ----
+    _need_fresh_stability = not _ckpt_exists(out_dir / "stability.csv")
+    _need_fresh_sim_acc   = args.eval_sim_accuracy and not _ckpt_exists(out_dir / "sim_accuracy.csv")
+    sims_cache = None
+    if _need_fresh_stability or _need_fresh_sim_acc:
+        n_presample = max(10, args.sim_accuracy_n if _need_fresh_sim_acc else 0)
+        sims_cache = precompute_simulations(
+            args.tree, all_dfs, n_presample,
+            masks_dict=masks_dict, specs=active_specs,
+        )
+
     # ---- Stability ----
-    ckpt_stability = out_dir / "stability.csv"
+    ckpt_stability   = out_dir / "stability.csv"
+    ckpt_trajectory  = out_dir / "stability_trajectory.csv"
     if _ckpt_exists(ckpt_stability):
         print("\n[Checkpoint] Stability: loading from file ...", flush=True)
-        stability_df = pd.read_csv(ckpt_stability)
+        stability_df  = pd.read_csv(ckpt_stability)
+        trajectory_df = pd.read_csv(ckpt_trajectory) if ckpt_trajectory.exists() else pd.DataFrame()
         print_stability_table(stability_df)
     else:
         print("\nRunning stability evaluation ...", flush=True)
-        stability_df = stability_evaluation(
-            args.tree, all_dfs, args.n_stability, args.max_workers
+        stability_df, trajectory_df = stability_evaluation(
+            args.tree, all_dfs, args.n_stability, args.max_workers,
+            specs=active_specs, masks_dict=masks_dict,
+            sims_cache=sims_cache,
+            n_iters=args.n_stability_iters,
+            obs=obs,
         )
         print_stability_table(stability_df)
         stability_df.to_csv(ckpt_stability, index=False)
+        if not trajectory_df.empty:
+            trajectory_df.to_csv(ckpt_trajectory, index=False)
 
     # ---- Simulation accuracy (optional) ----
     sim_acc_df = pd.DataFrame()
@@ -1368,6 +1690,7 @@ def main():
                 args.tree, all_dfs, args.annotations,
                 n_sample=args.sim_accuracy_n,
                 masks_dict=masks_dict,
+                sims_cache=sims_cache,
             )
             print_sim_accuracy_table(sim_acc_df)
             if not sim_acc_df.empty:
