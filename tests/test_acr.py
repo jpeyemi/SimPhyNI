@@ -358,7 +358,7 @@ def test_reconstruct_trait_constant_returns_none(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="threshold",
         gene_count=0,
@@ -372,7 +372,7 @@ def test_reconstruct_trait_threshold_columns(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="threshold",
         gene_count=int(obs["trait"].sum()),
@@ -390,7 +390,7 @@ def test_reconstruct_trait_marginal_columns(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="marginal",
         gene_count=int(obs["trait"].sum()),
@@ -406,7 +406,7 @@ def test_reconstruct_trait_both_has_all_columns(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="both",
         gene_count=int(obs["trait"].sum()),
@@ -457,7 +457,7 @@ def test_reconstruct_trait_both_mp_df_in_memory(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="both",
         gene_count=int(obs["trait"].sum()),
@@ -479,7 +479,7 @@ def test_reconstruct_trait_threshold_no_mp_df(obs_data_and_tree):
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
-        df_col=obs[["trait"]],
+        df_col=obs["trait"],
         upper_bound=10.0,
         uncertainty="threshold",
         gene_count=int(obs["trait"].sum()),
