@@ -137,6 +137,37 @@ _GAIN_SUB_COL = {
 }
 _LOSS_SUB_COL = {k: v.replace('gain', 'loss') for k, v in _GAIN_SUB_COL.items()}
 
+# PATH-masked variants: denominator restricted to PATH-eligible branches.
+# Used by build_sim_params when masking='PATH' and counting != 'JOINT'.
+# JOINT+PATH falls back to standard JOINT columns (no PATH variant for hard states).
+_GAIN_COL_PATH = {
+    'JOINT':   'gains',
+    'FLOW':    'gains_flow_path',
+    'MARKOV':  'gains_markov_path',
+    'ENTROPY': 'gains_entropy_path',
+}
+_LOSS_COL_PATH = {
+    'JOINT':   'losses',
+    'FLOW':    'losses_flow_path',
+    'MARKOV':  'losses_markov_path',
+    'ENTROPY': 'losses_entropy_path',
+}
+_GAIN_SUB_COL_PATH = {
+    ('JOINT',   'ORIGINAL'):  'gain_subsize',
+    ('JOINT',   'NO_FILTER'): 'gain_subsize_nofilter',
+    ('JOINT',   'THRESH'):    'gain_subsize_thresh',
+    ('FLOW',    'ORIGINAL'):  'gain_subsize_marginal_path',
+    ('FLOW',    'NO_FILTER'): 'gain_subsize_marginal_nofilter_path',
+    ('FLOW',    'THRESH'):    'gain_subsize_marginal_thresh_path',
+    ('MARKOV',  'ORIGINAL'):  'gain_subsize_marginal_path',
+    ('MARKOV',  'NO_FILTER'): 'gain_subsize_marginal_nofilter_path',
+    ('MARKOV',  'THRESH'):    'gain_subsize_marginal_thresh_path',
+    ('ENTROPY', 'ORIGINAL'):  'gain_subsize_entropy_path',
+    ('ENTROPY', 'NO_FILTER'): 'gain_subsize_entropy_nofilter_path',
+    ('ENTROPY', 'THRESH'):    'gain_subsize_entropy_thresh_path',
+}
+_LOSS_SUB_COL_PATH = {k: v.replace('gain', 'loss') for k, v in _GAIN_SUB_COL_PATH.items()}
+
 _DIST_COL = {
     'JOINT':   ('dist',         'loss_dist'),
     'FLOW':    ('dist_marginal', 'loss_dist_marginal'),
@@ -146,7 +177,8 @@ _DIST_COL = {
 
 
 def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
-                     no_threshold: bool = False) -> pd.DataFrame:
+                     no_threshold: bool = False,
+                     masking: str = 'DIST') -> pd.DataFrame:
     """
     Build a standardised trait_params DataFrame for sim_bit by selecting the
     appropriate counting and subsize columns for a given method combination.
@@ -163,6 +195,9 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     counting      : 'JOINT' | 'FLOW' | 'MARKOV' | 'ENTROPY'
     subsize       : 'ORIGINAL' | 'NO_FILTER' | 'THRESH'
     no_threshold  : if True, set dist = loss_dist = 0.0 (no emergence gate)
+    masking       : 'DIST' | 'NONE' | 'PATH' — when 'PATH' and counting != 'JOINT',
+                    selects _path-suffixed columns whose denominators are restricted
+                    to PATH-eligible branches.  Default 'DIST' for backward compat.
 
     Column mapping reference
     ------------------------
@@ -196,10 +231,16 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     if 'gene' in df.columns:
         out.insert(0, 'gene', df['gene'].values)
 
-    out['gains']        = src[_GAIN_COL[counting]].values
-    out['losses']       = src[_LOSS_COL[counting]].values
-    out['gain_subsize'] = src[_GAIN_SUB_COL[(counting, subsize)]].values
-    out['loss_subsize'] = src[_LOSS_SUB_COL[(counting, subsize)]].values
+    use_path = (masking == 'PATH') and (counting != 'JOINT')
+    _gc  = _GAIN_COL_PATH  if use_path else _GAIN_COL
+    _lc  = _LOSS_COL_PATH  if use_path else _LOSS_COL
+    _gsc = _GAIN_SUB_COL_PATH if use_path else _GAIN_SUB_COL
+    _lsc = _LOSS_SUB_COL_PATH if use_path else _LOSS_SUB_COL
+
+    out['gains']        = src[_gc[counting]].values
+    out['losses']       = src[_lc[counting]].values
+    out['gain_subsize'] = src[_gsc[(counting, subsize)]].values
+    out['loss_subsize'] = src[_lsc[(counting, subsize)]].values
 
     dist_col, loss_dist_col = _DIST_COL[counting]
     if no_threshold:

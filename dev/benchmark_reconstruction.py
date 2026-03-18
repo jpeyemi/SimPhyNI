@@ -135,6 +135,7 @@ def build_all_method_dfs(df_params, mp_dfs, tree_file, specs, p_threshold):
             sim_params = build_sim_params(
                 df_params, spec.counting, spec.subsize,
                 no_threshold=(spec.masking == 'NONE'),
+                masking=spec.masking,
             )
         except KeyError as e:
             print(f"  [SKIP] {spec.label}: missing column {e}", flush=True)
@@ -200,6 +201,10 @@ def parse_args():
                    help="Simulation masking methods to benchmark (default: all three)")
     p.add_argument("--p_threshold", default=0.5, type=float,
                    help="Probability threshold for PATH masking (default: 0.5)")
+    p.add_argument("--method", default=None, metavar="COUNTING_SUBSIZE_MASKING",
+                   help=("Single method shorthand, e.g. FLOW_THRESH_DIST or "
+                         "JOINT_ORIGINAL_PATH. Overrides --counting_methods, "
+                         "--subsize_methods, and --masking_methods."))
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -583,14 +588,16 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                 "prevalence":   seed_prev,
             })
 
-        # Resolve PATH masks for the sampled traits (reused across all iterations)
+        # Resolve PATH masks for iteration 1 from the original ACR (masks_dict).
+        # For iterations 2+, masks are rebuilt from each iteration's reconstruction
+        # results (see seed-selection block below).
         iter_gain_mask = iter_loss_mask = None
         if masking == 'PATH' and masks_dict and method_name in masks_dict:
             full_gm, full_lm = masks_dict[method_name]
             full_gene_order = masks_dict.get(method_name + "_gene_order", [])
             if full_gene_order:
-                col_idx = [full_gene_order.index(g) for g in trait_params.index
-                           if g in full_gene_order]
+                valid_genes = [g for g in trait_params.index if g in full_gene_order]
+                col_idx = [full_gene_order.index(g) for g in valid_genes]
                 if col_idx:
                     iter_gain_mask = full_gm[:, col_idx]
                     iter_loss_mask = full_lm[:, col_idx]
@@ -614,6 +621,9 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                 # ── Submit reconstructions ───────────────────────────────────
                 # futures_meta: (future, gene, trial, tgr, tlr, prevalence)
                 futures_meta = []
+                gene_trial_data: dict = {}
+                gene_true_gain:  dict = {}
+                gene_true_loss:  dict = {}
                 for col_idx, gene in enumerate(current_params.index):
                     tgr = float(trait_params.loc[gene, "gain_rate"])  # always vs iter-0
                     tlr = float(trait_params.loc[gene, "loss_rate"])
@@ -650,10 +660,6 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         futures_meta.append((fut, gene, trial, tgr, tlr, prevalence))
 
                 # ── Collect results ──────────────────────────────────────────
-                # gene_trial_data[gene] = list of per-trial param dicts
-                gene_trial_data: dict = {}
-                gene_true_gain:  dict = {}
-                gene_true_loss:  dict = {}
                 for fut, gene, trial, tgr, tlr, prev in futures_meta:
                     try:
                         res = fut.result()
@@ -665,7 +671,8 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                     try:
                         res_df = pd.DataFrame([res])
                         tp = build_sim_params(res_df, counting, subsize,
-                                              no_threshold=(masking == 'NONE'))
+                                              no_threshold=(masking == 'NONE'),
+                                              masking=masking)
                         gs = float(tp['gain_subsize'].iloc[0])
                         ls = float(tp['loss_subsize'].iloc[0])
                         gc = float(tp['gains'].iloc[0])
@@ -686,6 +693,10 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         "loss_dist":    float(tp['loss_dist'].iloc[0]),
                         "root_state":   float(tp['root_state'].iloc[0]),
                         "prevalence":   prev,
+                        # PATH masks from this trial's MPPA — used to rebuild
+                        # iter_gain_mask / iter_loss_mask for the next iteration.
+                        "_gain_mask_1d": res.get("_gain_mask_1d"),
+                        "_loss_mask_1d": res.get("_loss_mask_1d"),
                     })
 
                 # ── Record trajectory rows + stability_df (iteration 1 only) ─
@@ -725,7 +736,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                             "prevalence":   np.nan,
                         })
 
-                    if iteration == 1:
+                    if iteration == 1 and gene in gene_true_gain:
                         q01 = gene_true_gain[gene]
                         q10 = gene_true_loss[gene]
                         gr_vals = [td["gain_rate"] for td in trial_list]
@@ -748,6 +759,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         })
 
                 # ── Select representative trial per gene → seed next iteration ─
+                gene_new_masks: dict = {}  # gene → (gain_mask_1d, loss_mask_1d)
                 for gene, trial_list in gene_trial_data.items():
                     if not trial_list:
                         continue
@@ -762,13 +774,25 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         np.sqrt((td["gains"] - target_g) ** 2 + (td["losses"] - target_l) ** 2)
                         for td in valid
                     ]))
-                    trial_list = valid
-                    best = trial_list[best_idx]
+                    best = valid[best_idx]
                     for col in ["gains", "losses", "gain_subsize", "loss_subsize",
                                 "dist", "loss_dist", "root_state"]:
                         current_params.loc[gene, col] = best[col]
                     current_params.loc[gene, "gain_rate"] = best["gain_rate"]
                     current_params.loc[gene, "loss_rate"] = best["loss_rate"]
+                    # Collect the best trial's PATH masks for next iteration's sim_bit
+                    if best.get("_gain_mask_1d") is not None:
+                        gene_new_masks[gene] = (best["_gain_mask_1d"], best["_loss_mask_1d"])
+
+                # Rebuild iter_gain_mask / iter_loss_mask from best-trial masks.
+                # This keeps the simulation's eligible branches aligned with the
+                # most recent reconstruction for every subsequent iteration.
+                if masking == 'PATH' and gene_new_masks:
+                    genes_ordered = list(current_params.index)
+                    pairs = [gene_new_masks.get(g) for g in genes_ordered]
+                    if all(p is not None for p in pairs):
+                        iter_gain_mask = np.column_stack([p[0] for p in pairs])
+                        iter_loss_mask = np.column_stack([p[1] for p in pairs])
 
     return pd.DataFrame(records), pd.DataFrame(trajectory_records)
 
@@ -1481,12 +1505,35 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Parse --method shorthand (overrides per-dimension args) ----
+    if args.method is not None:
+        _raw = args.method.upper()
+        _matched = None
+        for _c in ('JOINT', 'FLOW', 'MARKOV', 'ENTROPY'):
+            for _s in ('ORIGINAL', 'NO_FILTER', 'THRESH'):
+                for _m in ('DIST', 'NONE', 'PATH'):
+                    if _raw == f"{_c}_{_s}_{_m}":
+                        _matched = (_c, _s, _m)
+        if _matched is None:
+            raise SystemExit(
+                f"[ERROR] --method {args.method!r} does not match any valid "
+                f"COUNTING_SUBSIZE_MASKING combination. "
+                f"Example: FLOW_THRESH_DIST or JOINT_ORIGINAL_PATH"
+            )
+        args.counting_methods = [_matched[0]]
+        args.subsize_methods  = [_matched[1]]
+        args.masking_methods  = [_matched[2]]
+        print(f"[--method] Single combination: {_matched[0]}_{_matched[1]}_{_matched[2]}",
+              flush=True)
+
     # ---- Build active method specs from CLI selectors ----
     active_specs = _build_method_specs(
         counting=args.counting_methods,
         subsize=args.subsize_methods,
         masking=args.masking_methods,
     )
+    needs_mppa = any(s.needs_mppa for s in active_specs)
+    acr_uncertainty = "marginal" if needs_mppa else "threshold"
     print(f"Active method combinations: {len(active_specs)} "
           f"({len(args.counting_methods)}×{len(args.subsize_methods)}×{len(args.masking_methods)})",
           flush=True)
@@ -1561,10 +1608,16 @@ def main():
             except Exception as exc:
                 print(f"  [FAILED] {exc}", file=sys.stderr)
 
-    # ---- Combined JOINT+MPPA ACR run → all 36 variant columns ----
+    # ---- Combined JOINT+MPPA ACR run → all variant columns ----
     ckpt_acr = out_dir / "params_all_acr.csv"
-    _ACR_REQUIRED = ["gains_flow", "gains_markov", "gains_entropy",
-                     "gain_subsize_nofilter", "gain_subsize_entropy"]
+    if needs_mppa:
+        # gains_flow_path is the sentinel for the new dual-call format;
+        # its absence means an old checkpoint with corrupt standard columns.
+        _ACR_REQUIRED = ["gains_flow", "gains_markov", "gains_entropy",
+                         "gain_subsize_nofilter", "gain_subsize_entropy",
+                         "gains_flow_path"]
+    else:
+        _ACR_REQUIRED = ["gains", "losses", "gain_subsize"]
     acr_valid = _checkpoint_has_cols(ckpt_acr, _ACR_REQUIRED)
 
     if acr_valid:
@@ -1590,10 +1643,12 @@ def main():
             if _mp_pkl.exists():
                 _mp_pkl.unlink()
         else:
-            print("\n[2/2] Running combined JOINT+MPPA reconstruction ...", flush=True)
+            label = "JOINT+MPPA" if needs_mppa else "JOINT-only"
+            print(f"\n[2/2] Running {label} reconstruction "
+                  f"(uncertainty={acr_uncertainty}) ...", flush=True)
         df_acr, t_acr, mp_dfs_all = run_api_method(
             args.tree, args.annotations, traits,
-            uncertainty="both", max_workers=args.max_workers,
+            uncertainty=acr_uncertainty, max_workers=args.max_workers,
         )
         timings["all_acr"] = t_acr
         df_acr.to_csv(ckpt_acr, index=False)
