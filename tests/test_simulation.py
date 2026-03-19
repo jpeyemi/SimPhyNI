@@ -671,3 +671,129 @@ def test_build_sim_params_legacy_joint_only():
     # All required base columns must be present
     for col in ("gains", "losses", "gain_subsize", "loss_subsize", "dist", "loss_dist", "root_state"):
         assert col in out.columns
+
+
+# ===========================================================================
+# Fixtures with PATH and JOINTP columns
+# ===========================================================================
+
+@pytest.fixture
+def wide_params_extended(wide_params):
+    """
+    Extends wide_params with PATH-masked and JOINTP parent-state columns.
+    Values are deliberately different from non-path/non-p variants so tests
+    can distinguish column selection.
+    """
+    extra = {
+        # PATH-masked variants (gains/losses restricted to eligible branches)
+        "gains_flow_path": [1.6], "losses_flow_path": [0.8],
+        "gains_markov_path": [1.3], "losses_markov_path": [0.6],
+        "gains_entropy_path": [1.0], "losses_entropy_path": [0.5],
+        "gain_subsize_marginal_path": [8.0],      "loss_subsize_marginal_path": [6.5],
+        "gain_subsize_marginal_nofilter_path": [9.5], "loss_subsize_marginal_nofilter_path": [7.5],
+        "gain_subsize_marginal_thresh_path": [5.5],   "loss_subsize_marginal_thresh_path": [4.5],
+        "gain_subsize_entropy_path": [3.5],        "loss_subsize_entropy_path": [3.0],
+        "gain_subsize_entropy_nofilter_path": [4.5],  "loss_subsize_entropy_nofilter_path": [4.0],
+        "gain_subsize_entropy_thresh_path": [2.5],    "loss_subsize_entropy_thresh_path": [2.0],
+        # JOINTP parent-state subsize columns
+        "gain_subsize_p": [11.0],         "loss_subsize_p": [9.0],
+        "gain_subsize_nofilter_p": [13.0], "loss_subsize_nofilter_p": [10.0],
+        "gain_subsize_thresh_p": [8.0],   "loss_subsize_thresh_p": [7.0],
+    }
+    for col, val in extra.items():
+        wide_params[col] = val
+    return wide_params
+
+
+# ===========================================================================
+# JOINTP column selection
+# ===========================================================================
+
+def test_build_sim_params_jointp_original(wide_params_extended):
+    """JOINTP+ORIGINAL uses gains (same as JOINT) and gain_subsize_p."""
+    out = build_sim_params(wide_params_extended, counting="JOINTP", subsize="ORIGINAL")
+    assert out["gains"].iloc[0] == pytest.approx(2.0)       # same as JOINT gains
+    assert out["gain_subsize"].iloc[0] == pytest.approx(11.0)  # from gain_subsize_p
+
+
+def test_build_sim_params_jointp_nofilter(wide_params_extended):
+    """JOINTP+NO_FILTER uses gain_subsize_nofilter_p."""
+    out = build_sim_params(wide_params_extended, counting="JOINTP", subsize="NO_FILTER")
+    assert out["gain_subsize"].iloc[0] == pytest.approx(13.0)
+
+
+def test_build_sim_params_jointp_thresh(wide_params_extended):
+    """JOINTP+THRESH uses gain_subsize_thresh_p."""
+    out = build_sim_params(wide_params_extended, counting="JOINTP", subsize="THRESH")
+    assert out["gain_subsize"].iloc[0] == pytest.approx(8.0)
+
+
+def test_build_sim_params_jointp_uses_joint_dist(wide_params_extended):
+    """JOINTP uses dist (not dist_marginal), same as JOINT."""
+    out = build_sim_params(wide_params_extended, counting="JOINTP", subsize="ORIGINAL")
+    assert out["dist"].iloc[0] == pytest.approx(0.5)   # from 'dist' column, not 'dist_marginal'
+
+
+def test_build_sim_params_jointp_root_state_from_root_state(wide_params_extended):
+    """JOINTP uses root_state integer (not root_prob thresholding), same as JOINT."""
+    out = build_sim_params(wide_params_extended, counting="JOINTP", subsize="ORIGINAL")
+    assert out["root_state"].iloc[0] == 0   # root_state column value
+
+
+# ===========================================================================
+# PATH masking column selection
+# ===========================================================================
+
+def test_build_sim_params_flow_dist_uses_standard_cols(wide_params_extended):
+    """masking='DIST' selects standard gains_flow, not gains_flow_path."""
+    out = build_sim_params(wide_params_extended, counting="FLOW", subsize="ORIGINAL",
+                           masking="DIST")
+    assert out["gains"].iloc[0] == pytest.approx(1.8)       # gains_flow, not _path
+    assert out["gain_subsize"].iloc[0] == pytest.approx(9.0)  # gain_subsize_marginal
+
+
+def test_build_sim_params_flow_path_uses_path_cols(wide_params_extended):
+    """masking='PATH' selects gains_flow_path and gain_subsize_marginal_path."""
+    out = build_sim_params(wide_params_extended, counting="FLOW", subsize="ORIGINAL",
+                           masking="PATH")
+    assert out["gains"].iloc[0] == pytest.approx(1.6)       # gains_flow_path
+    assert out["gain_subsize"].iloc[0] == pytest.approx(8.0)  # gain_subsize_marginal_path
+
+
+def test_build_sim_params_joint_path_uses_standard_cols(wide_params_extended):
+    """JOINT+PATH still uses standard gains and gain_subsize (no _path variant for JOINT)."""
+    out = build_sim_params(wide_params_extended, counting="JOINT", subsize="ORIGINAL",
+                           masking="PATH")
+    assert out["gains"].iloc[0] == pytest.approx(2.0)        # gains (standard)
+    assert out["gain_subsize"].iloc[0] == pytest.approx(10.0)  # gain_subsize (standard)
+
+
+def test_build_sim_params_jointp_path_uses_standard_p_cols(wide_params_extended):
+    """JOINTP+PATH uses gain_subsize_p (not _path), same as JOINTP+DIST."""
+    out_dist = build_sim_params(wide_params_extended, counting="JOINTP", subsize="ORIGINAL",
+                                masking="DIST")
+    out_path = build_sim_params(wide_params_extended, counting="JOINTP", subsize="ORIGINAL",
+                                masking="PATH")
+    assert out_dist["gain_subsize"].iloc[0] == out_path["gain_subsize"].iloc[0]
+
+
+@pytest.mark.parametrize("counting,subsize,expected_gains,expected_subsize", [
+    ("FLOW",    "ORIGINAL",  1.6,  8.0),
+    ("FLOW",    "NO_FILTER", 1.6,  9.5),
+    ("FLOW",    "THRESH",    1.6,  5.5),
+    ("MARKOV",  "ORIGINAL",  1.3,  8.0),
+    ("MARKOV",  "NO_FILTER", 1.3,  9.5),
+    ("MARKOV",  "THRESH",    1.3,  5.5),
+    ("ENTROPY", "ORIGINAL",  1.0,  3.5),
+    ("ENTROPY", "NO_FILTER", 1.0,  4.5),
+    ("ENTROPY", "THRESH",    1.0,  2.5),
+])
+def test_build_sim_params_path_masking_all_combinations(
+        wide_params_extended, counting, subsize, expected_gains, expected_subsize):
+    """Every non-JOINT counting × subsize with masking='PATH' selects the _path column."""
+    out = build_sim_params(wide_params_extended, counting=counting, subsize=subsize,
+                           masking="PATH")
+    assert out["gains"].iloc[0] == pytest.approx(expected_gains), \
+        f"{counting}+{subsize}+PATH: gains mismatch"
+    assert out["gain_subsize"].iloc[0] == pytest.approx(expected_subsize), \
+        f"{counting}+{subsize}+PATH: gain_subsize mismatch"

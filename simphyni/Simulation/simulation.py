@@ -111,12 +111,14 @@ def unpack_trait_params(tp: pd.DataFrame):
 
 _GAIN_COL = {
     'JOINT':   'gains',
+    'JOINTP':  'gains',   # same count as JOINT; only subsize differs
     'FLOW':    'gains_flow',
     'MARKOV':  'gains_markov',
     'ENTROPY': 'gains_entropy',
 }
 _LOSS_COL = {
     'JOINT':   'losses',
+    'JOINTP':  'losses',
     'FLOW':    'losses_flow',
     'MARKOV':  'losses_markov',
     'ENTROPY': 'losses_entropy',
@@ -125,6 +127,10 @@ _GAIN_SUB_COL = {
     ('JOINT',   'ORIGINAL'):  'gain_subsize',
     ('JOINT',   'NO_FILTER'): 'gain_subsize_nofilter',
     ('JOINT',   'THRESH'):    'gain_subsize_thresh',
+    # JOINTP: parent-state subsize (gain eligible when parent==0)
+    ('JOINTP',  'ORIGINAL'):  'gain_subsize_p',
+    ('JOINTP',  'NO_FILTER'): 'gain_subsize_nofilter_p',
+    ('JOINTP',  'THRESH'):    'gain_subsize_thresh_p',
     ('FLOW',    'ORIGINAL'):  'gain_subsize_marginal',
     ('FLOW',    'NO_FILTER'): 'gain_subsize_marginal_nofilter',
     ('FLOW',    'THRESH'):    'gain_subsize_marginal_thresh',
@@ -138,16 +144,18 @@ _GAIN_SUB_COL = {
 _LOSS_SUB_COL = {k: v.replace('gain', 'loss') for k, v in _GAIN_SUB_COL.items()}
 
 # PATH-masked variants: denominator restricted to PATH-eligible branches.
-# Used by build_sim_params when masking='PATH' and counting != 'JOINT'.
-# JOINT+PATH falls back to standard JOINT columns (no PATH variant for hard states).
+# Used by build_sim_params when masking='PATH' and counting not in ('JOINT','JOINTP').
+# JOINT/JOINTP+PATH falls back to standard columns (PATH mask applied at sim level).
 _GAIN_COL_PATH = {
     'JOINT':   'gains',
+    'JOINTP':  'gains',
     'FLOW':    'gains_flow_path',
     'MARKOV':  'gains_markov_path',
     'ENTROPY': 'gains_entropy_path',
 }
 _LOSS_COL_PATH = {
     'JOINT':   'losses',
+    'JOINTP':  'losses',
     'FLOW':    'losses_flow_path',
     'MARKOV':  'losses_markov_path',
     'ENTROPY': 'losses_entropy_path',
@@ -156,6 +164,9 @@ _GAIN_SUB_COL_PATH = {
     ('JOINT',   'ORIGINAL'):  'gain_subsize',
     ('JOINT',   'NO_FILTER'): 'gain_subsize_nofilter',
     ('JOINT',   'THRESH'):    'gain_subsize_thresh',
+    ('JOINTP',  'ORIGINAL'):  'gain_subsize_p',
+    ('JOINTP',  'NO_FILTER'): 'gain_subsize_nofilter_p',
+    ('JOINTP',  'THRESH'):    'gain_subsize_thresh_p',
     ('FLOW',    'ORIGINAL'):  'gain_subsize_marginal_path',
     ('FLOW',    'NO_FILTER'): 'gain_subsize_marginal_nofilter_path',
     ('FLOW',    'THRESH'):    'gain_subsize_marginal_thresh_path',
@@ -170,6 +181,7 @@ _LOSS_SUB_COL_PATH = {k: v.replace('gain', 'loss') for k, v in _GAIN_SUB_COL_PAT
 
 _DIST_COL = {
     'JOINT':   ('dist',         'loss_dist'),
+    'JOINTP':  ('dist',         'loss_dist'),
     'FLOW':    ('dist_marginal', 'loss_dist_marginal'),
     'MARKOV':  ('dist_marginal', 'loss_dist_marginal'),
     'ENTROPY': ('dist_marginal', 'loss_dist_marginal'),
@@ -231,7 +243,7 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     if 'gene' in df.columns:
         out.insert(0, 'gene', df['gene'].values)
 
-    use_path = (masking == 'PATH') and (counting != 'JOINT')
+    use_path = (masking == 'PATH') and (counting not in ('JOINT', 'JOINTP'))
     _gc  = _GAIN_COL_PATH  if use_path else _GAIN_COL
     _lc  = _LOSS_COL_PATH  if use_path else _LOSS_COL
     _gsc = _GAIN_SUB_COL_PATH if use_path else _GAIN_SUB_COL
@@ -251,7 +263,7 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
         out['loss_dist'] = src[loss_dist_col].replace([np.inf], 0.0).values
 
     # Root state: for marginal counting methods use root_prob thresholded at 0.5
-    if counting != 'JOINT' and 'root_prob' in src.columns:
+    if counting not in ('JOINT', 'JOINTP') and 'root_prob' in src.columns:
         out['root_state'] = (src['root_prob'].values >= 0.5).astype(int)
     else:
         out['root_state'] = src['root_state'].values.astype(int)
