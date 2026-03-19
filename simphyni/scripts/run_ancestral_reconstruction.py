@@ -261,6 +261,42 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
         if s == 1 and nd >= loss_dist:
             loss_subsize_thresh += bl
 
+    # JOINTP: parent-state subsize variants — gain eligible when parent==0 regardless of child state.
+    # This matches marginal methods (p0_p weight) where parent=0, child=1 branches contribute
+    # to gain_subsize. The original JOINT subsize (child-state based) is preserved above.
+    gain_subsize_p          = 0.0
+    loss_subsize_p          = 0.0
+    gain_subsize_nofilter_p = 0.0
+    loss_subsize_nofilter_p = 0.0
+    pending_thresh_p: list  = []
+
+    for node in tree.traverse("preorder"):
+        if node.is_root():
+            continue
+        parent_s, _ = _state(node.up)
+        nd = node_dists[node.name]
+        bl = node.dist
+        if parent_s == 0:
+            if bl < upper_bound:
+                gain_subsize_p += bl
+                pending_thresh_p.append((nd, "gain", bl))
+            if bl > 0:
+                gain_subsize_nofilter_p += bl
+        elif parent_s == 1:
+            if bl < upper_bound:
+                loss_subsize_p += bl
+                pending_thresh_p.append((nd, "loss", bl))
+            if bl > 0:
+                loss_subsize_nofilter_p += bl
+
+    gain_subsize_thresh_p = 0.0
+    loss_subsize_thresh_p = 0.0
+    for nd, kind, bl in pending_thresh_p:
+        if kind == "gain" and nd >= dist:
+            gain_subsize_thresh_p += bl
+        if kind == "loss" and nd >= loss_dist:
+            loss_subsize_thresh_p += bl
+
     return {
         "gains": gains,
         "losses": losses,
@@ -272,6 +308,13 @@ def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
         "loss_subsize_nofilter": loss_subsize_nofilter,
         "gain_subsize_thresh": gain_subsize_thresh,
         "loss_subsize_thresh": loss_subsize_thresh,
+        # JOINTP: parent-state subsize (gain eligible when parent==0)
+        "gain_subsize_p":          gain_subsize_p,
+        "loss_subsize_p":          loss_subsize_p,
+        "gain_subsize_nofilter_p": gain_subsize_nofilter_p,
+        "loss_subsize_nofilter_p": loss_subsize_nofilter_p,
+        "gain_subsize_thresh_p":   gain_subsize_thresh_p,
+        "loss_subsize_thresh_p":   loss_subsize_thresh_p,
         "root_state": root_state,
     }
 
@@ -420,22 +463,23 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     loss_nd = nd_v[p1_c < p_threshold]
     loss_dist_m = float(loss_nd.min()) if len(loss_nd) else float("inf")
 
-    # Thresh subsizes: edges within upper_bound, at or beyond threshold distance
-    thresh_mask = bl_v < upper_bound
-    nd_t    = nd_v[thresh_mask]
-    p0_t    = p0_p[thresh_mask]
-    p1_t    = p1_p[thresh_mask]
-    cert_t  = cert[thresh_mask]
-    eff_t   = eff_bl[thresh_mask]
-    gain_t  = gain_elig[thresh_mask]
-    loss_t  = loss_elig[thresh_mask]
+    # Thresh subsizes: eff_bl contribution downstream of emergence threshold.
+    # eff_bl already applies the IQR cap (upper_bound). For each branch, compute
+    # the fraction of the branch that lies at or beyond dist_m and scale eff_bl
+    # by that fraction. This correctly handles partial branches (straddling the
+    # threshold) rather than including or excluding them wholesale.
+    parent_dist = nd_v - bl_v  # root-to-parent distance
 
-    gm = (nd_t >= dist_m)      & gain_t
-    lm = (nd_t >= loss_dist_m) & loss_t
-    gain_subsize_marginal_thresh = float((p0_t[gm] * eff_t[gm]).sum())
-    gain_subsize_entropy_thresh  = float((p0_t[gm] * cert_t[gm] * eff_t[gm]).sum())
-    loss_subsize_marginal_thresh = float((p1_t[lm] * eff_t[lm]).sum())
-    loss_subsize_entropy_thresh  = float((p1_t[lm] * cert_t[lm] * eff_t[lm]).sum())
+    gain_overlap    = np.maximum(0.0, nd_v - np.maximum(parent_dist, dist_m))
+    eff_gain_thresh = np.minimum(gain_overlap, upper_bound)  # IQR cap on downstream portion
+
+    loss_overlap    = np.maximum(0.0, nd_v - np.maximum(parent_dist, loss_dist_m))
+    eff_loss_thresh = np.minimum(loss_overlap, upper_bound)  # IQR cap on downstream portion
+
+    gain_subsize_marginal_thresh = float((p0_p[gain_elig] * eff_gain_thresh[gain_elig]).sum())
+    gain_subsize_entropy_thresh  = float((p0_p[gain_elig] * cert[gain_elig] * eff_gain_thresh[gain_elig]).sum())
+    loss_subsize_marginal_thresh = float((p1_p[loss_elig] * eff_loss_thresh[loss_elig]).sum())
+    loss_subsize_entropy_thresh  = float((p1_p[loss_elig] * cert[loss_elig] * eff_loss_thresh[loss_elig]).sum())
 
     return {
         "gains_flow":   gains_flow,
@@ -753,6 +797,10 @@ def main():
         "gain_subsize", "loss_subsize",
         "gain_subsize_nofilter", "loss_subsize_nofilter",
         "gain_subsize_thresh", "loss_subsize_thresh",
+        # JOINTP: parent-state subsize columns (gain eligible when parent==0)
+        "gain_subsize_p", "loss_subsize_p",
+        "gain_subsize_nofilter_p", "loss_subsize_nofilter_p",
+        "gain_subsize_thresh_p", "loss_subsize_thresh_p",
         "root_state",
     ]
     marginal_cols = [

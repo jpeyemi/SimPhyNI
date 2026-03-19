@@ -517,3 +517,331 @@ def test_count_joint_stats_thresh_subsize_smaller_than_original():
     # gain_subsize_thresh only includes state-0 branches at depth >= dist (first gain).
     assert r["gains"] >= 1
     assert r["gain_subsize_thresh"] <= r["gain_subsize"] + 1e-9
+
+
+# ===========================================================================
+# count_all_marginal_stats — exact formula tests for each counting method
+# ===========================================================================
+
+def test_flow_loss_exact(tiny_tree):
+    """
+    FLOW loss = Σ max(0, P(parent=1) − P(child=1)).
+    Star tree: Root=0.8, A=0.1, B=0.9, C=0.6.
+    Expected loss: max(0,0.8-0.1) + max(0,0.8-0.9) + max(0,0.8-0.6) = 0.7+0+0.2 = 0.9
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    p1s = {root_name: 0.8, "A": 0.1, "B": 0.9, "C": 0.6}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    expected = max(0.0, 0.8 - 0.1) + max(0.0, 0.8 - 0.9) + max(0.0, 0.8 - 0.6)
+    assert result["losses_flow"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_flow_zero_when_flat(tiny_tree):
+    """All nodes have the same P(1) → gains_flow = 0 and losses_flow = 0."""
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    p1s = {n.name: 0.4 for n in tiny_tree.traverse()}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    assert result["gains_flow"] == pytest.approx(0.0, abs=1e-9)
+    assert result["losses_flow"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_markov_gains_formula_pinned(tiny_tree):
+    """
+    MARKOV gains = Σ P(parent=0) × P(child=1) × bl  (current approximation).
+    Star tree, all leaves direct children of root.
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    p1s = {root_name: 0.2, "A": 0.7, "B": 0.3, "C": 0.5}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+
+    # Branch lengths: A=1, B=2, C=3 (from tiny_tree fixture).
+    # For star tree, parent of every leaf is root: p0_p = 1 - 0.2 = 0.8
+    expected = (0.8 * 0.7 * 1.0) + (0.8 * 0.3 * 2.0) + (0.8 * 0.5 * 3.0)
+    assert result["gains_markov"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_entropy_certain_parent_equals_flow(tiny_tree):
+    """
+    When P(parent=1) = 0 exactly: H(parent) = 0, cert = 1 → gains_entropy = gains_flow.
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    # Root is completely absent; leaves have positive P(1)
+    p1s = {root_name: 0.0, "A": 0.9, "B": 0.6, "C": 0.3}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    # With a certain parent (p1=0 → h=0, cert=1), entropy weighting is identity
+    assert result["gains_entropy"] == pytest.approx(result["gains_flow"], abs=1e-6)
+
+
+def test_entropy_uncertain_parent_zero(tiny_tree):
+    """
+    When P(parent=1) = 0.5: H(parent) = 1, cert = 0 → gains_entropy = 0.
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    # Root is maximally uncertain (0.5); leaves have higher P(1) so flow > 0
+    p1s = {root_name: 0.5, "A": 0.9, "B": 0.8, "C": 0.7}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    assert result["gains_entropy"] == pytest.approx(0.0, abs=1e-6)
+    # Sanity: FLOW gain is positive (there is probability flux)
+    assert result["gains_flow"] > 0.0
+
+
+def test_entropy_leq_flow_general(tiny_tree):
+    """gains_entropy ≤ gains_flow in all cases (weight ≤ 1)."""
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    p1s = {root_name: 0.3, "A": 0.8, "B": 0.6, "C": 0.9}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    assert result["gains_entropy"] <= result["gains_flow"] + 1e-9
+
+
+def test_original_subsize_exact(tiny_tree):
+    """
+    gain_subsize_marginal = Σ P(parent=0) × min(bl, upper_bound).
+    Star tree: root=0.2, A bl=1, B bl=2, C bl=3, upper_bound=10 (all below cap).
+    Expected = 0.8 × 1 + 0.8 × 2 + 0.8 × 3 = 0.8 × 6 = 4.8
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    p1s = {root_name: 0.2, "A": 0.7, "B": 0.4, "C": 0.6}
+    mp = _mp_df(tiny_tree, p1s)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, upper_bound=10.0)
+    expected = 0.8 * 1.0 + 0.8 * 2.0 + 0.8 * 3.0
+    assert result["gain_subsize_marginal"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_nofilter_subsize_exceeds_original_when_long_branch():
+    """
+    When a branch length exceeds upper_bound, nofilter includes the full length
+    while original is capped → nofilter > original.
+    """
+    gene = "T"
+    # Leaf A has bl=20 which exceeds upper_bound=5
+    t = Tree("(A:20.0,B:1.0)Root;", format=1)
+    label_internal_nodes(t)
+    p1s = {"Root": 0.1, "A": 0.8, "B": 0.8}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=5.0)
+    assert result["gain_subsize_marginal_nofilter"] > result["gain_subsize_marginal"]
+
+
+def test_dist_marginal_exact():
+    """
+    dist_marginal = min root-to-node distance where P(node=1) ≥ 0.5.
+    Tree: (A:2.0,B:4.0)Root;  p1: Root=0.1, A=0.3, B=0.8
+    Only B has p1 ≥ 0.5, dist(B) = 4.0.
+    """
+    gene = "T"
+    t = Tree("(A:2.0,B:4.0)Root;", format=1)
+    label_internal_nodes(t)
+    p1s = {"Root": 0.1, "A": 0.3, "B": 0.8}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=10.0)
+    assert result["dist_marginal"] == pytest.approx(4.0, abs=1e-9)
+
+
+def test_thresh_fully_upstream():
+    """
+    Branches fully upstream of dist_m: gain_overlap = 0 → eff_gain_thresh = 0.
+    Set dist_m beyond all nodes by making all P(1) < 0.5 → dist_m = inf → overlap = 0.
+    """
+    gene = "T"
+    t = Tree("(A:2.0,B:3.0)Root;", format=1)
+    label_internal_nodes(t)
+    # All P(1) < 0.5 → dist_marginal = inf → all branches upstream
+    p1s = {"Root": 0.1, "A": 0.2, "B": 0.3}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=10.0)
+    assert result["gain_subsize_marginal_thresh"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_thresh_straddling_with_cap():
+    """
+    Straddling branch test with IQR cap applied.
+
+    Tree: (B:6.0,C:1.0)A;  upper_bound=4.0
+    p1: A=0.05, B=0.30, C=0.90
+    dist_m = dist(C) = 1.0   (only C has P(1) ≥ 0.5)
+
+    Branch B (straddling):
+      parent_dist = 0, nd_v = 6, dist_m = 1
+      gain_overlap = 6 - max(0, 1) = 5
+      eff_gain_thresh = min(5, 4) = 4   ← cap applies
+
+    Branch C (at dist_m, no overlap beyond itself):
+      parent_dist = 0, nd_v = 1, dist_m = 1
+      gain_overlap = max(0, 1 - max(0, 1)) = 0
+      eff_gain_thresh = 0
+
+    gain_subsize_marginal_thresh = P(A=0) × 0 + P(A=0) × 4
+                                 = 0 + 0.95 × 4 = 3.8
+    """
+    gene = "T"
+    t = Tree("(B:6.0,C:1.0)A;", format=1)
+    label_internal_nodes(t)
+    p1s = {"A": 0.05, "B": 0.30, "C": 0.90}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=4.0)
+    assert result["gain_subsize_marginal_thresh"] == pytest.approx(0.95 * 4.0, abs=1e-6)
+
+
+def test_thresh_fully_downstream_branch():
+    """
+    A branch whose parent is at or beyond dist_m is fully downstream:
+    gain_overlap = bl_v  →  eff_gain_thresh = min(bl_v, ub) = eff_bl.
+
+    Chain tree: Root → Int (bl=1.0) → B (bl=2.0)
+    p1: Root=0.1, Int=0.9, B=0.7,  upper_bound=10.
+
+    dist_m = min(nd where p1≥0.5) = nd(Int) = 1.0
+
+    Branch Int (Root→Int): parent_dist=0 < dist_m=1 → overlap=0, thresh=0
+    Branch B   (Int→B):    parent_dist=1 == dist_m=1 → overlap=2, thresh=min(2,10)=2
+      → B's full eff_bl (2.0) is included, matching its gain_subsize_marginal contribution
+
+    Expected gain_subsize_marginal_thresh:
+      P(Root=0)×0  +  P(Int=0)×2  =  0.9×0 + 0.1×2 = 0.2
+    """
+    gene = "T"
+    t = Tree("((B:2.0)Int:1.0)Root;", format=1)
+    label_internal_nodes(t)
+    p1s = {"Root": 0.1, "Int": 0.9, "B": 0.7}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=10.0)
+    # B branch is fully downstream: its full eff_bl=2.0 is counted
+    assert result["gain_subsize_marginal_thresh"] == pytest.approx(0.1 * 2.0, abs=1e-9)
+
+
+def test_thresh_leq_original(tiny_tree):
+    """gain_subsize_marginal_thresh ≤ gain_subsize_marginal always."""
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    p1s = {root_name: 0.1, "A": 0.8, "B": 0.9, "C": 0.6}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+    result = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+    assert result["gain_subsize_marginal_thresh"] <= result["gain_subsize_marginal"] + 1e-9
+
+
+def test_path_mask_restricts_flow(tiny_tree):
+    """
+    Restricting via PATH mask should reduce (or equal) gains_flow.
+    """
+    gene = "T"
+    label_internal_nodes(tiny_tree)
+    root_name = tiny_tree.name
+    # Root absent, A present, B absent, C absent → gain eligible only on A branch
+    p1s = {root_name: 0.0, "A": 0.9, "B": 0.05, "C": 0.05}
+    mp = _mp_df(tiny_tree, p1s)
+    ub = compute_branch_upper_bound(tiny_tree)
+
+    # Full (no mask)
+    full = count_all_marginal_stats(tiny_tree, gene, mp, ub)
+
+    # PATH mask
+    gain_mask, loss_mask = build_path_mask(tiny_tree, {gene: mp}, [gene])
+    gm1d = gain_mask[:, 0]
+    lm1d = loss_mask[:, 0]
+    masked = count_all_marginal_stats(tiny_tree, gene, mp, ub,
+                                      gain_mask_1d=gm1d, loss_mask_1d=lm1d)
+
+    assert masked["gains_flow"] <= full["gains_flow"] + 1e-9
+
+
+def test_parent_state_gain_eligibility_marginal():
+    """
+    gain_subsize_marginal is positive on a gain branch (parent=0, child=1).
+    This verifies that parent state (not child state) drives marginal gain eligibility.
+
+    Tree: Root(p1=0.0) → Leaf(p1=0.9), bl=1.
+    gain_subsize_marginal = P(Root=0) × bl = 1.0 × 1.0 = 1.0
+    (Even though the child has high P(1), the branch is gain-eligible via parent.)
+    """
+    gene = "T"
+    t = Tree("(Leaf:1.0)Root;", format=1)
+    label_internal_nodes(t)
+    p1s = {"Root": 0.0, "Leaf": 0.9}
+    mp = _mp_df(t, p1s)
+    result = count_all_marginal_stats(t, gene, mp, upper_bound=10.0)
+    # P(Root=0) = 1.0, eff_bl = min(1.0, 10.0) = 1.0
+    assert result["gain_subsize_marginal"] == pytest.approx(1.0, abs=1e-9)
+
+
+# ===========================================================================
+# count_joint_stats — JOINTP parent-state subsize vs old child-state subsize
+# ===========================================================================
+
+from simphyni.scripts.run_ancestral_reconstruction import count_joint_stats
+
+
+def test_joint_child_state_vs_parent_state_subsize():
+    """
+    Documents the difference between child-state (JOINT) and parent-state (JOINTP) subsize.
+
+    Tree: Root(0) → A(0):1 → B(1):1, upper_bound=10.
+
+    JOINT (child-state): gain_subsize counts branches where child==0.
+      - Root→A: child A = 0 → counts   (bl=1)
+      - A→B:   child B = 1 → does NOT count in gain_subsize; lands in loss_subsize
+
+    JOINTP (parent-state): gain_subsize_p counts branches where parent==0.
+      - Root→A: parent Root = 0 → counts   (bl=1)
+      - A→B:   parent A = 0   → also counts (bl=1) — the gain branch IS in the denominator
+
+    gain_subsize_p should be ≥ gain_subsize for this tree.
+    """
+    t = Tree("((B:1.0)A:1.0)Root;", format=1)
+    label_internal_nodes(t)
+    gene = "g"
+
+    def _annotate(states):
+        for node in t.traverse():
+            setattr(node, gene, frozenset({states.get(node.name, 0)}))
+
+    _annotate({"Root": 0, "A": 0, "B": 1})
+    ub = 10.0
+    r = count_joint_stats(t, gene, ub)
+
+    # Old JOINT: gain_subsize should only include Root→A (child A=0)
+    assert r["gain_subsize"] == pytest.approx(1.0, abs=1e-9), (
+        "JOINT gain_subsize should be 1.0 (only Root→A with child=0)"
+    )
+    # Old JOINT: A→B (child B=1) lands in loss_subsize, not gain_subsize
+    assert r["loss_subsize"] == pytest.approx(1.0, abs=1e-9), (
+        "JOINT loss_subsize should be 1.0 (A→B with child=1)"
+    )
+
+    # JOINTP: gain_subsize_p includes BOTH Root→A (parent=0) AND A→B (parent A=0)
+    assert r["gain_subsize_p"] == pytest.approx(2.0, abs=1e-9), (
+        "JOINTP gain_subsize_p should be 2.0 (both Root→A and A→B have parent=0)"
+    )
+    # JOINTP loss_subsize_p: no branch has parent==1 in this tree
+    assert r["loss_subsize_p"] == pytest.approx(0.0, abs=1e-9), (
+        "JOINTP loss_subsize_p should be 0 (no branch has parent==1)"
+    )
+
+    # Parent-state denominator is strictly larger than child-state denominator
+    assert r["gain_subsize_p"] >= r["gain_subsize"]

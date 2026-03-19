@@ -94,12 +94,13 @@ def _build_method_specs(counting=None, subsize=None, masking=None):
 
     Parameters filter to subsets; pass None to include all options.
     """
-    _COUNTING = counting or ['JOINT', 'FLOW', 'MARKOV', 'ENTROPY']
+    _COUNTING = counting or ['JOINT', 'JOINTP', 'FLOW', 'MARKOV', 'ENTROPY']
     _SUBSIZE  = subsize  or ['ORIGINAL', 'NO_FILTER', 'THRESH']
     _MASKING  = masking  or ['DIST', 'NONE', 'PATH']
     specs = []
     for c, s, m in _product(_COUNTING, _SUBSIZE, _MASKING):
-        needs_mppa = (c != 'JOINT') or (m == 'PATH')
+        # JOINTP needs MPPA only for PATH masking (to build path mask); otherwise JOINT-only.
+        needs_mppa = (c not in ('JOINT', 'JOINTP')) or (m == 'PATH')
         specs.append(MethodSpec(c, s, m, f"{c}_{s}_{m}", needs_mppa))
     return specs
 
@@ -191,8 +192,8 @@ def parse_args():
                    help="Delete all checkpoints and re-run from scratch")
     # Method combination selectors
     p.add_argument("--counting_methods", nargs="+",
-                   default=["JOINT", "FLOW", "MARKOV", "ENTROPY"],
-                   help="Counting methods to benchmark (default: all four)")
+                   default=["JOINT", "JOINTP", "FLOW", "MARKOV", "ENTROPY"],
+                   help="Counting methods to benchmark (default: all five)")
     p.add_argument("--subsize_methods", nargs="+",
                    default=["ORIGINAL", "NO_FILTER", "THRESH"],
                    help="Subsize methods to benchmark (default: all three)")
@@ -458,6 +459,10 @@ def precompute_simulations(
         df = df[(df["gain_subsize"] > 0) & (df["loss_subsize"] > 0)]
         df["gain_rate"] = df["gains"] / df["gain_subsize"]
         df["loss_rate"] = df["losses"] / df["loss_subsize"]
+        # Must match the non-cache filter in stability_evaluation: traits with zero
+        # gain/loss rate would make max(q01, 1e-9) the denominator, inflating
+        # relative_error to ~1e9 and producing astronomical stability values.
+        df = df[(df["gain_rate"] > 0) & (df["loss_rate"] > 0)]
         if df.empty:
             continue
 
@@ -1509,7 +1514,7 @@ def main():
     if args.method is not None:
         _raw = args.method.upper()
         _matched = None
-        for _c in ('JOINT', 'FLOW', 'MARKOV', 'ENTROPY'):
+        for _c in ('JOINT', 'JOINTP', 'FLOW', 'MARKOV', 'ENTROPY'):
             for _s in ('ORIGINAL', 'NO_FILTER', 'THRESH'):
                 for _m in ('DIST', 'NONE', 'PATH'):
                     if _raw == f"{_c}_{_s}_{_m}":
