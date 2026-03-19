@@ -459,10 +459,9 @@ def precompute_simulations(
         df = df[(df["gain_subsize"] > 0) & (df["loss_subsize"] > 0)]
         df["gain_rate"] = df["gains"] / df["gain_subsize"]
         df["loss_rate"] = df["losses"] / df["loss_subsize"]
-        # Must match the non-cache filter in stability_evaluation: traits with zero
-        # gain/loss rate would make max(q01, 1e-9) the denominator, inflating
-        # relative_error to ~1e9 and producing astronomical stability values.
-        df = df[(df["gain_rate"] > 0) & (df["loss_rate"] > 0)]
+        # Keep traits with at least one non-zero rate (gain OR loss).
+        # Traits where both rates are zero cannot change state and are uninformative.
+        df = df[(df["gain_rate"] > 0) | (df["loss_rate"] > 0)]
         if df.empty:
             continue
 
@@ -562,7 +561,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
             df = df[(df["gain_subsize"] > 0) & (df["loss_subsize"] > 0)]
             df["gain_rate"] = df["gains"] / df["gain_subsize"]
             df["loss_rate"] = df["losses"] / df["loss_subsize"]
-            df = df[(df["gain_rate"] > 0) & (df["loss_rate"] > 0)]
+            df = df[(df["gain_rate"] > 0) | (df["loss_rate"] > 0)]
             if df.empty:
                 print(f"  [WARN] {method_name}: no valid traits; skipping.", flush=True)
                 continue
@@ -746,21 +745,29 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         q10 = gene_true_loss[gene]
                         gr_vals = [td["gain_rate"] for td in trial_list]
                         lr_vals = [td["loss_rate"] for td in trial_list]
+                        _gr_mean = float(np.nanmean(gr_vals))
+                        _lr_mean = float(np.nanmean(lr_vals))
+                        # Symmetric relative error: 2|est-true|/(|est|+|true|+ε).
+                        # Handles zero true values without blowing up; returns 0 when
+                        # both are 0, and stays bounded (≤2) when one is zero.
+                        _sym_rel_err = lambda est, true: (
+                            2.0 * abs(est - true) / (abs(est) + abs(true) + 1e-12)
+                        )
                         records.append({
                             "method": method_name, "gene": gene,
                             "parameter": "gain_rate",
                             "true_value": q01,
-                            "mean_reestimate": float(np.mean(gr_vals)),
-                            "std_reestimate":  float(np.std(gr_vals)),
-                            "relative_error":  float(abs(np.mean(gr_vals) - q01) / max(q01, 1e-9)),
+                            "mean_reestimate": _gr_mean,
+                            "std_reestimate":  float(np.nanstd(gr_vals)),
+                            "relative_error":  _sym_rel_err(_gr_mean, q01),
                         })
                         records.append({
                             "method": method_name, "gene": gene,
                             "parameter": "loss_rate",
                             "true_value": q10,
-                            "mean_reestimate": float(np.mean(lr_vals)),
-                            "std_reestimate":  float(np.std(lr_vals)),
-                            "relative_error":  float(abs(np.mean(lr_vals) - q10) / max(q10, 1e-9)),
+                            "mean_reestimate": _lr_mean,
+                            "std_reestimate":  float(np.nanstd(lr_vals)),
+                            "relative_error":  _sym_rel_err(_lr_mean, q10),
                         })
 
                 # ── Select representative trial per gene → seed next iteration ─
