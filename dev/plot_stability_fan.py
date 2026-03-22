@@ -49,25 +49,34 @@ MEDIAN_COLOR = "#1A5276"
 SEED_COLOR   = "#922B21"  # dark red for iteration-0 diamond
 
 PARAM_LABELS = {
-    "gain_rate":    "Gain rate  (gains / gain_subsize)",
-    "loss_rate":    "Loss rate  (losses / loss_subsize)",
-    "gains":        "Gains (count)",
-    "losses":       "Losses (count)",
-    "prevalence":   "Prevalence (fraction of tips with trait = 1)",
+    "gain_rate":        "Gain rate  (gains / gain_subsize)",
+    "loss_rate":        "Loss rate  (losses / loss_subsize)",
+    "gains":            "Gains (count)",
+    "losses":           "Losses (count)",
+    "prevalence":       "Prevalence (fraction of tips with trait = 1)",
+    "parsimony":        "Fitch parsimony (min transitions)",
+    "mpd":              "MPD (mean pairwise phylogenetic distance)",
+    "expected_pi1":     "Expected stationary prevalence  \u03c0\u2081 = q\u2080\u2081/(q\u2080\u2081+q\u2081\u2080)",
+    "prevalence_drift": "Prevalence drift  (\u03c0\u2081 \u2212 observed prevalence)",
 }
 
-DEFAULT_PARAMS = ["gain_rate", "loss_rate", "gains", "losses", "prevalence"]
+DEFAULT_PARAMS = [
+    "gain_rate", "loss_rate", "gains", "losses", "prevalence",
+    "parsimony", "mpd", "expected_pi1", "prevalence_drift",
+]
 
 
 # ---------------------------------------------------------------------------
 # Core drawing function
 # ---------------------------------------------------------------------------
 
-def _draw_fan(ax: plt.Axes, tdf: pd.DataFrame, param: str) -> None:
+def _draw_fan(ax: plt.Axes, tdf: pd.DataFrame, param: str,
+              ylim: tuple | None = None) -> None:
     """
     Draw a fan plot for a single (gene, parameter) on the given axes.
 
-    tdf : trajectory DataFrame already filtered to one (method, gene).
+    tdf  : trajectory DataFrame already filtered to one (method, gene).
+    ylim : optional (lo, hi) to override automatic axis limits.
     """
     iters_all = sorted(tdf["iteration"].unique())
     iters_sim = [it for it in iters_all if it > 0]
@@ -118,8 +127,15 @@ def _draw_fan(ax: plt.Axes, tdf: pd.DataFrame, param: str) -> None:
     ax.set_ylabel(PARAM_LABELS.get(param, param), fontsize=9)
     ax.tick_params(labelsize=8)
     ax.spines[["top", "right"]].set_visible(False)
-    if param == "prevalence":
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    elif param in ("prevalence", "expected_pi1"):
         ax.set_ylim(0.0, 1.0)
+    elif param == "prevalence_drift":
+        ax.set_ylim(-1.0, 1.0)
+        ax.axhline(0, color="gray", lw=0.8, ls="--", zorder=1)
+    elif param in ("parsimony", "mpd"):
+        ax.set_ylim(bottom=0)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +143,8 @@ def _draw_fan(ax: plt.Axes, tdf: pd.DataFrame, param: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _gene_page(fig: plt.Figure, tdf: pd.DataFrame,
-               params: list[str], method: str, gene: str) -> None:
+               params: list[str], method: str, gene: str,
+               ylims: dict[str, tuple] | None = None) -> None:
     """Populate a figure with one row of fan plots, one panel per parameter."""
     n = len(params)
     axes = fig.subplots(1, n)
@@ -138,7 +155,7 @@ def _gene_page(fig: plt.Figure, tdf: pd.DataFrame,
         if param not in tdf.columns:
             ax.set_visible(False)
             continue
-        _draw_fan(ax, tdf, param)
+        _draw_fan(ax, tdf, param, ylim=(ylims or {}).get(param))
         ax.set_title(param, fontsize=10, fontweight="bold")
 
     fig.suptitle(f"{method}  —  {gene}", fontsize=11, fontweight="bold", y=1.01)
@@ -215,6 +232,16 @@ def main() -> None:
             print(f"  [SKIP] {method}: no data in trajectory file.")
             continue
 
+        # Precompute global y-limits for parsimony and mpd so all gene pages
+        # share a consistent scale (standardised across genes for this method).
+        ylims: dict[str, tuple] = {}
+        for param in ("parsimony", "mpd"):
+            if param in mdf.columns:
+                col_max = mdf[param].replace([np.inf, -np.inf], np.nan).dropna()
+                if not col_max.empty:
+                    global_max = float(col_max.max())
+                    ylims[param] = (0.0, global_max * 1.1)
+
         pdf_path = out_dir / f"{method}_stability_fan.pdf"
         with PdfPages(pdf_path) as pdf:
             pages = 0
@@ -224,7 +251,7 @@ def main() -> None:
                     continue
 
                 fig = plt.figure(figsize=(fig_w, fig_h))
-                _gene_page(fig, gdf, params, method, gene)
+                _gene_page(fig, gdf, params, method, gene, ylims=ylims)
                 pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
                 pages += 1

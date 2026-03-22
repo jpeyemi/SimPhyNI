@@ -540,6 +540,25 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
         leaf_names  = [n.name for n in master_tree.iter_leaves()]
     tree_newick = master_tree.write(format=1)
 
+    # ── Pairwise leaf distance matrix (used for per-trial MPD) ──────────────
+    # Same root-distance formula as simulation_accuracy_evaluation.
+    _root_dist_stab: dict = {}
+    for _node in master_tree.traverse('preorder'):
+        _root_dist_stab[id(_node)] = (
+            0.0 if _node.is_root()
+            else _root_dist_stab[id(_node.up)] + _node.dist
+        )
+    _leaves_ete_stab = list(master_tree.iter_leaves())
+    _n_leaves_stab   = len(_leaves_ete_stab)
+    _D_stab = np.zeros((_n_leaves_stab, _n_leaves_stab), dtype=float)
+    for _i in range(_n_leaves_stab):
+        for _j in range(_i + 1, _n_leaves_stab):
+            _lca = _leaves_ete_stab[_i].get_common_ancestor(_leaves_ete_stab[_j])
+            _d   = (_root_dist_stab[id(_leaves_ete_stab[_i])]
+                    + _root_dist_stab[id(_leaves_ete_stab[_j])]
+                    - 2.0 * _root_dist_stab[id(_lca)])
+            _D_stab[_i, _j] = _D_stab[_j, _i] = _d
+
     records: list = []            # stability_df rows (relative_error)
     trajectory_records: list = [] # trajectory_df rows (per trial)
     n_test_traits = 10
@@ -578,18 +597,45 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                 seed_prev = float(obs[gene].mean())
             else:
                 seed_prev = np.nan
+            _gr0 = float(trait_params.loc[gene, "gain_rate"])
+            _lr0 = float(trait_params.loc[gene, "loss_rate"])
+            # Stationary prevalence implied by the ACR-estimated rates.
+            # π₁ = q01/(q01+q10); drift = π₁ − observed prevalence.
+            _pi1  = _gr0 / (_gr0 + _lr0 + 1e-12)
+            _drift = (_pi1 - seed_prev) if not np.isnan(seed_prev) else np.nan
+            _gs0 = float(trait_params.loc[gene, "gain_subsize"])
+            _ls0 = float(trait_params.loc[gene, "loss_subsize"])
+            # Observed parsimony and MPD — baseline anchors for fan plots
+            if obs is not None and gene in obs.columns:
+                _obs_states = {n: int(obs.loc[n, gene])
+                               for n in leaf_names if n in obs.index}
+                _seed_pars = _fitch_parsimony_obs(master_tree, _obs_states)
+                _obs_pos = np.array([
+                    i for i, n in enumerate(leaf_names)
+                    if n in obs.index and int(obs.loc[n, gene]) == 1
+                ])
+                _seed_mpd = (float(_D_stab[np.ix_(_obs_pos, _obs_pos)].mean())
+                             if len(_obs_pos) > 1 else 0.0)
+            else:
+                _seed_pars = np.nan
+                _seed_mpd  = np.nan
             trajectory_records.append({
-                "method":       method_name,
-                "gene":         gene,
-                "iteration":    0,
-                "trial":        0,
-                "gains":        float(trait_params.loc[gene, "gains"]),
-                "losses":       float(trait_params.loc[gene, "losses"]),
-                "gain_subsize": float(trait_params.loc[gene, "gain_subsize"]),
-                "loss_subsize": float(trait_params.loc[gene, "loss_subsize"]),
-                "gain_rate":    float(trait_params.loc[gene, "gain_rate"]),
-                "loss_rate":    float(trait_params.loc[gene, "loss_rate"]),
-                "prevalence":   seed_prev,
+                "method":               method_name,
+                "gene":                 gene,
+                "iteration":            0,
+                "trial":                0,
+                "gains":                float(trait_params.loc[gene, "gains"]),
+                "losses":               float(trait_params.loc[gene, "losses"]),
+                "gain_subsize":         _gs0,
+                "loss_subsize":         _ls0,
+                "gain_rate":            _gr0,
+                "loss_rate":            _lr0,
+                "prevalence":           seed_prev,
+                "expected_pi1":         _pi1,
+                "prevalence_drift":     _drift,
+                "parsimony":            _seed_pars,
+                "mpd":                  _seed_mpd,
+                "eligible_tree_size":   _gs0 + _ls0,
             })
 
         # Resolve PATH masks for iteration 1 from the original ACR (masks_dict).
@@ -622,6 +668,33 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                                             gain_mask=iter_gain_mask,
                                             loss_mask=iter_loss_mask)
 
+                # ── Pre-compute per-gene packed metrics (parsimony + MPD) ───────
+                # Both are computed over all 64 trials at once from the packed
+                # lineages before unpacking individual trials below.
+                gene_packed_metrics: dict = {}
+                for _col_idx, _gene in enumerate(current_params.index):
+                    _packed_col = iter_lineages[:, _col_idx]
+                    # Fitch parsimony: vectorized over all 64 packed trials
+                    _leaf_packed = {leaf_names[_li]: _packed_col[_li]
+                                    for _li in range(len(leaf_names))}
+                    _pars_scores = _fitch_parsimony_packed(master_tree, _leaf_packed)
+                    # MPD: per trial, subsampled to ≤100 positive tips
+                    _trial_mpds = []
+                    for _t in range(64):
+                        _pos = np.where(
+                            ((_packed_col >> np.uint64(_t)) & np.uint64(1)).astype(bool)
+                        )[0]
+                        if len(_pos) < 2:
+                            _trial_mpds.append(np.nan)
+                        else:
+                            if len(_pos) > 100:
+                                _pos = np.random.choice(_pos, 100, replace=False)
+                            _trial_mpds.append(float(_D_stab[np.ix_(_pos, _pos)].mean()))
+                    gene_packed_metrics[_gene] = {
+                        'parsimony': _pars_scores,
+                        'mpd':       _trial_mpds,
+                    }
+
                 # ── Submit reconstructions ───────────────────────────────────
                 # futures_meta: (future, gene, trial, tgr, tlr, prevalence)
                 futures_meta = []
@@ -635,22 +708,33 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         tip_states = ((iter_lineages[:, col_idx] >> np.uint64(trial))
                                       & np.uint64(1)).astype(int)
                         prevalence = tip_states.sum() / len(tip_states)
-                        # Degenerate (all-0 or all-1): record directly, skip ACR
+                        # Degenerate (all-0 or all-1): record directly, skip ACR.
+                        # Impute interpretable rate values so these trials contribute
+                        # to the stability metric rather than being silently dropped:
+                        #   all-0 → gain failed  → gain_rate = 0.0, loss_rate = nan
+                        #   all-1 → loss failed  → gain_rate = nan, loss_rate = 0.0
+                        # eligible_tree_size = 0 in both cases (no eligible branches).
                         if tip_states.sum() == 0 or tip_states.sum() == len(tip_states):
+                            is_all_zero = tip_states.sum() == 0
                             gene_true_gain[gene] = tgr
                             gene_true_loss[gene]  = tlr
                             gene_trial_data.setdefault(gene, []).append({
-                                "trial":        trial,
-                                "gains":        np.nan,
-                                "losses":       np.nan,
-                                "gain_subsize": np.nan,
-                                "loss_subsize": np.nan,
-                                "gain_rate":    np.nan,
-                                "loss_rate":    np.nan,
-                                "dist":         np.nan,
-                                "loss_dist":    np.nan,
-                                "root_state":   np.nan,
-                                "prevalence":   prevalence,
+                                "trial":               trial,
+                                "gains":               np.nan,
+                                "losses":              np.nan,
+                                "gain_subsize":        np.nan,
+                                "loss_subsize":        np.nan,
+                                "gain_rate":           0.0 if is_all_zero else np.nan,
+                                "loss_rate":           0.0 if not is_all_zero else np.nan,
+                                "dist":                np.nan,
+                                "loss_dist":           np.nan,
+                                "root_state":          np.nan,
+                                "prevalence":          prevalence,
+                                "expected_pi1":        0.0 if is_all_zero else 1.0,
+                                "parsimony":           0,
+                                "mpd":                 np.nan,
+                                "eligible_tree_size":  0.0,
+                                "_degenerate":         True,
                             })
                             continue
                         sim_series = pd.Series(
@@ -685,18 +769,28 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         continue
                     gene_true_gain[gene] = tgr
                     gene_true_loss[gene] = tlr
+                    _pm = gene_packed_metrics.get(gene, {})
+                    _gr_t = gc / gs if gs > 0 else np.nan
+                    _lr_t = lc / ls if ls > 0 else np.nan
+                    _pi1_t = (_gr_t / (_gr_t + _lr_t + 1e-12)
+                              if not (np.isnan(_gr_t) or np.isnan(_lr_t)) else np.nan)
                     gene_trial_data.setdefault(gene, []).append({
-                        "trial":        trial,
-                        "gains":        gc,
-                        "losses":       lc,
-                        "gain_subsize": gs,
-                        "loss_subsize": ls,
-                        "gain_rate":    gc / gs if gs > 0 else np.nan,
-                        "loss_rate":    lc / ls if ls > 0 else np.nan,
-                        "dist":         float(tp['dist'].iloc[0]),
-                        "loss_dist":    float(tp['loss_dist'].iloc[0]),
-                        "root_state":   float(tp['root_state'].iloc[0]),
-                        "prevalence":   prev,
+                        "trial":               trial,
+                        "gains":               gc,
+                        "losses":              lc,
+                        "gain_subsize":        gs,
+                        "loss_subsize":        ls,
+                        "gain_rate":           _gr_t,
+                        "loss_rate":           _lr_t,
+                        "expected_pi1":        _pi1_t,
+                        "dist":                float(tp['dist'].iloc[0]),
+                        "loss_dist":           float(tp['loss_dist'].iloc[0]),
+                        "root_state":          float(tp['root_state'].iloc[0]),
+                        "prevalence":          prev,
+                        "parsimony":           int(_pm['parsimony'][trial]) if 'parsimony' in _pm else np.nan,
+                        "mpd":                 _pm['mpd'][trial] if 'mpd' in _pm else np.nan,
+                        "eligible_tree_size":  gs + ls,
+                        "_degenerate":         False,
                         # PATH masks from this trial's MPPA — used to rebuild
                         # iter_gain_mask / iter_loss_mask for the next iteration.
                         "_gain_mask_1d": res.get("_gain_mask_1d"),
@@ -711,87 +805,158 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                     if trial_list:
                         for td in trial_list:
                             trajectory_records.append({
-                                "method":       method_name,
-                                "gene":         gene,
-                                "iteration":    iteration,
-                                "trial":        td["trial"],
-                                "gains":        td["gains"],
-                                "losses":       td["losses"],
-                                "gain_subsize": td["gain_subsize"],
-                                "loss_subsize": td["loss_subsize"],
-                                "gain_rate":    td["gain_rate"],
-                                "loss_rate":    td["loss_rate"],
-                                "prevalence":   td["prevalence"],
+                                "method":               method_name,
+                                "gene":                 gene,
+                                "iteration":            iteration,
+                                "trial":                td["trial"],
+                                "gains":                td["gains"],
+                                "losses":               td["losses"],
+                                "gain_subsize":         td["gain_subsize"],
+                                "loss_subsize":         td["loss_subsize"],
+                                "gain_rate":            td["gain_rate"],
+                                "loss_rate":            td["loss_rate"],
+                                "prevalence":           td["prevalence"],
+                                "parsimony":            td.get("parsimony", np.nan),
+                                "mpd":                  td.get("mpd", np.nan),
+                                "eligible_tree_size":   td.get("eligible_tree_size", np.nan),
+                                "expected_pi1":         td.get("expected_pi1", np.nan),
+                                "prevalence_drift":     (
+                                    td["expected_pi1"] - td["prevalence"]
+                                    if not (np.isnan(td.get("expected_pi1", np.nan))
+                                            or np.isnan(td["prevalence"]))
+                                    else np.nan
+                                ),
                             })
                     else:
                         # All trials were dropped — record NaN so the iteration
                         # is present in the trajectory for every gene.
                         trajectory_records.append({
-                            "method":       method_name,
-                            "gene":         gene,
-                            "iteration":    iteration,
-                            "trial":        np.nan,
-                            "gains":        np.nan,
-                            "losses":       np.nan,
-                            "gain_subsize": np.nan,
-                            "loss_subsize": np.nan,
-                            "gain_rate":    np.nan,
-                            "loss_rate":    np.nan,
-                            "prevalence":   np.nan,
+                            "method":               method_name,
+                            "gene":                 gene,
+                            "iteration":            iteration,
+                            "trial":                np.nan,
+                            "gains":                np.nan,
+                            "losses":               np.nan,
+                            "gain_subsize":         np.nan,
+                            "loss_subsize":         np.nan,
+                            "gain_rate":            np.nan,
+                            "loss_rate":            np.nan,
+                            "prevalence":           np.nan,
+                            "parsimony":            np.nan,
+                            "mpd":                  np.nan,
+                            "eligible_tree_size":   np.nan,
+                            "expected_pi1":         np.nan,
+                            "prevalence_drift":     np.nan,
                         })
 
                     if iteration == 1 and gene in gene_true_gain:
                         q01 = gene_true_gain[gene]
                         q10 = gene_true_loss[gene]
+                        # Use ALL trials (including imputed degenerates) so that
+                        # methods which drive traits to fixation are penalised.
+                        # nanmean/nanstd skip NaN entries (e.g. loss_rate on
+                        # all-0 trials) while including the imputed 0.0 values.
                         gr_vals = [td["gain_rate"] for td in trial_list]
                         lr_vals = [td["loss_rate"] for td in trial_list]
-                        _gr_mean = float(np.nanmean(gr_vals))
-                        _lr_mean = float(np.nanmean(lr_vals))
+                        _gr_mean = float(np.nanmean(gr_vals)) if gr_vals else np.nan
+                        _lr_mean = float(np.nanmean(lr_vals)) if lr_vals else np.nan
+                        # Fraction of trials that were degenerate (all-0 or all-1)
+                        _n_degen = sum(1 for td in trial_list if td.get("_degenerate", False))
+                        _degen_frac = _n_degen / len(trial_list) if trial_list else np.nan
                         # Symmetric relative error: 2|est-true|/(|est|+|true|+ε).
-                        # Handles zero true values without blowing up; returns 0 when
-                        # both are 0, and stays bounded (≤2) when one is zero.
                         _sym_rel_err = lambda est, true: (
                             2.0 * abs(est - true) / (abs(est) + abs(true) + 1e-12)
                         )
                         records.append({
                             "method": method_name, "gene": gene,
                             "parameter": "gain_rate",
-                            "true_value": q01,
-                            "mean_reestimate": _gr_mean,
-                            "std_reestimate":  float(np.nanstd(gr_vals)),
-                            "relative_error":  _sym_rel_err(_gr_mean, q01),
+                            "true_value":        q01,
+                            "mean_reestimate":   _gr_mean,
+                            "std_reestimate":    float(np.nanstd(gr_vals)),
+                            "relative_error":    _sym_rel_err(_gr_mean, q01) if not np.isnan(_gr_mean) else np.nan,
+                            "degenerate_fraction": _degen_frac,
                         })
                         records.append({
                             "method": method_name, "gene": gene,
                             "parameter": "loss_rate",
-                            "true_value": q10,
-                            "mean_reestimate": _lr_mean,
-                            "std_reestimate":  float(np.nanstd(lr_vals)),
-                            "relative_error":  _sym_rel_err(_lr_mean, q10),
+                            "true_value":        q10,
+                            "mean_reestimate":   _lr_mean,
+                            "std_reestimate":    float(np.nanstd(lr_vals)),
+                            "relative_error":    _sym_rel_err(_lr_mean, q10) if not np.isnan(_lr_mean) else np.nan,
+                            "degenerate_fraction": _degen_frac,
                         })
 
                 # ── Select representative trial per gene → seed next iteration ─
+                # Selection operates in 5-dim normalised rate/parameter space
+                # over ALL trials (including imputed degenerates) so that methods
+                # which drive traits to fixation are not rewarded with a
+                # cherry-picked intermediate-prevalence seed.
+                #
+                # Dimensions: gain_rate, loss_rate, dist, loss_dist,
+                #             eligible_tree_size (= gain_subsize + loss_subsize)
+                # Normalisation: each dimension divided by the iter-0 seed value
+                # to express deviations as relative fractions.  NaN in either
+                # target or trial for a given dimension → that dimension is
+                # excluded from the distance for that trial.
+                _SEED_DIMS = ["gain_rate", "loss_rate", "dist", "loss_dist",
+                              "eligible_tree_size"]
+                _EPS_SEED  = 1e-12
+
                 gene_new_masks: dict = {}  # gene → (gain_mask_1d, loss_mask_1d)
                 for gene, trial_list in gene_trial_data.items():
                     if not trial_list:
                         continue
-                    # Use only non-degenerate trials (finite gains/losses) for seed selection
-                    valid = [td for td in trial_list
-                             if not (np.isnan(td["gains"]) or np.isnan(td["losses"]))]
-                    if not valid:
-                        continue
-                    target_g = float(np.mean([td["gains"]  for td in valid]))
-                    target_l = float(np.mean([td["losses"] for td in valid]))
-                    best_idx = int(np.argmin([
-                        np.sqrt((td["gains"] - target_g) ** 2 + (td["losses"] - target_l) ** 2)
-                        for td in valid
-                    ]))
-                    best = valid[best_idx]
-                    for col in ["gains", "losses", "gain_subsize", "loss_subsize",
-                                "dist", "loss_dist", "root_state"]:
-                        current_params.loc[gene, col] = best[col]
-                    current_params.loc[gene, "gain_rate"] = best["gain_rate"]
-                    current_params.loc[gene, "loss_rate"] = best["loss_rate"]
+
+                    # Gather all-trials values per dimension (NaN for missing)
+                    dim_vals: dict = {d: [] for d in _SEED_DIMS}
+                    for td in trial_list:
+                        dim_vals["gain_rate"].append(td.get("gain_rate", np.nan))
+                        dim_vals["loss_rate"].append(td.get("loss_rate", np.nan))
+                        dim_vals["dist"].append(td.get("dist", np.nan))
+                        dim_vals["loss_dist"].append(td.get("loss_dist", np.nan))
+                        _ets = td.get("eligible_tree_size", np.nan)
+                        dim_vals["eligible_tree_size"].append(_ets)
+
+                    # Target = nanmean per dimension across all trials
+                    target: dict = {d: float(np.nanmean(dim_vals[d])) for d in _SEED_DIMS}
+
+                    # Seed normalisation factors (iter-0 current_params values)
+                    _gs_seed = float(current_params.loc[gene, "gain_subsize"])
+                    _ls_seed = float(current_params.loc[gene, "loss_subsize"])
+                    seed_norm: dict = {
+                        "gain_rate":          float(current_params.loc[gene, "gain_rate"]),
+                        "loss_rate":          float(current_params.loc[gene, "loss_rate"]),
+                        "dist":               float(current_params.loc[gene, "dist"]),
+                        "loss_dist":          float(current_params.loc[gene, "loss_dist"]),
+                        "eligible_tree_size": _gs_seed + _ls_seed,
+                    }
+
+                    # Compute normalised RMS distance for each trial
+                    distances = []
+                    for i, td in enumerate(trial_list):
+                        sq_terms = []
+                        for d in _SEED_DIMS:
+                            t_val = target[d]
+                            v     = dim_vals[d][i]
+                            norm  = seed_norm[d]
+                            if np.isnan(t_val) or np.isnan(v):
+                                continue   # dimension excluded if either is NaN
+                            sq_terms.append(((v - t_val) / (abs(norm) + _EPS_SEED)) ** 2)
+                        distances.append(float(np.mean(sq_terms)) if sq_terms else np.inf)
+
+                    best_idx = int(np.argmin(distances))
+                    best = trial_list[best_idx]
+
+                    # Only update current_params if the best trial is non-degenerate;
+                    # if all trials are degenerate, carry forward the previous seed.
+                    if not best.get("_degenerate", True):
+                        for col in ["gains", "losses", "gain_subsize", "loss_subsize",
+                                    "dist", "loss_dist", "root_state"]:
+                            if not np.isnan(best.get(col, np.nan)):
+                                current_params.loc[gene, col] = best[col]
+                        current_params.loc[gene, "gain_rate"] = best["gain_rate"]
+                        current_params.loc[gene, "loss_rate"] = best["loss_rate"]
+
                     # Collect the best trial's PATH masks for next iteration's sim_bit
                     if best.get("_gain_mask_1d") is not None:
                         gene_new_masks[gene] = (best["_gain_mask_1d"], best["_loss_mask_1d"])
@@ -1363,11 +1528,23 @@ def print_stability_table(df: pd.DataFrame):
     if df.empty:
         print("  No stability data.")
         return
-    summary = (df.groupby(["method", "parameter"])["relative_error"]
-                  .agg(["mean", "median", "std"])
-                  .rename(columns={"mean": "mean_rel_err", "median": "median_rel_err",
-                                   "std": "std_rel_err"})
+    agg_cols = {"relative_error": ["mean", "median", "std"]}
+    if "degenerate_fraction" in df.columns:
+        agg_cols["degenerate_fraction"] = ["mean"]
+    summary = (df.groupby(["method", "parameter"])
+                  .agg(agg_cols)
                   .reset_index())
+    summary.columns = [
+        "_".join(c).strip("_") if c[1] else c[0]
+        for c in summary.columns
+    ]
+    rename_map = {
+        "relative_error_mean":   "mean_rel_err",
+        "relative_error_median": "median_rel_err",
+        "relative_error_std":    "std_rel_err",
+        "degenerate_fraction_mean": "mean_degen_frac",
+    }
+    summary = summary.rename(columns=rename_map)
     print(summary.to_string(index=False, float_format="{:.4f}".format))
 
 # ---------------------------------------------------------------------------
@@ -1378,22 +1555,32 @@ def compute_method_ranking(
     sim_acc_df: pd.DataFrame,
     stability_df: pd.DataFrame,
     pr_df: pd.DataFrame,
+    trajectory_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
-    Rank all methods across simulation accuracy, stability, and P/R.
+    Rank all methods and track diagnostic metrics.
 
-    Metrics used (lower = better unless noted):
-      sim_prev_error   — mean |sim_prevalence − obs_prevalence|
-      parsimony_calib  — mean |parsimony_ratio − 1|
-      mpd_calib        — mean |mpd_ratio − 1|
+    Composite ranking dimensions (rank_* columns contribute to composite_rank):
+      sim_prev_error   — mean |sim_prevalence − obs_prevalence|        (lower = better)
+      parsimony_calib  — mean |parsimony_ratio − 1|                    (lower = better)
+      mpd_calib        — mean |mpd_ratio − 1|                          (lower = better)
+      pr_f1            — F1 @ threshold 0.001, association="any"       (higher = better)
+      pr_auc           — trapezoidal PR-AUC across all thresholds,
+                         association="any"                             (higher = better)
+
+    Tracked but not ranked (informational only):
       clade_jsd        — mean clade_profile_jsd
       stability_gain   — mean gain_rate relative_error
       stability_loss   — mean loss_rate relative_error
-      pr_f1            — F1 @ threshold closest to 0.001, association="any"  (higher = better)
+      degen_fraction   — mean fraction of degenerate simulation trials
+      stationary_drift — mean |π₁ − observed_prevalence| at iter-0
 
-    Each method gets rank 1..N per metric; composite_rank = mean rank across
-    all available metrics.
+    composite_rank = mean of the 5 ranking dimension ranks (1 = best).
     """
+    # ── Dimensions that enter the composite rank ─────────────────────────────
+    _RANK_LOWER  = {"sim_prev_error", "parsimony_calib", "mpd_calib"}
+    _RANK_HIGHER = {"pr_f1", "pr_auc"}
+
     records: dict[str, dict] = {}
 
     # Simulation accuracy
@@ -1405,22 +1592,43 @@ def compute_method_ranking(
             records[method]["mpd_calib"]       = (grp["mpd_ratio"] - 1).abs().mean()
             records[method]["clade_jsd"]       = grp["clade_profile_jsd"].mean()
 
-    # Stability
+    # Stability (tracked, not ranked)
     if not stability_df.empty:
         for param, col in [("gain_rate", "stability_gain"), ("loss_rate", "stability_loss")]:
             sub = stability_df[stability_df["parameter"] == param]
             for method, val in sub.groupby("method")["relative_error"].mean().items():
                 records.setdefault(method, {})[col] = val
+        if "degenerate_fraction" in stability_df.columns:
+            for method, val in stability_df.groupby("method")["degenerate_fraction"].mean().items():
+                records.setdefault(method, {})["degen_fraction"] = val
 
-    # Precision / recall — F1 at threshold closest to 0.001, association="any"
+    # Stationary prevalence drift (tracked, not ranked)
+    if trajectory_df is not None and not trajectory_df.empty:
+        if "prevalence_drift" in trajectory_df.columns and "iteration" in trajectory_df.columns:
+            iter0 = trajectory_df[trajectory_df["iteration"] == 0].copy()
+            if not iter0.empty:
+                iter0["_abs_drift"] = iter0["prevalence_drift"].abs()
+                for method, val in iter0.groupby("method")["_abs_drift"].mean().items():
+                    records.setdefault(method, {})["stationary_drift"] = val
+
+    # Precision / recall — F1 at threshold 0.001 and trapezoidal PR-AUC
     if not pr_df.empty:
         pr_any = pr_df[pr_df["association"] == "any"].copy()
         if not pr_any.empty:
+            # F1 at threshold closest to 0.001
             pr_any["_td"] = (pr_any["threshold"] - 0.001).abs()
             best_thresh = pr_any["_td"].min()
-            pr_best = pr_any[pr_any["_td"] == best_thresh]
-            for _, row in pr_best.iterrows():
+            for _, row in pr_any[pr_any["_td"] == best_thresh].iterrows():
                 records.setdefault(row["method"], {})["pr_f1"] = row["F1"]
+
+            # PR-AUC: trapezoidal integral of precision over recall across all thresholds.
+            # Curve is formed by (recall, precision) pairs sorted by ascending recall.
+            # A random baseline has AUC = prevalence; higher is better.
+            for method, grp in pr_any.groupby("method"):
+                pts = grp[["recall", "precision"]].dropna().sort_values("recall")
+                if len(pts) >= 2:
+                    auc = float(np.trapz(pts["precision"].values, pts["recall"].values))
+                    records.setdefault(method, {})["pr_auc"] = auc
 
     if not records:
         return pd.DataFrame()
@@ -1428,24 +1636,21 @@ def compute_method_ranking(
     raw_df = pd.DataFrame.from_dict(records, orient="index")
     raw_df.index.name = "method"
 
-    # Rank each metric (1 = best)
-    lower_better  = ["sim_prev_error", "parsimony_calib", "mpd_calib",
-                     "clade_jsd", "stability_gain", "stability_loss"]
-    higher_better = ["pr_f1"]
-
+    # Create rank_* columns only for composite-ranking dimensions
     rank_df = raw_df.copy()
-    for col in lower_better:
+    for col in _RANK_LOWER:
         if col in rank_df.columns:
             rank_df[f"rank_{col}"] = rank_df[col].rank(ascending=True, na_option="bottom")
-    for col in higher_better:
+    for col in _RANK_HIGHER:
         if col in rank_df.columns:
             rank_df[f"rank_{col}"] = rank_df[col].rank(ascending=False, na_option="bottom")
 
     rank_cols = [c for c in rank_df.columns if c.startswith("rank_")]
-    if rank_cols:
-        rank_df["composite_rank"] = rank_df[rank_cols].mean(axis=1)
+    rank_df["composite_rank"] = (
+        rank_df[rank_cols].mean(axis=1) if rank_cols else np.nan
+    )
 
-    return rank_df.sort_values("composite_rank").reset_index()
+    return rank_df.sort_values("composite_rank", na_position="last").reset_index()
 
 
 def print_method_ranking(df: pd.DataFrame):
@@ -1454,19 +1659,32 @@ def print_method_ranking(df: pd.DataFrame):
         print("  No ranking data.")
         return
 
-    rank_cols   = [c for c in df.columns if c.startswith("rank_")]
-    metric_cols = [c for c in df.columns
-                   if c not in {"method", "composite_rank"} and not c.startswith("rank_")]
+    rank_cols = [c for c in df.columns if c.startswith("rank_")]
+
+    # Composite ranking dimensions (have rank_* columns)
+    ranked_metrics = [c.removeprefix("rank_") for c in rank_cols]
+    # Diagnostic metrics tracked but not part of composite rank
+    _ALL_DIAG = {"clade_jsd", "stability_gain", "stability_loss",
+                 "degen_fraction", "stationary_drift"}
+    diag_cols = [c for c in _ALL_DIAG if c in df.columns]
 
     # Full ranking table
-    print("\n  Full ranking (sorted by composite rank):")
+    print("\n  Composite ranking (sorted by composite rank):")
     disp = df[["method", "composite_rank"] + rank_cols].copy()
     print(disp.to_string(index=False, float_format="{:.2f}".format))
 
-    # Metric values table
-    if metric_cols:
-        print("\n  Metric values (lower = better, except pr_f1):")
-        print(df[["method"] + metric_cols].to_string(
+    # Ranking metric values
+    if ranked_metrics:
+        avail = [c for c in ranked_metrics if c in df.columns]
+        if avail:
+            print("\n  Ranking metric values:")
+            print(df[["method"] + avail].to_string(
+                index=False, float_format="{:.4f}".format))
+
+    # Diagnostic metric values (not ranked)
+    if diag_cols:
+        print("\n  Diagnostic metrics (tracked, not ranked):")
+        print(df[["method"] + diag_cols].to_string(
             index=False, float_format="{:.4f}".format))
 
     # Top 5 overall
@@ -1474,19 +1692,17 @@ def print_method_ranking(df: pd.DataFrame):
     for _, row in df.head(5).iterrows():
         print(f"    #{row['composite_rank']:.1f}  {row['method']}")
 
-    # Best per dimension
+    # Best per ranking dimension
     dim_labels = {
         "rank_sim_prev_error":  "Prevalence calibration",
         "rank_parsimony_calib": "Parsimony calibration",
         "rank_mpd_calib":       "MPD calibration",
-        "rank_clade_jsd":       "Clade profile accuracy",
-        "rank_stability_gain":  "Gain rate stability",
-        "rank_stability_loss":  "Loss rate stability",
         "rank_pr_f1":           "Precision/Recall F1",
+        "rank_pr_auc":          "Precision/Recall AUC",
     }
     available = [(rc, lbl) for rc, lbl in dim_labels.items() if rc in df.columns]
     if available:
-        print("\n  Best per evaluation dimension:")
+        print("\n  Best per ranking dimension:")
         for rank_col, label in available:
             best_row = df.loc[df[rank_col].idxmin()]
             print(f"    {label:<30}  {best_row['method']}")
@@ -1791,7 +2007,8 @@ def main():
 
     # ---- Method ranking ----
     if not stability_df.empty:
-        ranking_df = compute_method_ranking(sim_acc_df, stability_df, pr_df)
+        ranking_df = compute_method_ranking(sim_acc_df, stability_df, pr_df,
+                                            trajectory_df=trajectory_df)
         print_method_ranking(ranking_df)
         if not ranking_df.empty:
             ranking_df.to_csv(out_dir / "method_ranking.csv", index=False)
