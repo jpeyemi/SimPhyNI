@@ -707,7 +707,7 @@ def main():
     parser.add_argument(
         "--prefilter",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Pre-filter traits by Fisher exact test before reconstruction",
     )
     parser.add_argument("-r", "--run_traits", type=int, default=0,
