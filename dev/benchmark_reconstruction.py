@@ -1456,6 +1456,10 @@ def precision_recall_evaluation(
             continue
 
         sim.pairs, sim.obspairs = sim._get_pair_data2(sim.obsdf_modified, pairs)
+        # total_tests drives the multiple-testing correction padding; sync it
+        # to the actual pairs being evaluated (set during initialize_simulation_parameters
+        # on a different pairing, so it would otherwise be wrong).
+        sim.total_tests = len(sim.pairs)
         sim.run_simulation(gain_mask=gm, loss_mask=lm, gene_order=gene_order_for_mask)
         res = sim.get_results()
 
