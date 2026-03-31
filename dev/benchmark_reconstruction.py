@@ -192,14 +192,14 @@ def parse_args():
                    help="Delete all checkpoints and re-run from scratch")
     # Method combination selectors
     p.add_argument("--counting_methods", nargs="+",
-                   default=["JOINT", "JOINTP", "FLOW", "MARKOV", "ENTROPY"],
-                   help="Counting methods to benchmark (default: all five)")
+                   default=["JOINTP", "FLOW"],
+                   help="Counting methods to benchmark (default: JOINT and FLOW)")
     p.add_argument("--subsize_methods", nargs="+",
-                   default=["ORIGINAL", "NO_FILTER", "THRESH"],
-                   help="Subsize methods to benchmark (default: all three)")
+                   default=["ORIGINAL", "NO_FILTER",],
+                   help="Subsize methods to benchmark (default: ORIGINAL and NO_FILTER)")
     p.add_argument("--masking_methods", nargs="+",
-                   default=["DIST", "NONE", "PATH"],
-                   help="Simulation masking methods to benchmark (default: all three)")
+                   default=["DIST", "NONE"],
+                   help="Simulation masking methods to benchmark (default: DIST and NONE)")
     p.add_argument("--p_threshold", default=0.5, type=float,
                    help="Probability threshold for PATH masking (default: 0.5)")
     p.add_argument("--method", default=None, metavar="COUNTING_SUBSIZE_MASKING",
