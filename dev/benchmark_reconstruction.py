@@ -1397,21 +1397,41 @@ def precision_recall_evaluation(
 ) -> pd.DataFrame:
     """
     For each method's reconstruction output, run the SimPhyNI simulation
-    test and compute direction-aware precision / recall against known pairs.
+    on all labeled pairs and compute direction-aware precision / recall.
 
-    Evaluates three subsets:
+    Two evaluation modes are recorded per method:
+
+    1. Continuous PR AUC — uses -log10(pval_naive) as a ranked score with
+       sklearn.precision_recall_curve.  Scores are zeroed out for predictions
+       in the wrong direction so only correctly-directed hits contribute.
+       Null pairs (direction == 0) are included in the universe as ground-truth
+       negatives; a null pair predicted as significant counts as FP.
+
+    2. Discrete threshold P/R — binary predictions at pval_bh < {0.05, 0.01, 0.001}
+       for backward compatibility.
+
+    Evaluates two subsets per mode:
       positive  — synergistic (direction == 1)
       negative  — antagonistic (direction == -1)
-      any       — direction-agnostic (pair identity only)
     """
     try:
         from simphyni.Simulation.tree_simulator import TreeSimulator
+        from sklearn.metrics import precision_recall_curve, auc as sk_auc
     except ImportError as exc:
-        print(f"[WARN] Could not import TreeSimulator: {exc}")
+        print(f"[WARN] Could not import required module: {exc}")
         return pd.DataFrame()
 
     known_sets = _load_known_pairs(known_pairs_file)
     thresholds = [0.05, 0.01, 0.001]
+    eps = np.finfo(float).eps
+
+    # Build explicit pairs list from known_pairs_file so the simulation tests
+    # exactly the labeled pairs (pos + neg + null) regardless of column ordering
+    # in the annotation file.
+    _pl = pd.read_csv(known_pairs_file)
+    if "trait1" in _pl.columns:
+        _pl = _pl.rename(columns={"trait1": "T1", "trait2": "T2"})
+
     records = []
 
     for method_name, df in dfs.items():
@@ -1423,49 +1443,80 @@ def precision_recall_evaluation(
 
         sim = TreeSimulator(tree_file, df, ann_file)
         sim.initialize_simulation_parameters(pre_filter=False, run_traits=1)
-        refs = list(range(0,len(sim.obsdf.columns),2))
-        pairs = []
-        for i in refs:
-            pairs.extend([(sim.obsdf.columns[i],sim.obsdf.columns[i+j]) for j in range(1,2)])
+
+        # Build pair list from pair_labels — avoids any dependency on column order
+        obs_cols = set(sim.obsdf_modified.columns)
+        pairs = [
+            (str(r["T1"]), str(r["T2"]))
+            for _, r in _pl.iterrows()
+            if str(r["T1"]) in obs_cols and str(r["T2"]) in obs_cols
+        ]
+        if not pairs:
+            print(f"[WARN] {method_name}: no labeled pairs found in obsdf columns; skipping.")
+            continue
+
         sim.pairs, sim.obspairs = sim._get_pair_data2(sim.obsdf_modified, pairs)
         sim.run_simulation(gain_mask=gm, loss_mask=lm, gene_order=gene_order_for_mask)
         res = sim.get_results()
 
+        # ── Continuous PR AUC ────────────────────────────────────────────────
+        res = res.copy()
+        res["T1"] = res["T1"].astype(str)
+        res["T2"] = res["T2"].astype(str)
+        res["direction"] = res["direction"].astype(int)
+
+        # Canonical pair order consistent with known_sets
+        canonical = res.apply(lambda r: tuple(sorted([r["T1"], r["T2"]])), axis=1)
+        res["_ct1"] = canonical.str[0]
+        res["_ct2"] = canonical.str[1]
+        res["_nlp"] = -np.log10(res["pval_naive"].fillna(1.0).clip(lower=eps))
+
+        for target_dir, assoc_name in [(1, "positive"), (-1, "negative")]:
+            known_directional = known_sets["positive" if target_dir == 1 else "negative"]
+            y_true, y_score = [], []
+            for _, row in res.iterrows():
+                ct1, ct2 = row["_ct1"], row["_ct2"]
+                # Ground truth: 1 if this is a known pair in the target direction
+                y_true.append(1 if (ct1, ct2, target_dir) in known_directional else 0)
+                # Score: -log10(pval_naive) only for target-direction predictions;
+                # zero otherwise so wrong-direction calls don't boost score
+                y_score.append(float(row["_nlp"]) if int(row["direction"]) == target_dir else 0.0)
+
+            if sum(y_true) == 0:
+                pr_auc_val = float("nan")
+            else:
+                prec_c, rec_c, _ = precision_recall_curve(y_true, y_score)
+                pr_auc_val = float(sk_auc(rec_c, prec_c))
+
+            records.append({
+                "method":      method_name,
+                "threshold":   "continuous",
+                "association": assoc_name,
+                "PR_AUC":      pr_auc_val,
+                "TP": None, "FP": None, "FN": None,
+                "precision": None, "recall": None, "F1": None,
+            })
+
+        # ── Discrete threshold P/R (backward compat) ────────────────────────
+        known_neg_pairs = {(t1, t2) for t1, t2, _ in known_sets["negative"]}
+        known_pos_pairs = {(t1, t2) for t1, t2, _ in known_sets["positive"]}
+        known_any       = {(a, b, 0) for a, b, _ in known_sets["any"]}
+
         for thresh in thresholds:
             sig = res[res["pval_bh"] < thresh].copy()
-            sig["T1"] = sig["T1"].astype(str)
-            sig["T2"] = sig["T2"].astype(str)
-            sig["direction"] = sig["direction"].astype(int)
-
-            # Build directional prediction sets restricted to the labeled universe.
-            # Restricting to all_labeled ensures null pairs predicted as significant
-            # explicitly count as FP rather than being silently excluded.
-            all_labeled   = known_sets["all_labeled"]
-            known_neg_pairs = {(t1, t2) for t1, t2, _ in known_sets["negative"]}
-            known_pos_pairs = {(t1, t2) for t1, t2, _ in known_sets["positive"]}
 
             pred_dir = set()
             pred_any = set()
             for _, row in sig.iterrows():
-                d = int(row["direction"])
-                t1, t2 = sorted([str(row["T1"]), str(row["T2"])])
-                if (t1, t2) not in all_labeled:
-                    continue  # only evaluate labeled pairs
+                d   = int(row["direction"])
+                t1, t2 = row["_ct1"], row["_ct2"]
                 pred_dir.add((t1, t2, d))
                 pred_any.add((t1, t2, 0))
 
-            # Direction-filtered prediction sets.
-            # For "positive" eval: +1 predictions; pairs known to be -1 are excluded
-            #   so direction-switching errors don't inflate FP for the wrong question.
-            #   Null pairs predicted as +1 ARE included and count as FP.
-            # For "negative" eval: symmetric logic.
             pred_pos = {(t1, t2, d) for t1, t2, d in pred_dir
                         if d == 1 and (t1, t2) not in known_neg_pairs}
             pred_neg = {(t1, t2, d) for t1, t2, d in pred_dir
                         if d == -1 and (t1, t2) not in known_pos_pairs}
-
-            # Direction-agnostic: all labeled predictions vs all known interacting pairs
-            known_any = {(a, b, 0) for a, b, _ in known_sets["any"]}
 
             for subset_name, pred_set, known_set in [
                 ("positive", pred_pos, known_sets["positive"]),
@@ -1474,10 +1525,11 @@ def precision_recall_evaluation(
             ]:
                 stats = _pr_stats(pred_set, known_set)
                 records.append({
-                    "method": method_name,
-                    "threshold": thresh,
+                    "method":      method_name,
+                    "threshold":   thresh,
                     "association": subset_name,
-                    **stats
+                    "PR_AUC":      None,
+                    **stats,
                 })
 
     return pd.DataFrame(records)
