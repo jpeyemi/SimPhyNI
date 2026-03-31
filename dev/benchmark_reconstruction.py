@@ -1700,24 +1700,26 @@ def compute_method_ranking(
                 for method, val in iter0.groupby("method")["_abs_drift"].mean().items():
                     records.setdefault(method, {})["stationary_drift"] = val
 
-    # Precision / recall — F1 at threshold 0.001 and trapezoidal PR-AUC
+    # Precision / recall — F1 at threshold 0.001 and continuous PR-AUC
     if not pr_df.empty:
-        pr_any = pr_df[pr_df["association"] == "any"].copy()
-        if not pr_any.empty:
-            # F1 at threshold closest to 0.001
-            pr_any["_td"] = (pr_any["threshold"] - 0.001).abs()
-            best_thresh = pr_any["_td"].min()
-            for _, row in pr_any[pr_any["_td"] == best_thresh].iterrows():
+        # Discrete rows (threshold is numeric): used for F1 at threshold 0.001
+        pr_discrete = pr_df[
+            (pr_df["association"] == "any") & (pr_df["threshold"] != "continuous")
+        ].copy()
+        if not pr_discrete.empty:
+            pr_discrete["_td"] = (pr_discrete["threshold"].astype(float) - 0.001).abs()
+            best_thresh = pr_discrete["_td"].min()
+            for _, row in pr_discrete[pr_discrete["_td"] == best_thresh].iterrows():
                 records.setdefault(row["method"], {})["pr_f1"] = row["F1"]
 
-            # PR-AUC: trapezoidal integral of precision over recall across all thresholds.
-            # Curve is formed by (recall, precision) pairs sorted by ascending recall.
-            # A random baseline has AUC = prevalence; higher is better.
-            for method, grp in pr_any.groupby("method"):
-                pts = grp[["recall", "precision"]].dropna().sort_values("recall")
-                if len(pts) >= 2:
-                    auc = float(np.trapz(pts["precision"].values, pts["recall"].values))
-                    records.setdefault(method, {})["pr_auc"] = auc
+        # Continuous rows: PR-AUC computed via sklearn precision_recall_curve
+        # stored per (positive / negative) direction; average across both.
+        pr_cont = pr_df[pr_df["threshold"] == "continuous"].copy()
+        if not pr_cont.empty:
+            for method, grp in pr_cont.groupby("method"):
+                auc_vals = grp["PR_AUC"].dropna().values
+                if len(auc_vals) > 0:
+                    records.setdefault(method, {})["pr_auc"] = float(np.nanmean(auc_vals))
 
     if not records:
         return pd.DataFrame()
