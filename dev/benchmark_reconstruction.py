@@ -528,6 +528,12 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
 
     specs_by_label = {s.label: s for s in specs} if specs else {}
 
+    # Ensure obs index is string so leaf-name lookups work (leaf_names are
+    # always strings; a numeric obs.index would silently miss every leaf).
+    if obs is not None:
+        obs = obs.copy()
+        obs.index = obs.index.astype(str)
+
     # Tree setup — reuse cache if available
     if sims_cache and '_tree' in sims_cache:
         master_tree  = sims_cache['_tree']
@@ -615,7 +621,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                     if n in obs.index and int(obs.loc[n, gene]) == 1
                 ])
                 _seed_mpd = (float(_D_stab[np.ix_(_obs_pos, _obs_pos)].mean())
-                             if len(_obs_pos) > 1 else 0.0)
+                             if len(_obs_pos) > 1 else np.nan)
             else:
                 _seed_pars = np.nan
                 _seed_mpd  = np.nan
@@ -1308,25 +1314,39 @@ def _load_known_pairs(known_pairs_file: str) -> dict[str, set]:
     """
     Load known interacting pairs from a CSV.
 
-    Required columns : T1, T2, direction
-      direction must be  1 (positive / synergistic) or -1 (negative / antagonistic).
+    Accepts either column naming convention:
+      - T1, T2, direction   (legacy SimPhyNI format)
+      - trait1, trait2, direction  (benchmark pair_labels format)
+
+    direction must be 1 (positive/synergistic), -1 (negative/antagonistic),
+    or 0 (null — explicitly non-interacting).
 
     Returns a dict with keys:
-      'positive'  — set of (T1, T2) tuples with direction == 1
-      'negative'  — set of (T1, T2) tuples with direction == -1
-      'any'       — union of both (direction-agnostic)
+      'positive'     — set of (t1, t2, dir) with direction == 1
+      'negative'     — set of (t1, t2, dir) with direction == -1
+      'null'         — set of (t1, t2, dir) with direction == 0
+      'any'          — union of positive and negative (direction-agnostic)
+      'all_labeled'  — canonical (t1, t2) pairs across all directions;
+                       used to restrict predictions to the labeled universe
+                       so null pairs predicted as significant count as FP
 
-    Each set contains BOTH orderings (T1,T2) and (T2,T1) so lookups are
-    symmetric, matching how SimPhyNI de-duplicates pairs.
+    Each directional set uses canonical order (alphabetic sort on t1, t2).
     """
     known = pd.read_csv(known_pairs_file)
-    required = {"T1", "T2", "direction"}
-    missing = required - set(known.columns)
-    if missing:
+
+    # Normalise column names: accept trait1/trait2 or T1/T2
+    if "trait1" in known.columns and "trait2" in known.columns:
+        known = known.rename(columns={"trait1": "T1", "trait2": "T2"})
+    elif "T1" in known.columns and "T2" in known.columns:
+        pass  # already correct
+    else:
         raise ValueError(
-            f"known_pairs file must have columns T1, T2, direction.  Missing: {missing}\n"
-            f"  direction should be 1 (positive/synergistic) or -1 (negative/antagonistic)."
+            f"known_pairs file must have columns (T1, T2) or (trait1, trait2) plus direction. "
+            f"Found: {list(known.columns)}"
         )
+
+    if "direction" not in known.columns:
+        raise ValueError("known_pairs file is missing the 'direction' column.")
 
     known["T1"] = known["T1"].astype(str)
     known["T2"] = known["T2"].astype(str)
@@ -1335,14 +1355,25 @@ def _load_known_pairs(known_pairs_file: str) -> dict[str, set]:
     def _sym(subset):
         s = set()
         for _, row in subset.iterrows():
-            # Force a consistent order (A, B) where A < B
             t1, t2 = sorted([str(row["T1"]), str(row["T2"])])
             s.add((t1, t2, int(row["direction"])))
         return s
 
-    pos = _sym(known[known["direction"] ==  1])
-    neg = _sym(known[known["direction"] == -1])
-    return {"positive": pos, "negative": neg, "any": pos | neg}
+    pos  = _sym(known[known["direction"] ==  1])
+    neg  = _sym(known[known["direction"] == -1])
+    null = _sym(known[known["direction"] ==  0])
+
+    # Canonical identity set across all labeled directions — used to restrict
+    # the prediction universe so null pairs predicted as significant are FP
+    all_labeled = {(t1, t2) for t1, t2, _ in (pos | neg | null)}
+
+    return {
+        "positive":    pos,
+        "negative":    neg,
+        "null":        null,
+        "any":         pos | neg,
+        "all_labeled": all_labeled,
+    }
 
 
 def _pr_stats(pred_directional: set, known_directional: set) -> dict:
@@ -1406,32 +1437,34 @@ def precision_recall_evaluation(
             sig["T2"] = sig["T2"].astype(str)
             sig["direction"] = sig["direction"].astype(int)
 
-            # Build directional prediction sets (both orderings, consistent with known_sets)
+            # Build directional prediction sets restricted to the labeled universe.
+            # Restricting to all_labeled ensures null pairs predicted as significant
+            # explicitly count as FP rather than being silently excluded.
+            all_labeled   = known_sets["all_labeled"]
+            known_neg_pairs = {(t1, t2) for t1, t2, _ in known_sets["negative"]}
+            known_pos_pairs = {(t1, t2) for t1, t2, _ in known_sets["positive"]}
+
             pred_dir = set()
             pred_any = set()
             for _, row in sig.iterrows():
                 d = int(row["direction"])
-                # Canonical order: alphabetic sort
                 t1, t2 = sorted([str(row["T1"]), str(row["T2"])])
+                if (t1, t2) not in all_labeled:
+                    continue  # only evaluate labeled pairs
                 pred_dir.add((t1, t2, d))
                 pred_any.add((t1, t2, 0))
 
-            # Pair-identity sets for cross-direction exclusion
-            known_neg_pairs = {(t1, t2) for t1, t2, _ in known_sets["negative"]}
-            known_pos_pairs = {(t1, t2) for t1, t2, _ in known_sets["positive"]}
-
-            # Direction-filtered prediction sets with known-opposite pairs excluded:
-            #   "positive" eval: only +1 predictions; exclude pairs known to be -1
-            #   "negative" eval: only -1 predictions; exclude pairs known to be +1
-            # Rationale: a pair with a known ground-truth direction of -1 is
-            # irrelevant to the "positive" P/R question and should not contribute
-            # to FP — it conflates direction-switching errors with discovery errors.
+            # Direction-filtered prediction sets.
+            # For "positive" eval: +1 predictions; pairs known to be -1 are excluded
+            #   so direction-switching errors don't inflate FP for the wrong question.
+            #   Null pairs predicted as +1 ARE included and count as FP.
+            # For "negative" eval: symmetric logic.
             pred_pos = {(t1, t2, d) for t1, t2, d in pred_dir
                         if d == 1 and (t1, t2) not in known_neg_pairs}
             pred_neg = {(t1, t2, d) for t1, t2, d in pred_dir
                         if d == -1 and (t1, t2) not in known_pos_pairs}
 
-            # Direction-agnostic: all predictions vs all known pairs (no exclusion)
+            # Direction-agnostic: all labeled predictions vs all known interacting pairs
             known_any = {(a, b, 0) for a, b, _ in known_sets["any"]}
 
             for subset_name, pred_set, known_set in [
