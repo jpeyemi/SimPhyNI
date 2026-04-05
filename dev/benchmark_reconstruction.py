@@ -82,6 +82,16 @@ from pastml.acr import acr
 from pastml.ml import JOINT, MPPA
 
 # ---------------------------------------------------------------------------
+# D-statistic (phylogenetic signal) — scripts/d_statistic.py
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
+from d_statistic import (
+    get_or_calibrate as _d_get_or_calibrate,
+    get_null_distributions as _d_get_null_dists,
+    compute_d_statistic as _d_compute,
+)
+
+# ---------------------------------------------------------------------------
 # Method specification infrastructure
 # ---------------------------------------------------------------------------
 
@@ -546,6 +556,9 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
         leaf_names  = [n.name for n in master_tree.iter_leaves()]
     tree_newick = master_tree.write(format=1)
 
+    # Precompute tree structure and BM calibration for D-statistic (once per call)
+    _d_tree_struct, _d_bm_vals = _d_get_or_calibrate(tree_file, master_tree)
+
     # ── Pairwise leaf distance matrix (used for per-trial MPD) ──────────────
     # Same root-distance formula as simulation_accuracy_evaluation.
     _root_dist_stab: dict = {}
@@ -625,6 +638,16 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
             else:
                 _seed_pars = np.nan
                 _seed_mpd  = np.nan
+                _obs_states = {}
+            # D-statistic for seed (iteration 0)
+            if _obs_states:
+                _d_tip_seed = np.array([_obs_states.get(n, 0) for n in leaf_names], dtype=int)
+                _d_rand_s, _d_bm_s = _d_get_null_dists(
+                    tree_file, _d_tree_struct, _d_bm_vals, float(np.mean(_d_tip_seed))
+                )
+                _seed_d = _d_compute(_d_tree_struct, _d_tip_seed, _d_rand_s, _d_bm_s)
+            else:
+                _seed_d = np.nan
             trajectory_records.append({
                 "method":               method_name,
                 "gene":                 gene,
@@ -642,6 +665,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                 "parsimony":            _seed_pars,
                 "mpd":                  _seed_mpd,
                 "eligible_tree_size":   _gs0 + _ls0,
+                "d_statistic":          _seed_d,
             })
 
         # Resolve PATH masks for iteration 1 from the original ACR (masks_dict).
@@ -740,9 +764,15 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                                 "parsimony":           0,
                                 "mpd":                 np.nan,
                                 "eligible_tree_size":  0.0,
+                                "d_statistic":         np.nan,
                                 "_degenerate":         True,
                             })
                             continue
+                        # Compute D-statistic for this trial before submitting to executor
+                        _d_rand_t, _d_bm_t = _d_get_null_dists(
+                            tree_file, _d_tree_struct, _d_bm_vals, float(prevalence)
+                        )
+                        _trial_d_stat = _d_compute(_d_tree_struct, tip_states, _d_rand_t, _d_bm_t)
                         sim_series = pd.Series(
                             tip_states.astype(str), index=leaf_names, name=gene,
                         )
@@ -751,10 +781,10 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                             gene, tree_newick, sim_series, upper_bound,
                             uncertainty, int(tip_states.sum()),
                         )
-                        futures_meta.append((fut, gene, trial, tgr, tlr, prevalence))
+                        futures_meta.append((fut, gene, trial, tgr, tlr, prevalence, _trial_d_stat))
 
                 # ── Collect results ──────────────────────────────────────────
-                for fut, gene, trial, tgr, tlr, prev in futures_meta:
+                for fut, gene, trial, tgr, tlr, prev, _d_stat in futures_meta:
                     try:
                         res = fut.result()
                     except Exception as exc:
@@ -796,6 +826,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         "parsimony":           int(_pm['parsimony'][trial]) if 'parsimony' in _pm else np.nan,
                         "mpd":                 _pm['mpd'][trial] if 'mpd' in _pm else np.nan,
                         "eligible_tree_size":  gs + ls,
+                        "d_statistic":         _d_stat,
                         "_degenerate":         False,
                         # PATH masks from this trial's MPPA — used to rebuild
                         # iter_gain_mask / iter_loss_mask for the next iteration.
@@ -832,6 +863,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                                             or np.isnan(td["prevalence"]))
                                     else np.nan
                                 ),
+                                "d_statistic":          td.get("d_statistic", np.nan),
                             })
                     else:
                         # All trials were dropped — record NaN so the iteration
@@ -853,6 +885,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                             "eligible_tree_size":   np.nan,
                             "expected_pi1":         np.nan,
                             "prevalence_drift":     np.nan,
+                            "d_statistic":          np.nan,
                         })
 
                     if iteration == 1 and gene in gene_true_gain:
