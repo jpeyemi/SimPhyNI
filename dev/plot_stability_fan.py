@@ -56,13 +56,13 @@ PARAM_LABELS = {
     "prevalence":       "Prevalence (fraction of tips with trait = 1)",
     "parsimony":        "Fitch parsimony (min transitions)",
     "mpd":              "MPD (mean pairwise phylogenetic distance)",
-    "expected_pi1":     "Expected stationary prevalence  \u03c0\u2081 = q\u2080\u2081/(q\u2080\u2081+q\u2081\u2080)",
     "prevalence_drift": "Prevalence drift  (\u03c0\u2081 \u2212 observed prevalence)",
+    "d_statistic":      "D-statistic (phylogenetic signal)",
 }
 
 DEFAULT_PARAMS = [
     "gain_rate", "loss_rate", "gains", "losses", "prevalence",
-    "parsimony", "mpd", "expected_pi1", "prevalence_drift",
+    "parsimony", "mpd", "prevalence_drift", "d_statistic",
 ]
 
 
@@ -136,6 +136,9 @@ def _draw_fan(ax: plt.Axes, tdf: pd.DataFrame, param: str,
         ax.axhline(0, color="gray", lw=0.8, ls="--", zorder=1)
     elif param in ("parsimony", "mpd"):
         ax.set_ylim(bottom=0)
+    elif param == "d_statistic":
+        ax.axhline(0, color="gray", lw=0.8, ls="--", zorder=1)
+        ax.axhline(1, color="gray", lw=0.8, ls="--", alpha=0.5, zorder=1)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +163,105 @@ def _gene_page(fig: plt.Figure, tdf: pd.DataFrame,
 
     fig.suptitle(f"{method}  —  {gene}", fontsize=11, fontweight="bold", y=1.01)
     fig.tight_layout()
+
+
+# ---------------------------------------------------------------------------
+# Unified (multi-method overlay) plots
+# ---------------------------------------------------------------------------
+
+# Reduced-alpha bands for overlaid fans so multiple methods stay legible
+OVERLAY_BANDS = [
+    (0.00, 1.00, 0.04),
+    (0.05, 0.95, 0.07),
+    (0.10, 0.90, 0.10),
+    (0.20, 0.80, 0.14),
+    (0.30, 0.70, 0.20),
+]
+OVERLAY_PALETTE = [
+    "#2471A3", "#1E8449", "#922B21", "#7D3C98",
+    "#B7950B", "#1A5276", "#117A65", "#6E2F1A",
+]
+
+
+def _counting_group(method_name: str) -> str:
+    """Extract counting prefix: first '_'-delimited token (e.g. JOINT, FLOW)."""
+    return method_name.split("_")[0]
+
+
+def _draw_overlay_fan(ax: plt.Axes, gdf: pd.DataFrame, param: str,
+                      group_methods: list, palette: dict) -> None:
+    """
+    Draw superimposed fan plots for multiple methods on one axes.
+
+    gdf          : DataFrame filtered to one gene, all methods in the group.
+    group_methods: ordered list of method names to plot.
+    palette      : dict {method_name: color}.
+    """
+    iters_all: set = set()
+    for method in group_methods:
+        mdf = gdf[gdf["method"] == method]
+        if not mdf.empty:
+            iters_all.update(mdf["iteration"].unique())
+    iters_all_sorted = sorted(iters_all)
+    iters_sim = [it for it in iters_all_sorted if it > 0]
+
+    for method in group_methods:
+        mdf = gdf[gdf["method"] == method]
+        if mdf.empty:
+            continue
+        color = palette[method]
+
+        # Iteration-0 seed
+        seed_rows = mdf[mdf["iteration"] == 0]
+        if not seed_rows.empty:
+            seed_val = float(seed_rows[param].iloc[0])
+            ax.plot(0, seed_val, "D", color=color, ms=6, zorder=6)
+        else:
+            seed_val = None
+
+        if not iters_sim:
+            continue
+
+        q_data = {}
+        for it in iters_sim:
+            vals = mdf[mdf["iteration"] == it][param].dropna()
+            q_data[it] = vals
+
+        has_seed = seed_val is not None
+        x_bands = ([0] if has_seed else []) + list(iters_sim)
+
+        for q_lo, q_hi, alpha in OVERLAY_BANDS:
+            lo_vals = [float(q_data[it].quantile(q_lo)) if len(q_data[it]) else np.nan
+                       for it in iters_sim]
+            hi_vals = [float(q_data[it].quantile(q_hi)) if len(q_data[it]) else np.nan
+                       for it in iters_sim]
+            if has_seed:
+                lo_vals = [seed_val] + lo_vals
+                hi_vals = [seed_val] + hi_vals
+            ax.fill_between(x_bands, np.array(lo_vals), np.array(hi_vals),  # type: ignore[arg-type]
+                            alpha=alpha, color=color, linewidth=0)
+
+        medians_sim = [float(q_data[it].median()) if len(q_data[it]) else np.nan
+                       for it in iters_sim]
+        medians_all = ([seed_val] if has_seed else []) + medians_sim
+        ax.plot(x_bands, medians_all, "o-", color=color, lw=1.6, ms=4,
+                zorder=5, label=method)
+
+    ax.set_xticks(iters_all_sorted)
+    ax.set_xlabel("Iteration", fontsize=9)
+    ax.set_ylabel(PARAM_LABELS.get(param, param), fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    if param in ("prevalence", "expected_pi1"):
+        ax.set_ylim(0.0, 1.0)
+    elif param == "prevalence_drift":
+        ax.set_ylim(-1.0, 1.0)
+        ax.axhline(0, color="gray", lw=0.8, ls="--", zorder=1)
+    elif param in ("parsimony", "mpd"):
+        ax.set_ylim(bottom=0)
+    elif param == "d_statistic":
+        ax.axhline(0, color="gray", lw=0.8, ls="--", zorder=1)
+        ax.axhline(1, color="gray", lw=0.8, ls="--", alpha=0.5, zorder=1)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +366,57 @@ def main() -> None:
         print(f"  [{method}] {pages} gene pages → {pdf_path}")
         total_pages += pages
 
-    print(f"\nDone.  {total_pages} total pages written to {out_dir}/")
+    # ── Unified overlay PDFs: one per counting-method group ─────────────────
+    # Methods are grouped by the first '_'-delimited token (e.g. JOINT, FLOW).
+    # Each PDF has one page per gene; each page shows all group methods overlaid.
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for m in methods:
+        groups[_counting_group(m)].append(m)
+
+    unified_pages = 0
+    for group_name, group_methods in sorted(groups.items()):
+        palette = {m: OVERLAY_PALETTE[i % len(OVERLAY_PALETTE)]
+                   for i, m in enumerate(group_methods)}
+
+        pdf_path = out_dir / f"{group_name}_unified_stability_fan.pdf"
+        with PdfPages(pdf_path) as pdf:
+            pages = 0
+            for gene in genes:
+                gdf = df[df["gene"] == gene]
+                gdf = gdf[gdf["method"].isin(group_methods)]
+                if gdf.empty:
+                    continue
+
+                fig, axes = plt.subplots(1, n_panels, figsize=(fig_w, fig_h))
+                if n_panels == 1:
+                    axes = [axes]
+
+                for ax, param in zip(axes, params):
+                    if param not in gdf.columns:
+                        ax.set_visible(False)
+                        continue
+                    _draw_overlay_fan(ax, gdf, param, group_methods, palette)
+                    ax.set_title(param, fontsize=10, fontweight="bold")
+
+                handles = [plt.Line2D([0], [0], color=palette[m], label=m, lw=2)
+                           for m in group_methods]
+                fig.legend(handles=handles, loc="upper right", fontsize=7,
+                           bbox_to_anchor=(1.0, 1.0), framealpha=0.8)
+                fig.suptitle(f"{group_name} methods  \u2014  {gene}",
+                             fontsize=11, fontweight="bold", y=1.01)
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                pages += 1
+
+            if pages == 0:
+                pdf_path.unlink(missing_ok=True)
+            else:
+                print(f"  [{group_name} unified] {pages} gene pages → {pdf_path}")
+                unified_pages += pages
+
+    print(f"\nDone.  {total_pages} per-method + {unified_pages} unified pages written to {out_dir}/")
 
 
 if __name__ == "__main__":
