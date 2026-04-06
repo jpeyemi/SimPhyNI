@@ -114,24 +114,26 @@ rule reformat_tree:
 # Default: 'api'.  Override with --config reconstruction_method=legacy
 reconstruction_method = config.get('reconstruction_method', 'api')
 
-# uncertainty controls what run_ancestral_reconstruction.py writes to the ACR CSV,
+# reconstruction controls what run_ancestral_reconstruction.py writes to the ACR CSV,
 # which in turn determines which counting method runSimPhyNI.py can use:
 #
-#   'marginal' (default) — runs JOINT + MPPA reconstruction; writes the full
+#   'all' (default) — runs both JOINT and MPPA reconstruction; writes the full
 #              wide-format CSV including gains_flow, gains_markov, gains_entropy,
 #              marginal subsizes, dist_marginal, root_prob, etc.
 #              runSimPhyNI.py detects gains_flow and selects FLOW counting
 #              (the recommended, best-calibrated method per benchmark_reconstruction.py).
 #
-#   'threshold' — runs JOINT reconstruction only; writes only the JOINT columns
+#   'JOINT'    — runs JOINT reconstruction only; writes only the JOINT columns
 #              (gains, losses, gain_subsize, dist, …).  runSimPhyNI.py falls back
 #              to JOINT counting.  Use for legacy-compatible output or to reproduce
 #              pre-marginal pipeline results.
 #
-#   'both'     — identical to 'marginal'; retained for backward compatibility only.
+#   'MPPA'     — runs MPPA reconstruction only; writes strictly marginal columns
+#              (gains_flow, gain_subsize_marginal, dist_marginal, root_prob, etc.).
+#              runSimPhyNI.py detects gains_flow and selects FLOW counting.
 #
-# Override the default: --config uncertainty=threshold
-uncertainty_mode = config.get('uncertainty', 'marginal')
+# Override the default: --config reconstruction=JOINT
+reconstruction_mode = config.get('reconstruction', 'all')
 
 # --- Legacy pipeline: pastml CLI + GL_tab aggregation (unchanged) ----------
 
@@ -175,7 +177,7 @@ rule aggregatepastml:
         'python "{SCRIPTS_DIRECTORY}/GL_tab.py" '
         '"{input.inputsFile}" "{input.tree}" "{params.pastml_folder}" "{output.annotation}"'
 
-# --- API pipeline: single script, Python API, optional marginal uncertainty -
+# --- API pipeline: single script, Python API, configurable reconstruction mode -
 
 rule ancestral_reconstruction:
     threads: 64
@@ -196,7 +198,7 @@ rule ancestral_reconstruction:
         '--output_csv "{output.annotation}" '
         '--max_workers {params.max_workers} '
         '-r {params.runtype} '
-        '--uncertainty ' + uncertainty_mode + ' '
+        '--reconstruction ' + reconstruction_mode + ' '
         '--{prefilter}'
 
 # --- Route SimPhyNI to the selected pipeline output ---------------------

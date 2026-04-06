@@ -8,11 +8,12 @@ Uses the PastML Python API (no subprocess overhead) to run ancestral
 state reconstruction in parallel across all input traits, then counts
 gains, losses, subsizes, root state, and emergence threshold in-memory.
 
-Outputs a single CSV.  Two uncertainty modes control what is written:
+Outputs a single CSV.  The --reconstruction flag controls which methods run
+and which columns are written.
 
-Uncertainty modes
------------------
-marginal (pipeline default — set by Snakefile.py)
+Reconstruction modes
+--------------------
+all (pipeline default — set by Snakefile.py)
     Runs both JOINT and MPPA reconstruction per trait.  Writes the full
     wide-format CSV: all JOINT columns plus the following marginal columns
     derived from MPPA marginal probabilities:
@@ -30,23 +31,37 @@ marginal (pipeline default — set by Snakefile.py)
     When runSimPhyNI.py receives this CSV it detects gains_flow and selects
     FLOW counting (the recommended, best-calibrated method).
 
-threshold (legacy)
+JOINT
     Runs JOINT reconstruction only.  Writes the standard JOINT columns
     (gains, losses, gain_subsize, loss_subsize, dist, loss_dist, root_state).
     runSimPhyNI.py detects the absence of gains_flow and falls back to JOINT
     counting.  Use this to reproduce pre-marginal pipeline results or for
     faster runs where marginal calibration is not needed.
 
-both
-    Identical to marginal.  Retained for backward compatibility only.
+MPPA
+    Runs MPPA reconstruction only.  Writes strictly marginal columns
+    (gains_flow, losses_flow, gain_subsize_marginal, dist_marginal, root_prob,
+    and related variants).  runSimPhyNI.py detects gains_flow and selects
+    FLOW counting.
+
+Short output (--short flag)
+---------------------------
+Trims the CSV to a minimal column set optimised for each mode:
+
+  JOINT --short : gene, gains, losses, count, dist, loss_dist,
+                  gain_subsize, loss_subsize, root_state
+  MPPA  --short : gene, gains_flow, losses_flow, count, dist, loss_dist,
+                  gain_subsize_marginal, loss_subsize_marginal,
+                  dist_marginal, loss_dist_marginal, root_prob
+  all   --short : union of both sets above
 
 Counting methods (selected downstream in runSimPhyNI.py / simulation.py)
 -------------------------------------------------------------------------
 The ACR CSV is produced once.  runSimPhyNI.py selects a counting method
 automatically based on which columns are present:
 
-  CSV produced with uncertainty=marginal  →  FLOW counting (default)
-  CSV produced with uncertainty=threshold →  JOINT counting (fallback)
+  CSV produced with --reconstruction all or MPPA  →  FLOW counting (default)
+  CSV produced with --reconstruction JOINT        →  JOINT counting (fallback)
 
 For development / benchmarking, all counting × subsize × masking combinations
 (JOINT/FLOW/MARKOV/ENTROPY × ORIGINAL/NO_FILTER/THRESH × DIST/NONE/PATH) are
@@ -515,7 +530,7 @@ def reconstruct_trait(
     tree_newick: str,
     df_col: pd.Series,
     upper_bound: float,
-    uncertainty: str,
+    reconstruction: str,
     gene_count: int,
 ) -> dict | None:
     """
@@ -523,14 +538,14 @@ def reconstruct_trait(
 
     Parameters
     ----------
-    gene        : trait name
-    tree_newick : Newick string
-    df_col      : Series with index = tip names, values = trait states
-    upper_bound : branch-length upper bound for subsize calculation
-    uncertainty : 'threshold', 'marginal', or 'both'
-    gene_count  : number of tips with trait = 1 (for 'count' column)
+    gene           : trait name
+    tree_newick    : Newick string
+    df_col         : Series with index = tip names, values = trait states
+    upper_bound    : branch-length upper bound for subsize calculation
+    reconstruction : 'JOINT', 'MPPA', or 'all'
+    gene_count     : number of tips with trait = 1 (for 'count' column)
 
-    When uncertainty in ('marginal', 'both'), the returned dict also contains:
+    When reconstruction in ('MPPA', 'all'), the returned dict also contains:
       '_mp_df'        — MPPA marginal_probabilities DataFrame (strip before CSV)
       '_gain_mask_1d' — bool array (n_nodes,) PATH gain eligibility mask
       '_loss_mask_1d' — bool array (n_nodes,) PATH loss eligibility mask
@@ -560,7 +575,7 @@ def reconstruct_trait(
         stats["count"] = int(gene_count)
 
         # --- MPPA marginal reconstruction (if requested) ---
-        if uncertainty in ("marginal", "both"):
+        if reconstruction in ("MPPA", "all"):
             # No need to copy the tree: acr() with df=ann calls preannotate_forest()
             # unconditionally before any ML computation, which re-annotates all tips
             # from the DataFrame and overwrites any JOINT annotations.
@@ -701,9 +716,18 @@ def main():
                         help="Process pool size for parallel reconstruction")
     parser.add_argument("--summary_file", default=None,
                         help="Optional text summary of run status")
-    parser.add_argument("--uncertainty", choices=["threshold", "marginal", "both"],
-                        default="threshold",
-                        help="Uncertainty mode (default: threshold)")
+    parser.add_argument(
+        "--reconstruction", choices=["all", "JOINT", "MPPA"],
+        default="all",
+        help="Reconstruction mode: 'all' runs both JOINT and MPPA (full output); "
+             "'JOINT' runs only JOINT reconstruction; 'MPPA' runs only MPPA "
+             "reconstruction. (default: all)"
+    )
+    parser.add_argument(
+        "--short", action="store_true", default=False,
+        help="Write trimmed output: core columns only, optimised for the chosen "
+             "reconstruction mode."
+    )
     parser.add_argument(
         "--prefilter",
         action=argparse.BooleanOptionalAction,
@@ -718,7 +742,7 @@ def main():
     tree_file = args.tree_file
     output_csv = Path(args.output_csv)
     max_workers = args.max_workers
-    uncertainty = args.uncertainty
+    reconstruction = args.reconstruction
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
@@ -748,7 +772,7 @@ def main():
                  for g in sample_ids}
 
     print(f"Running reconstruction for {len(sample_ids)} traits "
-          f"(uncertainty={uncertainty}, workers={max_workers}) ...", flush=True)
+          f"(reconstruction={reconstruction}, workers={max_workers}) ...", flush=True)
 
     # ---- Parallel reconstruction ----
     results = {}
@@ -763,7 +787,7 @@ def main():
                 tree_newick,
                 obs_filtered[gene],         
                 upper_bound,
-                uncertainty,
+                reconstruction,
                 gene_sums.get(gene, 0),
             ): gene
             for gene in sample_ids
@@ -826,8 +850,31 @@ def main():
         "dist_marginal", "loss_dist_marginal", "root_prob",
     ]
 
-    present_cols = core_cols + [c for c in marginal_cols if c in df_out.columns]
-    df_out = df_out[[c for c in present_cols if c in df_out.columns]]
+    # Short column sets
+    _short_joint = ["gene", "gains", "losses", "count", "dist", "loss_dist",
+                    "gain_subsize", "loss_subsize", "root_state"]
+    _short_mppa  = ["gene", "gains_flow", "losses_flow", "count", "dist", "loss_dist",
+                    "gain_subsize_marginal", "loss_subsize_marginal",
+                    "dist_marginal", "loss_dist_marginal", "root_prob"]
+
+    if args.short:
+        if reconstruction == "JOINT":
+            output_cols = _short_joint
+        elif reconstruction == "MPPA":
+            output_cols = _short_mppa
+        else:  # "all"
+            seen: set = set()
+            output_cols = [c for c in _short_joint + _short_mppa
+                           if not (c in seen or seen.add(c))]
+    else:
+        if reconstruction == "JOINT":
+            output_cols = core_cols
+        elif reconstruction == "MPPA":
+            output_cols = marginal_cols
+        else:  # "all"
+            output_cols = core_cols + marginal_cols
+
+    df_out = df_out[[c for c in output_cols if c in df_out.columns]]
     df_out.to_csv(output_csv, index=False)
     print(f"\n[OK] Results written -> {output_csv}", flush=True)
 
@@ -839,7 +886,7 @@ def main():
         f"Total traits attempted : {len(sample_ids)}",
         f"Successful             : {success}",
         f"Failed                 : {failed}",
-        f"Uncertainty mode       : {uncertainty}",
+        f"Reconstruction mode    : {reconstruction}",
         "\nJob complete.",
     ]
     if args.summary_file:
