@@ -8,7 +8,7 @@ Tests cover:
   - count_joint_stats  (JOINT-annotated tree, hand-crafted states)
   - count_all_marginal_stats  (FLOW / MARKOV / ENTROPY counting variants)
   - build_path_mask  (per-node eligibility masks)
-  - reconstruct_trait  (column coverage for each uncertainty mode)
+  - reconstruct_trait  (column coverage for each reconstruction mode)
 """
 
 import pytest
@@ -360,21 +360,21 @@ def test_reconstruct_trait_constant_returns_none(obs_data_and_tree):
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="threshold",
+        reconstruction="JOINT",
         gene_count=0,
     )
     assert result is None
 
 
-def test_reconstruct_trait_threshold_columns(obs_data_and_tree):
-    """uncertainty='threshold' → output has all core columns."""
+def test_reconstruct_trait_joint_columns(obs_data_and_tree):
+    """reconstruction='JOINT' → output has all core columns."""
     tree_str, obs = obs_data_and_tree
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="threshold",
+        reconstruction="JOINT",
         gene_count=int(obs["trait"].sum()),
     )
     assert result is not None
@@ -384,15 +384,15 @@ def test_reconstruct_trait_threshold_columns(obs_data_and_tree):
     assert "gains_flow" not in result
 
 
-def test_reconstruct_trait_marginal_columns(obs_data_and_tree):
-    """uncertainty='marginal' → output includes FLOW / MARKOV / ENTROPY columns."""
+def test_reconstruct_trait_mppa_columns(obs_data_and_tree):
+    """reconstruction='MPPA' → output includes FLOW / MARKOV / ENTROPY columns."""
     tree_str, obs = obs_data_and_tree
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="marginal",
+        reconstruction="MPPA",
         gene_count=int(obs["trait"].sum()),
     )
     assert result is not None
@@ -400,15 +400,15 @@ def test_reconstruct_trait_marginal_columns(obs_data_and_tree):
         assert col in result, f"Missing marginal column: {col}"
 
 
-def test_reconstruct_trait_both_has_all_columns(obs_data_and_tree):
-    """uncertainty='both' → output is the union of threshold + marginal columns."""
+def test_reconstruct_trait_all_has_all_columns(obs_data_and_tree):
+    """reconstruction='all' → output is the union of JOINT + MPPA columns."""
     tree_str, obs = obs_data_and_tree
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="both",
+        reconstruction="all",
         gene_count=int(obs["trait"].sum()),
     )
     assert result is not None
@@ -451,15 +451,15 @@ def test_node_dists_from_root_star_tree(tiny_tree):
 # reconstruct_trait — _mp_df in-memory handling
 # ===========================================================================
 
-def test_reconstruct_trait_both_mp_df_in_memory(obs_data_and_tree):
-    """uncertainty='both' stores _mp_df in result; it must be stripped before CSV output."""
+def test_reconstruct_trait_all_mp_df_in_memory(obs_data_and_tree):
+    """reconstruction='all' stores _mp_df in result; it must be stripped before CSV output."""
     tree_str, obs = obs_data_and_tree
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="both",
+        reconstruction="all",
         gene_count=int(obs["trait"].sum()),
     )
     assert result is not None
@@ -473,15 +473,15 @@ def test_reconstruct_trait_both_mp_df_in_memory(obs_data_and_tree):
     assert "root_prob" in csv_row
 
 
-def test_reconstruct_trait_threshold_no_mp_df(obs_data_and_tree):
-    """uncertainty='threshold' → _mp_df must NOT be present (MPPA not run)."""
+def test_reconstruct_trait_joint_no_mp_df(obs_data_and_tree):
+    """reconstruction='JOINT' → _mp_df must NOT be present (MPPA not run)."""
     tree_str, obs = obs_data_and_tree
     result = reconstruct_trait(
         gene="trait",
         tree_newick=tree_str,
         df_col=obs["trait"],
         upper_bound=10.0,
-        uncertainty="threshold",
+        reconstruction="JOINT",
         gene_count=int(obs["trait"].sum()),
     )
     assert result is not None

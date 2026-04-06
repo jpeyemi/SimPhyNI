@@ -57,13 +57,13 @@ def main():
     #   with a P(parent=0)-weighted subsize denominator (IQR-filtered) and
     #   dist_marginal as the emergence threshold gate.
     #   Requires 'gains_flow' in the CSV, which is written by
-    #   run_ancestral_reconstruction.py when --uncertainty=marginal
+    #   run_ancestral_reconstruction.py when --reconstruction=MPPA or all
     #   (the Snakefile default).
     #
     # JOINT + ORIGINAL (legacy fallback):
     #   Hard discrete counts from the JOINT ML reconstruction.
     #   Used automatically when the CSV lacks 'gains_flow' — i.e. ACR was run
-    #   with --uncertainty=threshold or via the legacy pastml CLI pipeline.
+    #   with --reconstruction=JOINT or via the legacy pastml CLI pipeline.
     if 'gains_flow' in pastml_df.columns:
         pastml_df = build_sim_params(pastml_df, counting='FLOW', subsize='ORIGINAL')
     else:
