@@ -114,6 +114,12 @@ rule reformat_tree:
 # Default: 'api'.  Override with --config reconstruction_method=legacy
 reconstruction_method = config.get('reconstruction_method', 'api')
 
+# acr_shard_size: when > 0, split trait CSV into chunks of this many columns
+# and run ancestral_reconstruction as one job per shard (lower per-job memory,
+# scales across cluster nodes).  Set via --config acr_shard_size=20000.
+# Default 0 = no sharding (single-job API pipeline as before).
+acr_shard_size = int(config.get('acr_shard_size', 0))
+
 # reconstruction controls what run_ancestral_reconstruction.py writes to the ACR CSV,
 # which in turn determines which counting method runSimPhyNI.py can use:
 #
@@ -200,6 +206,73 @@ rule ancestral_reconstruction:
         '-r {params.runtype} '
         '--reconstruction ' + reconstruction_mode + ' '
         '--{prefilter}'
+
+# --- Optional sharded API pipeline (acr_shard_size > 0) ------------------
+# Splits the trait CSV into N column-shards, runs one ancestral_reconstruction
+# job per shard (each with lower memory), then merges the output CSVs.
+# Activate with:  --config acr_shard_size=20000
+
+if acr_shard_size > 0:
+    checkpoint split_traits:
+        threads: 1
+        input:
+            inp=rules.reformat_csv.output.out
+        output:
+            shard_dir=directory(f"{base_tmp}/{{sample}}/0-formatting/shards")
+        params:
+            shard_size=acr_shard_size
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        shell:
+            'python "{SCRIPTS_DIRECTORY}/split_traits.py" '
+            '--inputs_file "{input.inp}" '
+            '--output_dir "{output.shard_dir}" '
+            '--shard_size {params.shard_size}'
+
+    rule ancestral_reconstruction_shard:
+        threads: 64
+        input:
+            inputsFile=f"{base_tmp}/{{sample}}/0-formatting/shards/{{shard}}.csv",
+            tree=rules.reformat_tree.output.out
+        output:
+            annotation=f"{base_tmp}/{{sample}}/1-PastML-api/shards/{{shard}}.csv"
+        params:
+            max_workers=lambda wildcards, threads: threads,
+            runtype=lambda w: len(run_dict.get(w.sample, []))
+        resources:
+            mem_mb=16000
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        shell:
+            'python "{SCRIPTS_DIRECTORY}/run_ancestral_reconstruction.py" '
+            '--inputs_file "{input.inputsFile}" '
+            '--tree_file "{input.tree}" '
+            '--output_csv "{output.annotation}" '
+            '--max_workers {params.max_workers} '
+            '-r {params.runtype} '
+            '--reconstruction ' + reconstruction_mode + ' '
+            '--{prefilter}'
+
+    def _acr_shard_outputs(wildcards):
+        shard_dir = checkpoints.split_traits.get(sample=wildcards.sample).output.shard_dir
+        shards = glob_wildcards(os.path.join(shard_dir, "{shard}.csv")).shard
+        return expand(
+            f"{base_tmp}/{wildcards.sample}/1-PastML-api/shards/{{shard}}.csv",
+            shard=shards,
+        )
+
+    rule merge_acr:
+        threads: 1
+        input:
+            shards=_acr_shard_outputs
+        output:
+            annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        run:
+            import pandas as pd
+            dfs = [pd.read_csv(f) for f in sorted(input.shards)]
+            pd.concat(dfs, ignore_index=True).to_csv(output[0], index=False)
 
 # --- Route SimPhyNI to the selected pipeline output ---------------------
 
