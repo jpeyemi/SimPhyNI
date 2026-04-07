@@ -70,6 +70,7 @@ selection — no re-running ACR per method combination.
 """
 
 import argparse
+import gc
 import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -84,6 +85,20 @@ warnings.filterwarnings("ignore")
 
 from pastml.acr import acr
 from pastml.ml import JOINT, MPPA
+
+# ---------------------------------------------------------------------------
+# Worker-process state (populated by _worker_init; avoids re-parsing per task)
+# ---------------------------------------------------------------------------
+_WORKER_TREE: Tree | None = None
+_WORKER_UPPER_BOUND: float | None = None
+
+
+def _worker_init(tree_newick: str, upper_bound: float) -> None:
+    """Called once per worker process to cache the parsed tree."""
+    global _WORKER_TREE, _WORKER_UPPER_BOUND
+    _WORKER_TREE = Tree(tree_newick, format=1)
+    label_internal_nodes(_WORKER_TREE)
+    _WORKER_UPPER_BOUND = upper_bound
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -554,8 +569,11 @@ def reconstruct_trait(
     sim_bit for the next stability iteration's simulation.
     """
     try:
-        tree = Tree(tree_newick, format=1)
-        label_internal_nodes(tree)
+        if _WORKER_TREE is not None:
+            tree = _WORKER_TREE.copy()
+        else:
+            tree = Tree(tree_newick, format=1)
+            label_internal_nodes(tree)
 
         ann = df_col.astype(str).to_frame(name=gene)
 
@@ -714,6 +732,9 @@ def main():
                         help="Output CSV path (pastmlout.csv equivalent)")
     parser.add_argument("--max_workers", type=int, default=8,
                         help="Process pool size for parallel reconstruction")
+    parser.add_argument("--chunk-size", type=int, default=10_000, dest="chunk_size",
+                        help="Number of traits processed per memory chunk "
+                             "(lower = less peak RAM; default: 10000)")
     parser.add_argument("--summary_file", default=None,
                         help="Optional text summary of run status")
     parser.add_argument(
@@ -774,48 +795,7 @@ def main():
     print(f"Running reconstruction for {len(sample_ids)} traits "
           f"(reconstruction={reconstruction}, workers={max_workers}) ...", flush=True)
 
-    # ---- Parallel reconstruction ----
-    results = {}
-    total = len(sample_ids)
-    log_every = max(1, total // 20) 
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                reconstruct_trait,
-                gene,
-                tree_newick,
-                obs_filtered[gene],         
-                upper_bound,
-                reconstruction,
-                gene_sums.get(gene, 0),
-            ): gene
-            for gene in sample_ids
-        }
-        done = 0
-        for future in as_completed(futures):
-            gene = futures[future]
-            done += 1
-            try:
-                res = future.result()
-                if res is not None:
-                    results[gene] = res
-                if done % log_every == 0 or done == total:
-                    print(f"  [{done}/{total}] last completed: {gene}", flush=True)
-            except Exception as exc:
-                print(f"  [FAILED] {gene}: {exc}", file=sys.stderr)
-
-    # ---- Assemble output DataFrame ----
-    if not results:
-        print("ERROR: No traits were successfully reconstructed.", file=sys.stderr)
-        sys.exit(1)
-
-    # Strip in-memory-only keys before CSV serialization
-    rows = [{k: v for k, v in results[g].items() if not k.startswith("_")}
-            for g in sample_ids if g in results]
-    df_out = pd.DataFrame(rows)
-
-    # Canonical column order
+    # ---- Canonical column order (resolved before chunked loop) ----
     core_cols = [
         "gene", "gains", "losses", "count", "dist", "loss_dist",
         "gain_subsize", "loss_subsize",
@@ -828,6 +808,7 @@ def main():
         "root_state",
     ]
     marginal_cols = [
+        "gene",
         "gains_flow", "losses_flow",
         "gains_markov", "losses_markov",
         "gains_entropy", "losses_entropy",
@@ -874,12 +855,81 @@ def main():
         else:  # "all"
             output_cols = core_cols + marginal_cols
 
-    df_out = df_out[[c for c in output_cols if c in df_out.columns]]
-    df_out.to_csv(output_csv, index=False)
+    # ---- Chunked parallel reconstruction with streaming CSV output ----
+    # Processing traits in fixed-size chunks keeps peak memory proportional to
+    # CHUNK_SIZE rather than total trait count, enabling 400k+ trait datasets to
+    # run within the available memory budget.
+    CHUNK_SIZE = args.chunk_size
+    total = len(sample_ids)
+    done = 0
+    success = 0
+    first_chunk = True
+
+    for chunk_start in range(0, total, CHUNK_SIZE):
+        chunk_ids = sample_ids[chunk_start : chunk_start + CHUNK_SIZE]
+        chunk_results: dict = {}
+
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(tree_newick, upper_bound),
+        ) as executor:
+            futures = {
+                executor.submit(
+                    reconstruct_trait,
+                    gene,
+                    tree_newick,
+                    obs_filtered[gene],
+                    upper_bound,
+                    reconstruction,
+                    gene_sums.get(gene, 0),
+                ): gene
+                for gene in chunk_ids
+            }
+            for future in as_completed(futures):
+                gene = futures[future]
+                done += 1
+                try:
+                    res = future.result()
+                    if res is not None:
+                        chunk_results[gene] = res
+                except Exception as exc:
+                    print(f"  [FAILED] {gene}: {exc}", file=sys.stderr)
+
+        # Stream chunk to CSV (append after first chunk)
+        rows = [
+            {k: v for k, v in chunk_results[g].items() if not k.startswith("_")}
+            for g in chunk_ids if g in chunk_results
+        ]
+        if rows:
+            df_chunk = pd.DataFrame(rows)
+            df_chunk = df_chunk[[c for c in output_cols if c in df_chunk.columns]]
+            df_chunk.to_csv(
+                output_csv,
+                index=False,
+                mode="w" if first_chunk else "a",
+                header=first_chunk,
+            )
+            success += len(rows)
+            first_chunk = False
+
+        chunk_end = min(chunk_start + CHUNK_SIZE, total)
+        print(f"  [{chunk_end}/{total}] chunk written "
+              f"({len(rows)}/{len(chunk_ids)} succeeded)", flush=True)
+
+        del chunk_results, rows
+        if "df_chunk" in dir():
+            del df_chunk
+        gc.collect()
+
+    if first_chunk:
+        # No traits succeeded at all
+        print("ERROR: No traits were successfully reconstructed.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"\n[OK] Results written -> {output_csv}", flush=True)
 
     # ---- Optional summary file ----
-    success = len(results)
     failed = len(sample_ids) - success
     summary_lines = [
         f"Output CSV: {output_csv}",
