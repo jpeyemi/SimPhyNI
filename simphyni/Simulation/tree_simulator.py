@@ -102,9 +102,12 @@ class TreeSimulator:
         self.obsdf_modified = self._collapse_tree_tips(collapse_threshold)
         if not vars: vars = self.obsdf_modified.columns
         if not targets: targets = self.obsdf_modified.columns
-        if run_traits > 0: 
+        if run_traits > 0:
             vars = vars[:run_traits]
             targets = targets[run_traits:]
+            self.run_trait_names = list(vars)
+        else:
+            self.run_trait_names = None
         self.set_pairs(vars,targets, prevalence_threshold=prevalence_threshold, pre_filter = pre_filter)
 
     def set_pairs(self, vars, targets, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = True):
@@ -312,7 +315,7 @@ class TreeSimulator:
 
         return valid_pairs, stats
 
-    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None):
+    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None, gamma=False):
         """
         Runs the tree simulation and stores results.
 
@@ -322,13 +325,17 @@ class TreeSimulator:
                           traits actually simulated.
         :param loss_mask: Matching loss eligibility mask.
         :param gene_order: List of trait names corresponding to mask columns.
+        :param gamma: If True, sample each trial's rate from the Jeffreys posterior
+                      Gamma(count + 0.5, 1/subsize) instead of using the point estimate.
+                      Widens the null for traits with few events; negligible effect for
+                      large counts.  Default False.
         """
         self._gain_mask  = gain_mask
         self._loss_mask  = loss_mask
         self._gene_order = gene_order or []
-        self._simulate_and_evaluate(cores=cores)
+        self._simulate_and_evaluate(cores=cores, gamma=gamma)
 
-    def _simulate_and_evaluate(self, alpha=0.05, cores=-1):
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False):
         traits_to_simulate = np.unique(self.pairs.flatten())
         traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
 
@@ -344,7 +351,7 @@ class TreeSimulator:
         self.simulation_result = simulate_glrates_bit(
             tree=self.tree, trait_params=traits_to_simulate_pastml,
             pairs=self.pairs, obspairs=self.obspairs, cores=cores,
-            gain_mask=gm, loss_mask=lm,
+            gain_mask=gm, loss_mask=lm, gamma=gamma,
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
@@ -443,10 +450,15 @@ class TreeSimulator:
         np.fill_diagonal(combined_matrix.values, .5)
 
         # --- Plot ---
+        n = len(all_indices)
+        if figure_size == -1:
+            figure_size = max(10, n * 0.35)
+        # Annotation threshold loosens as n grows to reduce visual noise
+        ann_threshold = 0.001 if n > 80 else (0.01 if n > 50 else 0.05)
+
         fig, ax = plt.subplots()
-        if figure_size != -1:
-            fig.set_figwidth(figure_size)
-            fig.set_figheight(figure_size)
+        fig.set_figwidth(figure_size)
+        fig.set_figheight(figure_size)
 
         mask = np.zeros_like(combined_matrix, dtype=bool)
         mask[np.triu_indices_from(mask)] = True
@@ -472,30 +484,33 @@ class TreeSimulator:
             plt.xlabel("")
             plt.ylabel("")
 
-            # Add significance stars
-            mask_1 = combined_matrix < 0.05 
-            mask_2 = combined_matrix < 0.01
-            mask_3 = combined_matrix < 0.001
+            # Scale tick labels with number of traits
+            tick_fs = max(4, 10 - n // 15)
+            ax.tick_params(labelsize=tick_fs)
 
+            # Add significance stars (threshold loosens for large n to avoid visual noise)
+            ann_fs = max(5, 10 - n // 15)
             for i in range(combined_matrix.shape[0]):
                 for j in range(combined_matrix.shape[1]):
+                    val = combined_matrix.iloc[i, j]
                     annotation = ""
-                    if mask_3.iloc[i, j]:
+                    if val < 0.001:
                         annotation = "***"
-                    elif mask_2.iloc[i, j]:
+                    elif val < 0.01:
                         annotation = "**"
-                    elif mask_1.iloc[i, j]:
+                    elif val < ann_threshold:
                         annotation = "*"
                     if annotation:
-                        plt.text(j + 0.5, i + 0.5, annotation, 
-                                ha='center', va='center', fontsize=10, color='black')
+                        plt.text(j + 0.5, i + 0.5, annotation,
+                                ha='center', va='center', fontsize=ann_fs, color='black')
 
         plt.title("Positive (Red) and Negative (Blue) Associations")
         plt.tight_layout()
         plt.savefig(output_file, format='png')
+        plt.close(fig)
     
     def plot_effect_size(self, pval_col, prevalence_range = [0,1], output_file = 'fig.png'):
-        
+
         x = self.result
         if prevalence_range is not None:
             lo, hi = prevalence_range
@@ -509,6 +524,105 @@ class TreeSimulator:
         plt.scatter(x = ef, y = pv)
         plt.tight_layout()
         plt.savefig(output_file, format='png')
+
+    def plot_volcano(self, trait, pval_col, prevalence_range=[0, 1], output_file='volcano.png'):
+        """Volcano plot for a single trait: signed effect size vs -log10(p-value)."""
+        res = self.result.copy()
+        if prevalence_range is not None:
+            lo, hi = prevalence_range
+            res = res[
+                (res["prevalence_T1"].between(lo, hi)) &
+                (res["prevalence_T2"].between(lo, hi))
+            ]
+        res = res[(res['T1'] == trait) | (res['T2'] == trait)]
+
+        ef = res['effect size'] * res['direction']
+        pv = -np.log10(res[pval_col].clip(lower=1e-300))
+        colors = res['direction'].map({1: '#ff711f', -1: '#0a6bf2'})
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(ef, pv, c=colors, alpha=0.7, edgecolors='none')
+        ax.axhline(-np.log10(0.05), color='grey', linestyle='--', linewidth=0.8, label='p=0.05')
+        ax.set_xlabel('Effect size \u00d7 direction')
+        ax.set_ylabel('-log\u2081\u2080(p-value)')
+        ax.set_title(trait)
+        plt.tight_layout()
+        plt.savefig(output_file, format='png', dpi=150)
+        plt.close(fig)
+
+    def plot_heatmap_subset(self, run_traits, pval_col, prevalence_range=[0, 1], output_file='heatmap_subset.png'):
+        """Rectangular heatmap: run_traits (rows) vs all other traits (columns).
+
+        Cell colour encodes direction and significance via:
+            score = direction * (0.5 - pval)
+        Synergistic + significant -> positive -> red
+        Antagonistic + significant -> negative -> blue
+        Non-significant (pval~0.5) -> ~0 -> white
+        """
+        res = self.result.copy()
+        if prevalence_range is not None:
+            lo, hi = prevalence_range
+            res = res[
+                (res["prevalence_T1"].between(lo, hi)) &
+                (res["prevalence_T2"].between(lo, hi))
+            ]
+
+        run_set = set(run_traits)
+        res = res[(res['T1'].isin(run_set)) | (res['T2'].isin(run_set))]
+
+        def _assign(r):
+            if r['T1'] in run_set:
+                return r['T1'], r['T2']
+            return r['T2'], r['T1']
+
+        res[['row_trait', 'col_trait']] = res.apply(
+            lambda r: pd.Series(_assign(r)), axis=1)
+        res['score'] = res['direction'] * (0.5 - res[pval_col])
+
+        matrix = res.pivot_table(
+            index='row_trait', columns='col_trait',
+            values='score', aggfunc='first'
+        ).reindex(index=run_traits)
+
+        pval_matrix = res.pivot_table(
+            index='row_trait', columns='col_trait',
+            values=pval_col, aggfunc='first'
+        ).reindex(index=run_traits, columns=matrix.columns)
+
+        n_rows, n_cols = matrix.shape
+        fig_w = max(8, n_cols * 0.4)
+        fig_h = max(4, n_rows * 0.4)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        cmap = LinearSegmentedColormap.from_list('bwr_custom', ['#0a6bf2', '#ffffff', '#ff711f'])
+        sns.heatmap(
+            matrix.fillna(0), cmap=cmap, center=0, vmin=-0.5, vmax=0.5,
+            ax=ax, square=False,
+            cbar_kws={'label': 'direction \u00d7 (0.5 \u2212 p-value)'}
+        )
+
+        row_labels = list(matrix.index)
+        col_labels = list(matrix.columns)
+        ann_fs = max(5, 8 - n_cols // 20)
+        for i, r in enumerate(row_labels):
+            for j, c in enumerate(col_labels):
+                try:
+                    p = pval_matrix.at[r, c]
+                    ann = '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else ''))
+                    if ann:
+                        ax.text(j + 0.5, i + 0.5, ann,
+                                ha='center', va='center', fontsize=ann_fs, color='black')
+                except (KeyError, TypeError):
+                    pass
+
+        tick_fs = max(5, 8 - max(n_rows, n_cols) // 20)
+        ax.tick_params(labelsize=tick_fs)
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+        plt.title(f'Associations: run traits vs. others ({pval_col})')
+        plt.tight_layout()
+        plt.savefig(output_file, format='png', dpi=150)
+        plt.close(fig)
 
 
     
