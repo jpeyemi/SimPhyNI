@@ -64,10 +64,10 @@ def main():
     #   Hard discrete counts from the JOINT ML reconstruction.
     #   Used automatically when the CSV lacks 'gains_flow' — i.e. ACR was run
     #   with --reconstruction=JOINT or via the legacy pastml CLI pipeline.
-    if 'gains_flow' in pastml_df.columns:
-        pastml_df = build_sim_params(pastml_df, counting='FLOW', subsize='ORIGINAL')
-    else:
-        pastml_df = build_sim_params(pastml_df, counting='JOINT', subsize='ORIGINAL')
+    # if 'gains_flow' in pastml_df.columns:
+    #     pastml_df = build_sim_params(pastml_df, counting='FLOW', subsize='ORIGINAL')
+    # else:
+    pastml_df = build_sim_params(pastml_df, counting='JOINTP', subsize='ORIGINAL',no_threshold=False)
 
     # ----------------------
     # Simulation Setup
@@ -89,7 +89,7 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores)
+    Sim.run_simulation(cores=args.cores, gamma = True)
 
     # ----------------------
     # Save Outputs
@@ -104,11 +104,38 @@ def main():
     Sim.get_results().to_csv(output_dir / 'simphyni_results.csv')
     print("Simulation completed.")
 
+    PVAL_COLS = {
+        'uncorrected': 'pval_naive',
+        'bh':          'pval_bh',
+        'by':          'pval_by',
+        'bonf':        'pval_bonf',
+    }
+
     if args.plot:
-        Sim.plot_results(pval_col='pval_naive', output_file=str(output_dir / 'heatmap_uncorrected.png'), figure_size=10)
-        Sim.plot_results(pval_col='pval_bh', output_file=str(output_dir / 'heatmap_bh.png'), figure_size=10)
-        Sim.plot_results(pval_col='pval_by', output_file=str(output_dir / 'heatmap_by.png'), figure_size=10)
-        Sim.plot_results(pval_col='pval_bonf', output_file=str(output_dir / 'heatmap_bonf.png'), figure_size=10)
+        if args.run_traits > 0 and Sim.run_trait_names:
+            # Specific traits mode: volcano per trait+method, rectangular heatmap per method
+            for trait in Sim.run_trait_names:
+                safe = trait.replace('/', '_').replace(' ', '_')
+                for label, col in PVAL_COLS.items():
+                    Sim.plot_volcano(
+                        trait=trait,
+                        pval_col=col,
+                        output_file=str(output_dir / f'volcano_{safe}_{label}.png')
+                    )
+            for label, col in PVAL_COLS.items():
+                Sim.plot_heatmap_subset(
+                    run_traits=Sim.run_trait_names,
+                    pval_col=col,
+                    output_file=str(output_dir / f'heatmap_subset_{label}.png')
+                )
+        else:
+            # All-by-all mode: scalable symmetric heatmaps
+            for label, col in PVAL_COLS.items():
+                Sim.plot_results(
+                    pval_col=col,
+                    output_file=str(output_dir / f'heatmap_{label}.png'),
+                    figure_size=-1
+                )
 
 
 if __name__ == '__main__':
