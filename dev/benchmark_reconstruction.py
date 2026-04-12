@@ -445,7 +445,7 @@ def precompute_simulations(
 
         cache[method_name] = {
             'trait_params': DataFrame indexed by gene  (≤n_sample rows),
-            'lineages':     ndarray (n_leaves, n_traits) uint64,
+            'lineages':     ndarray (n_leaves, n_traits) uint64,  # squeezed from sim_bit's 3D output
         }
     """
     from simphyni.Simulation.simulation import sim_bit
@@ -491,6 +491,8 @@ def precompute_simulations(
                     lm = full_lm[:, col_idx]
 
         lineages = sim_bit(master_tree, trait_params, gain_mask=gm, loss_mask=lm)
+        if lineages.ndim == 3:      # sim_bit returns (n_tips, n_traits, n_chunks)
+            lineages = lineages[..., 0]   # squeeze to (n_tips, n_traits); safe when n_trials ≤ 64
         cache[method_name] = {'trait_params': trait_params, 'lineages': lineages}
 
     return cache
@@ -693,10 +695,14 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                 # Simulation — use cache only for iteration 1
                 if iteration == 1 and sims_cache and method_name in sims_cache:
                     iter_lineages = sims_cache[method_name]['lineages'][:, :n_test_traits]
+                    if iter_lineages.ndim == 3:
+                        iter_lineages = iter_lineages[..., 0]
                 else:
                     iter_lineages = sim_bit(master_tree, current_params,
                                             gain_mask=iter_gain_mask,
                                             loss_mask=iter_loss_mask)
+                    if iter_lineages.ndim == 3:
+                        iter_lineages = iter_lineages[..., 0]
 
                 # ── Pre-compute per-gene packed metrics (parsimony + MPD) ───────
                 # Both are computed over all 64 trials at once from the packed
@@ -1193,6 +1199,8 @@ def simulation_accuracy_evaluation(
                         lm = full_lm[:, col_idx]
 
             lineages = sim_bit(master_tree, trait_params, gain_mask=gm, loss_mask=lm)
+            if lineages.ndim == 3:
+                lineages = lineages[..., 0]
 
         if trait_params.empty:
             print(f"    [WARN] no valid traits; skipping.", flush=True)
