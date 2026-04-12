@@ -299,10 +299,11 @@ def run_legacy_cli(tree_file: str, ann_file: str, traits: list[str],
 # ---------------------------------------------------------------------------
 
 def run_api_method(tree_file: str, ann_file: str, traits: list[str],
-                   uncertainty: str, max_workers: int) -> tuple[pd.DataFrame, float]:
+                   reconstruction: str, max_workers: int) -> tuple[pd.DataFrame, float]:
     """
     Run run_ancestral_reconstruction.py logic in-process.
-    uncertainty: 'threshold' -> Method B, 'marginal' -> Method C (both cols).
+    reconstruction: 'all' -> runs both JOINT and MPPA, 'JOINT' -> JOINT only,
+                   'MPPA' -> MPPA only.
     """
     master_tree = Tree(tree_file, format=1)
     label_internal_nodes(master_tree)
@@ -328,7 +329,7 @@ def run_api_method(tree_file: str, ann_file: str, traits: list[str],
         futures = {
             ex.submit(
                 reconstruct_trait,
-                gene, tree_newick, obs[gene], upper_bound, uncertainty, gene_sums.get(gene, 0)
+                gene, tree_newick, obs[gene], upper_bound, reconstruction, gene_sums.get(gene, 0)
             ): gene
             for gene in obs.columns
         }
@@ -588,7 +589,7 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
         counting = spec.counting if spec else 'JOINT'
         subsize  = spec.subsize  if spec else 'ORIGINAL'
         masking  = spec.masking  if spec else 'DIST'
-        uncertainty = "threshold" if counting == 'JOINT' else "marginal"
+        reconstruction = "all"
 
         # ── Resolve initial trait_params (iteration 0) ──────────────────────
         if sims_cache and method_name in sims_cache:
@@ -774,12 +775,12 @@ def stability_evaluation(tree_file: str, dfs: dict[str, pd.DataFrame],
                         )
                         _trial_d_stat = _d_compute(_d_tree_struct, tip_states, _d_rand_t, _d_bm_t)
                         sim_series = pd.Series(
-                            tip_states.astype(str), index=leaf_names, name=gene,
+                            tip_states.tolist(), index=leaf_names, name=gene,
                         )
                         fut = executor.submit(
                             reconstruct_trait,
                             gene, tree_newick, sim_series, upper_bound,
-                            uncertainty, int(tip_states.sum()),
+                            "all", int(tip_states.sum()),
                         )
                         futures_meta.append((fut, gene, trial, tgr, tlr, prevalence, _trial_d_stat))
 
@@ -1885,7 +1886,7 @@ def main():
         masking=args.masking_methods,
     )
     needs_mppa = any(s.needs_mppa for s in active_specs)
-    acr_uncertainty = "marginal" if needs_mppa else "threshold"
+    acr_uncertainty = "all"
     print(f"Active method combinations: {len(active_specs)} "
           f"({len(args.counting_methods)}×{len(args.subsize_methods)}×{len(args.masking_methods)})",
           flush=True)
@@ -1997,10 +1998,10 @@ def main():
         else:
             label = "JOINT+MPPA" if needs_mppa else "JOINT-only"
             print(f"\n[2/2] Running {label} reconstruction "
-                  f"(uncertainty={acr_uncertainty}) ...", flush=True)
+                  f"(reconstruction={acr_uncertainty}) ...", flush=True)
         df_acr, t_acr, mp_dfs_all = run_api_method(
             args.tree, args.annotations, traits,
-            uncertainty=acr_uncertainty, max_workers=args.max_workers,
+            reconstruction=acr_uncertainty, max_workers=args.max_workers,
         )
         timings["all_acr"] = t_acr
         df_acr.to_csv(ckpt_acr, index=False)
