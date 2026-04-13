@@ -1,9 +1,15 @@
 import os
 import sys
+from pathlib import Path
 import pandas as pd
 from ete3 import Tree
 from joblib import Parallel, delayed
 from countgainloss_tab import countgainloss
+
+# Ensure the scripts directory is on sys.path so traits_io can be imported
+# both when run as a script (Snakemake) and when imported as a package module.
+sys.path.insert(0, str(Path(__file__).parent))
+from traits_io import compute_gene_sums, get_trait_metadata
 
 def process_gene(gene, pastml_dir, gene_count):
     gene_dir = os.path.join(pastml_dir, gene)
@@ -30,17 +36,17 @@ if __name__ == "__main__":
     pastml_dir = sys.argv[-2]
     outannot = sys.argv[-1]
 
-    # Load data and filter leaves
-    data = pd.read_csv(inpdir, index_col=0)
+    # Determine which genes have PastML reconstructions (metadata only, no data load).
     t = Tree(tree_file, 1)
-    leaves = [i for i in t.get_leaf_names() if i in data.index]
-    data = data.loc[leaves]
+    leaves_in_tree: set[str] = set(t.get_leaf_names())
 
-    # Only process genes that have PastML reconstructions
-    available_genes = [g for g in data.columns if os.path.exists(os.path.join(pastml_dir, g))]
+    index_col, all_traits = get_trait_metadata(inpdir)
+    available_genes = [
+        g for g in all_traits if os.path.exists(os.path.join(pastml_dir, g))
+    ]
 
-    # Precompute the sum for each gene to reduce memory
-    gene_sums = {g: data[g].sum() for g in available_genes}
+    # Stream per-column sums without loading the full matrix.
+    gene_sums = compute_gene_sums(inpdir, index_col, leaves_in_tree)
 
     # Run in parallel using joblib, passing only gene name and precomputed count
     results = Parallel(n_jobs=-1, verbose=5)(
