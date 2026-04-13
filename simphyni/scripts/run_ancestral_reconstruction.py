@@ -72,6 +72,7 @@ selection — no re-running ACR per method combination.
 import argparse
 import gc
 import sys
+import traceback
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -568,85 +569,80 @@ def reconstruct_trait(
     count_all_marginal_stats (denominator alignment) and can be forwarded to
     sim_bit for the next stability iteration's simulation.
     """
-    try:
-        if _WORKER_TREE is not None:
-            tree = _WORKER_TREE.copy()
-        else:
-            tree = Tree(tree_newick, format=1)
-            label_internal_nodes(tree)
+    if _WORKER_TREE is not None:
+        tree = _WORKER_TREE.copy()
+    else:
+        tree = Tree(tree_newick, format=1)
+        label_internal_nodes(tree)
 
-        ann = df_col.astype(str).to_frame(name=gene)
+    ann = df_col.astype(str).to_frame(name=gene)
 
-        states = sorted(ann[gene].dropna().unique().tolist())
-        if len(states) < 2:
-            return None  # can't reconstruct a constant trait
+    states = sorted(ann[gene].dropna().unique().tolist())
+    if len(states) < 2:
+        return None  # can't reconstruct a constant trait
 
-        # node_dists computed once on the JOINT tree and reused for MPPA
-        # (safe: both trees share identical topology and branch lengths)
-        node_dists = _node_dists_from_root(tree)
+    # node_dists computed once on the JOINT tree and reused for MPPA
+    # (safe: both trees share identical topology and branch lengths)
+    node_dists = _node_dists_from_root(tree)
 
-        # --- JOINT reconstruction ---
-        acr(tree, df=ann, prediction_method=JOINT, model="F81")
+    # --- JOINT reconstruction ---
+    acr(tree, df=ann, prediction_method=JOINT, model="F81")
 
-        stats = count_joint_stats(tree, gene, upper_bound, node_dists=node_dists)
-        stats["gene"] = gene
-        stats["count"] = int(gene_count)
+    stats = count_joint_stats(tree, gene, upper_bound, node_dists=node_dists)
+    stats["gene"] = gene
+    stats["count"] = int(gene_count)
 
-        # --- MPPA marginal reconstruction (if requested) ---
-        if reconstruction in ("MPPA", "all"):
-            # No need to copy the tree: acr() with df=ann calls preannotate_forest()
-            # unconditionally before any ML computation, which re-annotates all tips
-            # from the DataFrame and overwrites any JOINT annotations.
-            mppa_results = acr(
-                tree,
-                df=ann,
-                prediction_method=MPPA,
-                model="F81",
-            )
-            mp_df = mppa_results[0]["marginal_probabilities"]
+    # --- MPPA marginal reconstruction (if requested) ---
+    if reconstruction in ("MPPA", "all"):
+        # No need to copy the tree: acr() with df=ann calls preannotate_forest()
+        # unconditionally before any ML computation, which re-annotates all tips
+        # from the DataFrame and overwrites any JOINT annotations.
+        mppa_results = acr(
+            tree,
+            df=ann,
+            prediction_method=MPPA,
+            model="F81",
+        )
+        mp_df = mppa_results[0]["marginal_probabilities"]
 
-            # First call: standard columns (no mask) — used by DIST and NONE masking.
-            standard_marginal = count_all_marginal_stats(
-                tree, gene, mp_df, upper_bound, node_dists=node_dists,
-            )
-            stats.update(standard_marginal)
+        # First call: standard columns (no mask) — used by DIST and NONE masking.
+        standard_marginal = count_all_marginal_stats(
+            tree, gene, mp_df, upper_bound, node_dists=node_dists,
+        )
+        stats.update(standard_marginal)
 
-            # Second call: PATH-masked columns — restricted to eligible branches.
-            # Written with _path suffix so build_sim_params can select them when
-            # masking='PATH', without corrupting the standard columns.
-            _path_gm, _path_lm = build_path_mask(tree, {gene: mp_df}, [gene])
-            _gm1d = _path_gm[:, 0]
-            _lm1d = _path_lm[:, 0]
-            path_marginal = count_all_marginal_stats(
-                tree, gene, mp_df, upper_bound,
-                node_dists=node_dists,
-                gain_mask_1d=_gm1d,
-                loss_mask_1d=_lm1d,
-            )
-            _PATH_SUFFIX_COLS = [
-                "gains_flow", "losses_flow",
-                "gains_markov", "losses_markov",
-                "gains_entropy", "losses_entropy",
-                "gain_subsize_marginal", "loss_subsize_marginal",
-                "gain_subsize_marginal_nofilter", "loss_subsize_marginal_nofilter",
-                "gain_subsize_marginal_thresh", "loss_subsize_marginal_thresh",
-                "gain_subsize_entropy", "loss_subsize_entropy",
-                "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
-                "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
-            ]
-            for col in _PATH_SUFFIX_COLS:
-                if col in path_marginal:
-                    stats[col + "_path"] = path_marginal[col]
+        # Second call: PATH-masked columns — restricted to eligible branches.
+        # Written with _path suffix so build_sim_params can select them when
+        # masking='PATH', without corrupting the standard columns.
+        _path_gm, _path_lm = build_path_mask(tree, {gene: mp_df}, [gene])
+        _gm1d = _path_gm[:, 0]
+        _lm1d = _path_lm[:, 0]
+        path_marginal = count_all_marginal_stats(
+            tree, gene, mp_df, upper_bound,
+            node_dists=node_dists,
+            gain_mask_1d=_gm1d,
+            loss_mask_1d=_lm1d,
+        )
+        _PATH_SUFFIX_COLS = [
+            "gains_flow", "losses_flow",
+            "gains_markov", "losses_markov",
+            "gains_entropy", "losses_entropy",
+            "gain_subsize_marginal", "loss_subsize_marginal",
+            "gain_subsize_marginal_nofilter", "loss_subsize_marginal_nofilter",
+            "gain_subsize_marginal_thresh", "loss_subsize_marginal_thresh",
+            "gain_subsize_entropy", "loss_subsize_entropy",
+            "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
+            "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
+        ]
+        for col in _PATH_SUFFIX_COLS:
+            if col in path_marginal:
+                stats[col + "_path"] = path_marginal[col]
 
-            stats["_mp_df"]        = mp_df
-            stats["_gain_mask_1d"] = _gm1d
-            stats["_loss_mask_1d"] = _lm1d
+        stats["_mp_df"]        = mp_df
+        stats["_gain_mask_1d"] = _gm1d
+        stats["_loss_mask_1d"] = _lm1d
 
-        return stats
-
-    except Exception as exc:
-        print(f"  [ERROR] {gene}: {exc}", file=sys.stderr)
-        return None
+    return stats
 
 
 def build_path_mask(
@@ -864,6 +860,7 @@ def main():
     done = 0
     success = 0
     first_chunk = True
+    first_failure_tb = None
 
     for chunk_start in range(0, total, CHUNK_SIZE):
         chunk_ids = sample_ids[chunk_start : chunk_start + CHUNK_SIZE]
@@ -894,7 +891,10 @@ def main():
                     if res is not None:
                         chunk_results[gene] = res
                 except Exception as exc:
-                    print(f"  [FAILED] {gene}: {exc}", file=sys.stderr)
+                    tb = traceback.format_exc()
+                    print(f"  [FAILED] {gene}: {exc}\n{tb}", file=sys.stderr, flush=True)
+                    if first_failure_tb is None:
+                        first_failure_tb = (gene, exc, tb)
 
         # Stream chunk to CSV (append after first chunk)
         rows = [
@@ -923,8 +923,10 @@ def main():
         gc.collect()
 
     if first_chunk:
-        # No traits succeeded at all
-        print("ERROR: No traits were successfully reconstructed.", file=sys.stderr)
+        print("ERROR: No traits were successfully reconstructed.", file=sys.stderr, flush=True)
+        if first_failure_tb is not None:
+            gene, exc, tb = first_failure_tb
+            print(f"\nFirst failure was trait '{gene}':\n{tb}", file=sys.stderr, flush=True)
         sys.exit(1)
 
     print(f"\n[OK] Results written -> {output_csv}", flush=True)

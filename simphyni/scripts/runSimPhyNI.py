@@ -67,7 +67,7 @@ def main():
     # if 'gains_flow' in pastml_df.columns:
     #     pastml_df = build_sim_params(pastml_df, counting='FLOW', subsize='ORIGINAL')
     # else:
-    pastml_df = build_sim_params(pastml_df, counting='JOINTP', subsize='ORIGINAL',no_threshold=False)
+    pastml_df = build_sim_params(pastml_df, counting='FLOW', subsize='ORIGINAL',no_threshold=False)
 
     # ----------------------
     # Simulation Setup
@@ -89,7 +89,7 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores, gamma = True)
+    Sim.run_simulation(cores=args.cores, gamma = False)
 
     # ----------------------
     # Save Outputs

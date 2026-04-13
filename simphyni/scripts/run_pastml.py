@@ -2,6 +2,8 @@
 
 import argparse
 import os
+import sys
+import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
@@ -128,6 +130,8 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
             sample_id, status = future.result()
             results[sample_id] = status
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"  [FAILED] {sample_id}: {e}\n{tb}", file=sys.stderr, flush=True)
             results[sample_id] = f"Failed with exception: {e}"
 
 with open(summary_file, "w") as f:
