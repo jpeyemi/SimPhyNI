@@ -87,6 +87,12 @@ warnings.filterwarnings("ignore")
 from pastml.acr import acr
 from pastml.ml import JOINT, MPPA
 
+# Ensure the scripts directory is on sys.path so traits_io can be imported
+# both when run as a script (Snakemake) and when imported as a package module.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent))
+from traits_io import compute_gene_sums, get_trait_metadata, load_trait_columns
+
 # ---------------------------------------------------------------------------
 # Worker-process state (populated by _worker_init; avoids re-parsing per task)
 # ---------------------------------------------------------------------------
@@ -763,30 +769,44 @@ def main():
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # ---- Load data ----
-    obs = pd.read_csv(inputs_file, index_col=0)
-    obs.index = obs.index.astype(str)
-
-    # ---- Pre-filter traits ----
-    if args.prefilter:
-        print("Pre-filtering traits by Fisher exact test ...", flush=True)
-        sample_ids = prefiltering(obs, run_traits=args.run_traits)
-        print(f"  {len(sample_ids)} traits retained (of {len(obs.columns)} input)", flush=True)
-    else:
-        sample_ids = list(obs.columns)
-
     # ---- Load tree once; compute shared upper bound ----
     master_tree = Tree(tree_file, format=1)
     label_internal_nodes(master_tree)
     leaves_in_tree = set(master_tree.get_leaf_names())
-    obs_filtered = obs.loc[[i for i in obs.index if i in leaves_in_tree]]
     upper_bound = compute_branch_upper_bound(master_tree)
     tree_newick = master_tree.write(format=1)
 
-    sample_ids = [g for g in sample_ids if g in obs_filtered.columns]
+    # ---- Resolve trait list and index without loading the full matrix ----
+    # get_trait_metadata reads only the file footer (Parquet) or header row
+    # (CSV) — no trait data is loaded here.
+    index_col, all_traits = get_trait_metadata(inputs_file)
 
-    gene_sums = {g: int(pd.to_numeric(obs_filtered[g], errors="coerce").fillna(0).sum())
-                 for g in sample_ids}
+    # Load only the index column to intersect taxa with the tree.
+    obs_index_df = load_trait_columns(inputs_file, [], index_col)
+    valid_index: set[str] = set(obs_index_df.index) & leaves_in_tree
+
+    # ---- Pre-filter traits ----
+    if args.prefilter:
+        # Fisher test requires the full obs matrix — load it here only when needed.
+        print("Pre-filtering traits by Fisher exact test ...", flush=True)
+        obs_full = load_trait_columns(inputs_file, all_traits, index_col)
+        obs_full = obs_full.loc[obs_full.index.isin(valid_index)]
+        sample_ids_unfiltered = prefiltering(obs_full, run_traits=args.run_traits)
+        print(
+            f"  {len(sample_ids_unfiltered)} traits retained "
+            f"(of {len(all_traits)} input)", flush=True
+        )
+        del obs_full
+    else:
+        sample_ids_unfiltered = all_traits
+
+    # ---- Stream per-column sums (never loads full matrix) ----
+    # compute_gene_sums iterates in SCAN_CHUNK batches; peak RAM per batch is
+    # SCAN_CHUNK * n_rows * bytes_per_value.
+    print("Computing trait counts ...", flush=True)
+    gene_sums = compute_gene_sums(inputs_file, index_col, valid_index)
+
+    sample_ids = [g for g in sample_ids_unfiltered if g in gene_sums]
 
     print(f"Running reconstruction for {len(sample_ids)} traits "
           f"(reconstruction={reconstruction}, workers={max_workers}) ...", flush=True)
@@ -866,6 +886,12 @@ def main():
         chunk_ids = sample_ids[chunk_start : chunk_start + CHUNK_SIZE]
         chunk_results: dict = {}
 
+        # Load only this chunk's columns from disk.  For Parquet files PyArrow
+        # decompresses only the requested columns; for CSV pandas skips the rest
+        # via usecols.  Peak RAM for trait data = CHUNK_SIZE * n_rows.
+        obs_chunk = load_trait_columns(inputs_file, chunk_ids, index_col)
+        obs_chunk = obs_chunk.loc[obs_chunk.index.isin(valid_index)]
+
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_worker_init,
@@ -876,7 +902,7 @@ def main():
                     reconstruct_trait,
                     gene,
                     None,           # tree_newick not needed: worker has _WORKER_TREE
-                    obs_filtered[gene],
+                    obs_chunk[gene],
                     upper_bound,
                     reconstruction,
                     gene_sums.get(gene, 0),
@@ -917,7 +943,7 @@ def main():
         print(f"  [{chunk_end}/{total}] chunk written "
               f"({len(rows)}/{len(chunk_ids)} succeeded)", flush=True)
 
-        del chunk_results, rows
+        del chunk_results, rows, obs_chunk
         if "df_chunk" in dir():
             del df_chunk
         gc.collect()

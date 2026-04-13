@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,11 @@ import subprocess
 import pandas as pd
 import numpy as np
 from scipy.special import loggamma
+
+# Ensure the scripts directory is on sys.path so traits_io can be imported
+# both when run as a script (Snakemake) and when imported as a package module.
+sys.path.insert(0, str(Path(__file__).parent))
+from traits_io import get_trait_metadata, load_trait_columns, _is_parquet
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--inputs_file", required=True)
@@ -86,11 +92,35 @@ def prefiltering(obs):
 inputs_file = args.inputs_file
 tree_file = args.tree_file
 output_dir = Path(args.outdir)
-obs = pd.read_csv(inputs_file, index_col = 0)
+
 if args.prefilter:
-    sample_ids = prefiltering(obs)
+    # Fisher test needs the full obs matrix — load it (all columns).
+    index_col, all_traits = get_trait_metadata(inputs_file)
+    obs = load_trait_columns(inputs_file, all_traits, index_col)
+    sample_ids = list(prefiltering(obs))
 else:
-    sample_ids = list(obs.columns)
+    _, sample_ids = get_trait_metadata(inputs_file)
+    sample_ids = list(sample_ids)
+
+# The pastml CLI subprocess only understands CSV.  If the reformatted traits
+# file is Parquet, write a temporary CSV that persists for the lifetime of
+# this process (deleted on process exit).
+_tmp_csv_file = None
+if _is_parquet(inputs_file):
+    index_col, all_traits = get_trait_metadata(inputs_file)
+    _tmp_csv_file = tempfile.NamedTemporaryFile(
+        suffix=".csv", delete=False, mode="w"
+    )
+    _tmp_csv_path = _tmp_csv_file.name
+    _tmp_csv_file.close()
+    # Load all columns to write CSV — this is the legacy pipeline and
+    # memory efficiency is secondary to correctness here.
+    obs_full = load_trait_columns(inputs_file, all_traits, index_col)
+    obs_full.to_csv(_tmp_csv_path)
+    del obs_full
+    pastml_input_file = _tmp_csv_path
+else:
+    pastml_input_file = inputs_file
 max_workers = args.max_workers
 summary_file = Path(args.summary_file)
 summary_file.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +137,7 @@ def run_pastml(sample_id):
             subprocess.run([
                 "pastml",
                 "--tree", str(tree_file),
-                "--data", str(inputs_file),
+                "--data", str(pastml_input_file),
                 "--columns", sample_id,
                 "--id_index", "0",
                 "-n", "outs",
@@ -150,3 +180,10 @@ with open(summary_file, "w") as f:
             if status.startswith("Failed"):
                 f.write(f"{sample_id}: {status}\n")
     f.write("\nJob is complete.\n")
+
+# Clean up temporary CSV written for the pastml CLI (if any).
+if _tmp_csv_file is not None:
+    try:
+        os.unlink(_tmp_csv_path)
+    except OSError:
+        pass

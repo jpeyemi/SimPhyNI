@@ -73,6 +73,13 @@ def copy_files_to_inputs(file_paths, name):
 copy_files_to_inputs(OBS_ls, SAMPLE_ls)
 copy_files_to_inputs(TREE_ls, SAMPLE_ls)
 
+# Map each sample to the file extension of its raw traits file (.csv or .parquet).
+# Used by the reformat_csv rule input so both formats are accepted.
+ext_dict = {
+    sample: os.path.splitext(obs)[1]
+    for sample, obs in zip(SAMPLE_ls, OBS_ls)
+}
+
 # Snakemake Rules
 
 # Snakemake Rules
@@ -84,9 +91,9 @@ rule all:
 rule reformat_csv:
     threads: 1
     input:
-        inp=f"{outdir}/inputs/{{sample}}.csv"
+        inp=lambda w: f"{outdir}/inputs/{w.sample}{ext_dict[w.sample]}"
     output:
-        out= f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.csv'
+        out=f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.parquet'
     params:
         min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
         max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1],
@@ -208,8 +215,8 @@ rule ancestral_reconstruction:
         '--{prefilter}'
 
 # --- Optional sharded API pipeline (acr_shard_size > 0) ------------------
-# Splits the trait CSV into N column-shards, runs one ancestral_reconstruction
-# job per shard (each with lower memory), then merges the output CSVs.
+# Splits the reformatted Parquet into N CSV column-shards, runs one
+# ancestral_reconstruction job per shard (lower per-job memory), then merges.
 # Activate with:  --config acr_shard_size=20000
 
 if acr_shard_size > 0:

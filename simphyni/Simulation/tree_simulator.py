@@ -41,6 +41,8 @@ class TreeSimulator:
         # Handle observed data input
         if isinstance(self.obsdatafile, pd.DataFrame):
             self.obsdf = self.obsdatafile.copy()
+        elif str(self.obsdatafile).lower().endswith(".parquet"):
+            self.obsdf = pd.read_parquet(self.obsdatafile)
         else:
             self.obsdf = pd.read_csv(self.obsdatafile, index_col=0)
 

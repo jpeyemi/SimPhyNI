@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 # Import your module here.
 # Assuming the file provided is named 'simulation_methods.py' inside 'simphyni' package
 from simphyni import sim_bit, simulate_glrates_bit, compres, build_sim_params
-from simphyni.Simulation.simulation import unpack_trait_params, circular_bitshift_right, compute_kde_stats, sum_all_bits, compute_bitwise_cooc, process_batch
+from simphyni.Simulation.simulation import unpack_trait_params, multi_word_circular_shift, compute_kde_stats, sum_all_bits, compute_bitwise_cooc, process_batch
 from simphyni.scripts.run_ancestral_reconstruction import build_path_mask, label_internal_nodes
 
 # ==========================================
@@ -82,24 +82,25 @@ def test_circular_bitshift_logic(shift):
     Also verifies basic bit movement.
     """
     # 1. Basic Movement Check
-    # Create (1,1) array with value 1 (Binary ...0001)
-    arr = np.array([[1]], dtype=np.uint64)
-    shifted = circular_bitshift_right(arr, k=1, bits=64)
+    # Create (1,1,1) array with value 1 (Binary ...0001) — shape (n_nodes, n_traits, n_chunks)
+    arr = np.array([[[1]]], dtype=np.uint64)
+    shifted = multi_word_circular_shift(arr, k=1, total_trials=64, bits=64)
     # 1 shifted right by 1 in 64-bit circle becomes the MSB (2^63)
-    assert shifted[0, 0] == (np.uint64(1) << np.uint64(63))
+    assert shifted[0, 0, 0] == (np.uint64(1) << np.uint64(63))
 
     # 2. Restoration Property Check
-    original = np.random.randint(0, 2**63, size=(10, 2), dtype=np.uint64)
-    shifted = circular_bitshift_right(original, shift, bits=64)
+    original = np.random.randint(0, 2**63, size=(10, 2, 1), dtype=np.uint64)
+    shifted = multi_word_circular_shift(original, shift, total_trials=64, bits=64)
     restore_shift = (64 - (shift % 64)) % 64
-    restored = circular_bitshift_right(shifted, restore_shift, bits=64)
+    restored = multi_word_circular_shift(shifted, restore_shift, total_trials=64, bits=64)
     np.testing.assert_array_equal(original, restored)
 
 def test_sum_all_bits():
     """Verify that we count set bits correctly across the vertical 'trials'."""
     # Value 7 is binary ...000111 (3 bits set)
-    arr = np.array([[7]], dtype=np.uint64)
-    res = sum_all_bits(arr, bits=64)
+    # Shape (n_nodes=1, n_traits=1, n_chunks=1)
+    arr = np.array([[[7]]], dtype=np.uint64)
+    res = sum_all_bits(arr, total_trials=64, bits=64)
     
     # Expect bits 0, 1, 2 to be 1.0, others 0.0
     assert res[0, 0] == 1.0 
