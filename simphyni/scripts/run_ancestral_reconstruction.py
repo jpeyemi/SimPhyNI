@@ -459,8 +459,8 @@ def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
     eff_bl = np.minimum(bl_v, upper_bound)
 
     # FLOW
-    gain_flow_arr = np.maximum(0.0, p1_c - p1_p) * (1 - p1_p)
-    loss_flow_arr = np.maximum(0.0, p1_p - p1_c) * p1_p
+    gain_flow_arr = np.maximum(0.0, p1_c - p1_p) #* (1 - p1_p)
+    loss_flow_arr = np.maximum(0.0, p1_p - p1_c) #* p1_p
     gains_flow  = float(gain_flow_arr[gain_elig].sum())
     losses_flow = float(loss_flow_arr[loss_elig].sum())
 
