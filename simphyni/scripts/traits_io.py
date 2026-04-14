@@ -127,6 +127,8 @@ def load_trait_columns_filtered(
         else:
             df = pd.read_csv(path, index_col=0, usecols=[idx_usecol])
     df.index = df.index.astype(str)
+    if row_ids is not None and not _is_parquet(path):
+        df = df[df.index.isin(row_ids)]
     return df
 
 
