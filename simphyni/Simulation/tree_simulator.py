@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from ete3 import Tree
@@ -11,6 +14,10 @@ from .pair_statistics import *
 import numpy as np
 from scipy.special import loggamma
 from scipy.stats import hypergeom
+
+# traits_io lives in simphyni/scripts/ — add to path for bare import
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from traits_io import get_trait_metadata, load_trait_columns_filtered, _is_parquet
 
 class TreeSimulator:
 
@@ -27,39 +34,65 @@ class TreeSimulator:
     
     def _prepare_data(self):
         """
-        Prepares necessary data for the simulation, including reading pastml and observation files,
-        and initializing various simulation parameters.
-        Accepts either file paths or pandas DataFrames directly.
-        """
+        Prepares necessary data for the simulation.
 
-        # Handle pastml input
+        pastml is always loaded immediately (small CSV).
+        obs data is loaded lazily when the input is a file path: the full matrix
+        is deferred until initialize_simulation_parameters() runs, at which point
+        the tree is available and we can row-filter to tree leaves before loading
+        any trait values (pyarrow predicate pushdown for Parquet).
+        """
+        # Load pastml (always small)
         if isinstance(self.pastmlfile, pd.DataFrame):
             self.pastml = self.pastmlfile.copy()
         else:
             self.pastml = pd.read_csv(self.pastmlfile, index_col=0)
 
-        # Handle observed data input
-        if isinstance(self.obsdatafile, pd.DataFrame):
-            self.obsdf = self.obsdatafile.copy()
-        elif str(self.obsdatafile).lower().endswith(".parquet"):
-            self.obsdf = pd.read_parquet(self.obsdatafile)
-        else:
-            self.obsdf = pd.read_csv(self.obsdatafile, index_col=0)
-
-        # Run validation and preprocessing
+        # Validate pastml columns before anything else
         self._check_pastml_data()
-        self._process_obs_data()
-
-
-    def _process_obs_data(self):
-        """
-        Processes the observation data to be used in the simulation.
-        """
+        # Index pastml on 'gene' immediately
         self.pastml = self.pastml.set_index('gene')
+
+        # Handle observed data
+        if isinstance(self.obsdatafile, pd.DataFrame):
+            # DataFrame passed directly — use as-is (backward compat / tests)
+            self.obsdf = self.obsdatafile.copy()
+            self._obs_lazy = False
+            self._binarize_obs()
+        else:
+            # File path — defer full load until tree is known so we can
+            # row-filter to tree leaves before decompressing trait values.
+            self._obs_path = str(self.obsdatafile)
+            self._obs_index_col, self._obs_all_cols = get_trait_metadata(self._obs_path)
+            self._obs_lazy = True
+            self.obsdf = None   # populated in initialize_simulation_parameters
+
+    def _binarize_obs(self):
+        """Binarize and normalize self.obsdf in-place."""
         self.obsdf[self.obsdf > 0.5] = 1
         self.obsdf.fillna(0, inplace=True)
         self.obsdf = self.obsdf.astype(int)
         self.obsdf.index = self.obsdf.index.astype(str)
+
+    def _load_obs_filtered_to_leaves(self, leaf_names: set) -> pd.DataFrame:
+        """
+        Load the obs matrix with row predicate pushdown limited to tree leaves.
+
+        For Parquet: pyarrow skips row groups that contain no matching leaf rows
+        before decompressing any data — peak RAM scales with the number of
+        matching rows, not the total rows in the file.
+        For CSV: loads all rows then filters (no pushdown possible).
+
+        Returns a binarized DataFrame indexed by the obs index column.
+        """
+        leaf_ids = {str(l) for l in leaf_names}
+        df = load_trait_columns_filtered(
+            self._obs_path,
+            self._obs_all_cols,
+            self._obs_index_col,
+            row_ids=leaf_ids,
+        )
+        return df
 
         
 
@@ -100,6 +133,14 @@ class TreeSimulator:
                     node.name = name
 
         self.pair_statistic = pair_statistics._log_odds_ratio_statistic
+
+        # If obs was deferred, load now — filtered to tree leaves only
+        if getattr(self, '_obs_lazy', False) and self.obsdf is None:
+            print("Loading obs matrix (filtered to tree leaves) ...", flush=True)
+            self.obsdf = self._load_obs_filtered_to_leaves(
+                set(self.tree.get_leaf_names())
+            )
+            self._binarize_obs()
 
         self.obsdf_modified = self._collapse_tree_tips(collapse_threshold)
         if not vars: vars = self.obsdf_modified.columns

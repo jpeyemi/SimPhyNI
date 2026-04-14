@@ -115,21 +115,22 @@ def test_compute_bitwise_cooc_all_bits_single_node():
     correct independent contingency table.
     """
     bits = 64
-    tp = np.zeros((1, 1), dtype=np.uint64)
-    tq = np.zeros((1, 1), dtype=np.uint64)
+    # Shape: (n_nodes=1, n_traits=1, n_chunks=1)
+    tp = np.zeros((1, 1, 1), dtype=np.uint64)
+    tq = np.zeros((1, 1, 1), dtype=np.uint64)
 
-    # Setup: 
+    # Setup:
     # tp has alternating bits: 101010... (0xAAAAAAAAAAAAAAAA)
     # tq has blocks of 2:      110011... (0xCCCCCCCCCCCCCCCC)
     # This ensures a mix of (1,1), (1,0), (0,1), and (0,0) cases across the 64 bits.
     tp_val = 0xAAAAAAAAAAAAAAAA
     tq_val = 0xCCCCCCCCCCCCCCCC
-    tp[0, 0] = np.uint64(tp_val)
-    tq[0, 0] = np.uint64(tq_val)
+    tp[0, 0, 0] = np.uint64(tp_val)
+    tq[0, 0, 0] = np.uint64(tq_val)
 
     # Run calculation
     # We focus on shift k=0 (the first 64 columns of the result)
-    result_matrix = compute_bitwise_cooc(tp, tq, bits=64)
+    result_matrix = compute_bitwise_cooc(tp, tq, total_trials=64, bits=64)
     
     # Iterate through every bit position to verify independence
     for i in range(bits):
@@ -183,21 +184,21 @@ def test_compute_bitwise_cooc_multi_node_aggregation():
     # Node 1: A=1, B=0 (Mismatch)
     # Node 2: A=0, B=1 (Mismatch)
     
-    tp = np.zeros((n_nodes, 1), dtype=np.uint64)
-    tq = np.zeros((n_nodes, 1), dtype=np.uint64)
-    
+    tp = np.zeros((n_nodes, 1, 1), dtype=np.uint64)
+    tq = np.zeros((n_nodes, 1, 1), dtype=np.uint64)
+
     # Set Bit 0 for relevant nodes
-    tp[0, 0] = 1 # Node 0: A=1
-    tq[0, 0] = 1 # Node 0: B=1
-    
-    tp[1, 0] = 1 # Node 1: A=1
-    tq[1, 0] = 0 # Node 1: B=0
-    
-    tp[2, 0] = 0 # Node 2: A=0
-    tq[2, 0] = 1 # Node 2: B=1
-    
+    tp[0, 0, 0] = 1 # Node 0: A=1
+    tq[0, 0, 0] = 1 # Node 0: B=1
+
+    tp[1, 0, 0] = 1 # Node 1: A=1
+    tq[1, 0, 0] = 0 # Node 1: B=0
+
+    tp[2, 0, 0] = 0 # Node 2: A=0
+    tq[2, 0, 0] = 1 # Node 2: B=1
+
     # Run calculation
-    result_matrix = compute_bitwise_cooc(tp, tq, bits=64)
+    result_matrix = compute_bitwise_cooc(tp, tq, total_trials=64, bits=64)
     
     # --- Manual Verification for Bit 0 (Shift 0) ---
     
@@ -326,7 +327,7 @@ def test_simulation_statistical_fidelity(trait_params):
     
     # 4. Extract Leaf Data (Optimized)
     # Since we know the order is [Root, Leaf1, Leaf2...], we just skip row 0.
-    leaf_uint64s = sim_result[:, 0] 
+    leaf_uint64s = sim_result[:, 0, 0]
     
     # 5. UNPACK and Verify
     # We verify the binary matrix statistics
@@ -362,7 +363,7 @@ def test_simulation_statistical_fidelity(trait_params):
 def test_process_batch_logic():
     """Unit test for the batch processing worker function."""
     # Mock data: 5 Nodes, 2 Traits
-    sim_readonly = np.random.randint(0, 100, size=(5, 2), dtype=np.uint64)
+    sim_readonly = np.random.randint(0, 100, size=(5, 2, 1), dtype=np.uint64)
     pairs = np.array([[0, 1]]) # Pair Trait 0 and Trait 1
     obspairs = np.array([5.0])
     
