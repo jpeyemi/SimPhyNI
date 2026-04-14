@@ -81,10 +81,14 @@ def load_trait_columns(path: str, columns: list[str], index_col: str) -> pd.Data
         if df.index.name != index_col and index_col in df.columns:
             df = df.set_index(index_col)
     else:
+        # When the index column is unnamed (empty string), usecols must use
+        # the positional integer 0; using '' as a column name fails because
+        # pandas validates usecols against the non-index column names.
+        idx_usecol = index_col if index_col else 0
         if columns:
-            df = pd.read_csv(path, index_col=0, usecols=[index_col] + list(columns))
+            df = pd.read_csv(path, index_col=0, usecols=[idx_usecol] + list(columns))
         else:
-            df = pd.read_csv(path, index_col=0, usecols=[index_col])
+            df = pd.read_csv(path, index_col=0, usecols=[idx_usecol])
     df.index = df.index.astype(str)
     return df
 
