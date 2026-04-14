@@ -380,6 +380,31 @@ class TreeSimulator:
 
     def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False):
         traits_to_simulate = np.unique(self.pairs.flatten())
+
+        # PastML skips constant traits (< 2 unique states), so they are absent
+        # from self.pastml. Drop any pairs where either trait is missing so that
+        # those pairs fall into the p=0.5 bucket in _multiple_test_correction.
+        pastml_traits = set(self.pastml.index)
+        missing = [t for t in traits_to_simulate if t not in pastml_traits]
+        if missing:
+            import warnings
+            preview = missing[:5]
+            warnings.warn(
+                f"{len(missing)} trait(s) absent from PastML output (likely constant) "
+                f"and will be skipped: {preview}{'...' if len(missing) > 5 else ''}"
+            )
+            valid_mask = (
+                np.isin(self.pairs[:, 0], list(pastml_traits)) &
+                np.isin(self.pairs[:, 1], list(pastml_traits))
+            )
+            self.pairs    = self.pairs[valid_mask]
+            self.obspairs = self.obspairs[valid_mask]
+            traits_to_simulate = np.unique(self.pairs.flatten())
+
+        if len(traits_to_simulate) == 0:
+            self.simulation_result = pd.DataFrame()
+            return
+
         traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
 
         # Sub-select mask columns for the traits being simulated
