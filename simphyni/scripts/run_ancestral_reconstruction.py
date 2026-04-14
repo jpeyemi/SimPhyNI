@@ -91,7 +91,12 @@ from pastml.ml import JOINT, MPPA
 # both when run as a script (Snakemake) and when imported as a package module.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
-from traits_io import compute_gene_sums, get_trait_metadata, load_trait_columns
+from traits_io import (
+    compute_gene_sums,
+    get_trait_metadata,
+    load_trait_columns,
+    prefilter_traits_chunked,
+)
 
 # ---------------------------------------------------------------------------
 # Worker-process state (populated by _worker_init; avoids re-parsing per task)
@@ -587,6 +592,20 @@ def reconstruct_trait(
     if len(states) < 2:
         return None  # can't reconstruct a constant trait
 
+    # Prune tree to leaves with known state so PastML never sees unannotated tips
+    ann_leaves = set(ann.index)
+    tree_leaves = {l.name for l in tree.get_leaves()}
+    missing = tree_leaves - ann_leaves
+    if missing:
+        keep = [l for l in tree.get_leaves() if l.name in ann_leaves]
+        tree.prune(keep, preserve_branch_length=True)
+
+    # Clamp non-positive branch lengths — negative/zero dists cause PastML to
+    # produce invalid transition matrices (non-intersecting states error).
+    for node in tree.traverse():
+        if not node.is_root() and node.dist <= 0:
+            node.dist = 1e-8
+
     # node_dists computed once on the JOINT tree and reused for MPPA
     # (safe: both trees share identical topology and branch lengths)
     node_dists = _node_dists_from_root(tree)
@@ -787,16 +806,19 @@ def main():
 
     # ---- Pre-filter traits ----
     if args.prefilter:
-        # Fisher test requires the full obs matrix — load it here only when needed.
-        print("Pre-filtering traits by Fisher exact test ...", flush=True)
-        obs_full = load_trait_columns(inputs_file, all_traits, index_col)
-        obs_full = obs_full.loc[obs_full.index.isin(valid_index)]
-        sample_ids_unfiltered = prefiltering(obs_full, run_traits=args.run_traits)
+        # Chunked Fisher test — never loads the full matrix into memory.
+        # Peak RAM = O(SCAN_CHUNK × len(valid_index)) per iteration.
+        print("Pre-filtering traits by Fisher exact test (chunked) ...", flush=True)
+        sample_ids_unfiltered = prefilter_traits_chunked(
+            inputs_file,
+            index_col,
+            valid_rows=valid_index,
+            run_traits=args.run_traits,
+        )
         print(
             f"  {len(sample_ids_unfiltered)} traits retained "
             f"(of {len(all_traits)} input)", flush=True
         )
-        del obs_full
     else:
         sample_ids_unfiltered = all_traits
 

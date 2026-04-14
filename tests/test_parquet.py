@@ -135,6 +135,65 @@ class TestTraitsIO:
         # T3 = [0,0,0,0,1,1] → sum over A,B = 0
         assert sums["T3"] == 0
 
+    # --- load_trait_columns_filtered ---
+
+    def test_load_trait_columns_filtered_row_subset_parquet(self, parquet_path):
+        """Row predicate pushdown: only requested rows are returned."""
+        df = tio.load_trait_columns_filtered(
+            str(parquet_path), ["T1", "T2"], "taxon", row_ids={"A", "B"}
+        )
+        assert set(df.index) == {"A", "B"}
+        assert list(df.columns) == ["T1", "T2"]
+
+    def test_load_trait_columns_filtered_no_row_filter_matches_load_trait_columns(
+        self, parquet_path
+    ):
+        df_full = tio.load_trait_columns(str(parquet_path), ["T1"], "taxon")
+        df_filt = tio.load_trait_columns_filtered(
+            str(parquet_path), ["T1"], "taxon", row_ids=None
+        )
+        pd.testing.assert_frame_equal(df_full.astype(int), df_filt.astype(int))
+
+    def test_load_trait_columns_filtered_csv_row_subset(self, csv_path):
+        df = tio.load_trait_columns_filtered(
+            str(csv_path), ["T3"], "taxon", row_ids={"C", "D"}
+        )
+        assert set(df.index) == {"C", "D"}
+        assert "T3" in df.columns
+
+    # --- prefilter_traits_chunked ---
+
+    def test_prefilter_traits_chunked_returns_associated_traits(self, parquet_path):
+        """Traits co-occurring together (T1 pairs with T4 etc.) survive prefilter."""
+        surviving = tio.prefilter_traits_chunked(
+            str(parquet_path), "taxon", valid_rows=None, run_traits=0,
+            chunk_size=4, pval_threshold=0.1,
+        )
+        # Some traits should survive; result is a non-empty list
+        assert isinstance(surviving, list)
+        # All returned names must be real trait names
+        assert all(t in _TRAIT_MATRIX for t in surviving)
+
+    def test_prefilter_traits_chunked_run_traits_mode(self, parquet_path):
+        """run_traits=2 tests first-2 vs remaining."""
+        surviving = tio.prefilter_traits_chunked(
+            str(parquet_path), "taxon", valid_rows=None, run_traits=2,
+            chunk_size=4, pval_threshold=0.5,
+        )
+        assert isinstance(surviving, list)
+
+    def test_prefilter_traits_chunked_csv_parquet_agree(self, csv_path, parquet_path):
+        """Chunked prefilter gives same surviving set for CSV and Parquet inputs."""
+        sv_csv = set(tio.prefilter_traits_chunked(
+            str(csv_path), "taxon", valid_rows=None, run_traits=0,
+            chunk_size=4, pval_threshold=0.1,
+        ))
+        sv_pq = set(tio.prefilter_traits_chunked(
+            str(parquet_path), "taxon", valid_rows=None, run_traits=0,
+            chunk_size=4, pval_threshold=0.1,
+        ))
+        assert sv_csv == sv_pq
+
 
 # ---------------------------------------------------------------------------
 # 2. reformat_columns — CSV and Parquet produce identical outputs
@@ -338,7 +397,81 @@ class TestACRLazyLoad:
 
 
 # ---------------------------------------------------------------------------
-# 5. End-to-end: ecoli_accessory.csv → parquet → reformat → ACR (one trait)
+# 5. TreeSimulator lazy loading — obs deferred until tree is loaded
+# ---------------------------------------------------------------------------
+
+from simphyni import TreeSimulator  # noqa: E402
+from simphyni.Simulation.simulation import build_sim_params  # noqa: E402
+
+
+class TestTreeSimulatorLazyLoad:
+    """Verify that TreeSimulator defers obs loading and filters to tree leaves."""
+
+    def _make_pastml_df(self) -> pd.DataFrame:
+        """Minimal pastml DataFrame matching the 6-taxon tree."""
+        genes = list(_TRAIT_MATRIX.keys())
+        return pd.DataFrame({
+            "gene":         genes,
+            "gains":        [0.2] * len(genes),
+            "losses":       [0.2] * len(genes),
+            "dist":         [0.0] * len(genes),
+            "loss_dist":    [0.0] * len(genes),
+            "gain_subsize": [1.0] * len(genes),
+            "loss_subsize": [1.0] * len(genes),
+            "root_state":   [0]   * len(genes),
+        })
+
+    def test_obs_not_loaded_at_init_for_file_path(self, parquet_path):
+        """obsdf must be None immediately after __init__ when given a file path."""
+        pastml_df = self._make_pastml_df()
+        sim = TreeSimulator(
+            tree=_NEWICK_6,
+            pastmlfile=pastml_df,
+            obsdatafile=str(parquet_path),
+        )
+        assert sim.obsdf is None, "obs should be deferred until initialize_simulation_parameters"
+        assert sim._obs_lazy is True
+
+    def test_obs_loaded_after_initialize(self, parquet_path, tree_path):
+        """obsdf must be populated and contain only tree leaves after initialize."""
+        pastml_df = self._make_pastml_df()
+        sim = TreeSimulator(
+            tree=str(tree_path),
+            pastmlfile=pastml_df,
+            obsdatafile=str(parquet_path),
+        )
+        sim.initialize_simulation_parameters(pre_filter=False)
+        assert sim.obsdf is not None
+        # All rows must be in the tree
+        tree_leaves = set(sim.tree.get_leaf_names())
+        assert set(sim.obsdf.index).issubset(tree_leaves)
+
+    def test_lazy_and_eager_give_same_obsdf(self, parquet_path, tree_path, trait_df):
+        """Lazy loading from file produces the same data as passing a DataFrame."""
+        pastml_df = self._make_pastml_df()
+
+        # Eager: DataFrame passed directly
+        sim_eager = TreeSimulator(
+            tree=str(tree_path), pastmlfile=pastml_df.copy(),
+            obsdatafile=trait_df.copy(),
+        )
+        sim_eager.initialize_simulation_parameters(pre_filter=False)
+
+        # Lazy: file path — deferred until initialize
+        sim_lazy = TreeSimulator(
+            tree=str(tree_path), pastmlfile=pastml_df.copy(),
+            obsdatafile=str(parquet_path),
+        )
+        sim_lazy.initialize_simulation_parameters(pre_filter=False)
+
+        pd.testing.assert_frame_equal(
+            sim_eager.obsdf.sort_index().sort_index(axis=1),
+            sim_lazy.obsdf.sort_index().sort_index(axis=1),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. End-to-end: ecoli_accessory.csv → parquet → reformat → ACR (one trait)
 # ---------------------------------------------------------------------------
 
 PANX_DIR = Path(__file__).parent / "panx"
