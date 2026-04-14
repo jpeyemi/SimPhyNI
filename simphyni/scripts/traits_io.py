@@ -108,10 +108,14 @@ def load_trait_columns_filtered(
         if df.index.name != index_col and index_col in df.columns:
             df = df.set_index(index_col)
     else:
-        usecols = [index_col] + list(columns) if columns else [index_col]
-        df = pd.read_csv(path, index_col=0, usecols=usecols)
-        if row_ids is not None:
-            df = df[df.index.isin(row_ids)]
+        # When the index column is unnamed (empty string), usecols must use
+        # the positional integer 0; using '' as a column name fails because
+        # pandas validates usecols against the non-index column names.
+        idx_usecol = index_col if index_col else 0
+        if columns:
+            df = pd.read_csv(path, index_col=0, usecols=[idx_usecol] + list(columns))
+        else:
+            df = pd.read_csv(path, index_col=0, usecols=[idx_usecol])
     df.index = df.index.astype(str)
     return df
 
