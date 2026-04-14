@@ -111,9 +111,19 @@ def load_trait_columns_filtered(
         # When the index column is unnamed (empty string), usecols must use
         # the positional integer 0; using '' as a column name fails because
         # pandas validates usecols against the non-index column names.
+        # usecols must be homogeneous (all strings or all integers), so when
+        # idx_usecol is an integer we map every column name to its position.
         idx_usecol = index_col if index_col else 0
         if columns:
-            df = pd.read_csv(path, index_col=0, usecols=[idx_usecol] + list(columns))
+            if isinstance(idx_usecol, int):
+                import csv as _csv
+                with open(path, newline="") as _f:
+                    raw_header = next(_csv.reader(_f))
+                col_pos = {name: i for i, name in enumerate(raw_header)}
+                usecols_arg = [idx_usecol] + [col_pos[c] for c in columns if c in col_pos]
+                df = pd.read_csv(path, index_col=0, usecols=usecols_arg)
+            else:
+                df = pd.read_csv(path, index_col=0, usecols=[idx_usecol] + list(columns))
         else:
             df = pd.read_csv(path, index_col=0, usecols=[idx_usecol])
     df.index = df.index.astype(str)
