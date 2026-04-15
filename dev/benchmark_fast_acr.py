@@ -176,6 +176,7 @@ def timing_benchmark(
     ete_tree: Tree,
     sizes: list,
     n_pastml_sample: int = 5,
+    no_pastml: bool = False,
 ):
     """For each N in sizes: time fast ACR (empirical+ml) and extrapolate PastML.
 
@@ -192,7 +193,7 @@ def timing_benchmark(
 
     # PastML per-trait cost — sample once from the first n_pastml_sample traits
     pastml_per_trait_s = np.nan
-    if PASTML_AVAILABLE:
+    if not no_pastml and PASTML_AVAILABLE:
         n_sample = min(n_pastml_sample, len(trait_names))
         print(f"  Timing PastML on {n_sample} traits (for extrapolation) ...",
               flush=True)
@@ -512,6 +513,8 @@ def main():
                         default="dev/acr_plots/fast_acr_benchmark")
     parser.add_argument("--n_pastml_sample", type=int, default=5,
                         help="Traits timed against PastML for extrapolation (default 5)")
+    parser.add_argument("--no-pastml", action="store_true", default=False,
+                        help="Skip PastML timing/accuracy comparison (fast ACR only).")
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
@@ -566,13 +569,14 @@ def main():
     timing_df = timing_benchmark(
         ta, obs, trait_names_sub,
         trait_df, ete_tree, args.n_traits,
+        no_pastml=args.no_pastml,
     )
     timing_df.to_csv(out_dir / "timing.csv", index=False)
 
     # ---- Accuracy benchmark ----
     trait_df_acc = pd.DataFrame()
     stats_df_acc = pd.DataFrame()
-    if PASTML_AVAILABLE:
+    if not args.no_pastml and PASTML_AVAILABLE:
         n_cmp = min(args.n_compare, max_n)
         print(f"\nRunning accuracy benchmark ({n_cmp} traits vs PastML) ...")
         trait_df_acc, stats_df_acc = accuracy_benchmark(

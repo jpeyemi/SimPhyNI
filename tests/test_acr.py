@@ -11,6 +11,9 @@ Tests cover:
   - reconstruct_trait  (column coverage for each reconstruction mode)
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 import numpy as np
 import pandas as pd
@@ -23,8 +26,34 @@ from simphyni.scripts.run_ancestral_reconstruction import (
     count_all_marginal_stats,
     build_path_mask,
     reconstruct_trait,
+    reconstruct_chunk_fast,
     _entropy,
     _node_dists_from_root,
+)
+
+# ---------------------------------------------------------------------------
+# Optional fast ACR import (requires numba)
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parent.parent
+_scripts = str(_REPO / "simphyni" / "scripts")
+if _scripts not in sys.path:
+    sys.path.insert(0, _scripts)
+
+try:
+    from fast_binary_acr import (
+        build_tree_arrays,
+        build_obs_matrix,
+        fast_acr,
+        marginal_probs_df,
+    )
+    _FAST_ACR_AVAILABLE = True
+except ImportError:
+    _FAST_ACR_AVAILABLE = False
+
+_fast_acr_only = pytest.mark.skipif(
+    not _FAST_ACR_AVAILABLE,
+    reason="fast_binary_acr (numba) not available",
 )
 
 
@@ -845,3 +874,236 @@ def test_joint_child_state_vs_parent_state_subsize():
 
     # Parent-state denominator is strictly larger than child-state denominator
     assert r["gain_subsize_p"] >= r["gain_subsize"]
+
+
+# ===========================================================================
+# Fast ACR — shared fixtures
+# ===========================================================================
+
+# 4-taxon balanced tree: two clades of two leaves each
+_FAST_NEWICK = "((T1:1.0,T2:1.0)Int1:1.0,(T3:1.0,T4:1.0)Int2:1.0)Root:0.0;"
+_FAST_TAXA   = ["T1", "T2", "T3", "T4"]
+_FAST_TRAITS = {
+    "gA": [1, 1, 0, 0],   # present in clade 1 only
+    "gB": [0, 0, 1, 1],   # present in clade 2 only
+    "gC": [1, 0, 1, 0],   # alternating
+}
+
+
+@pytest.fixture(scope="module")
+def fast_tree():
+    t = Tree(_FAST_NEWICK, format=1)
+    label_internal_nodes(t)
+    return t
+
+
+@pytest.fixture(scope="module")
+def fast_setup(fast_tree):
+    """Return (ta, obs, trait_names, upper_bound) for fast ACR tests."""
+    if not _FAST_ACR_AVAILABLE:
+        pytest.skip("fast_binary_acr not available")
+    df  = pd.DataFrame(_FAST_TRAITS, index=_FAST_TAXA)
+    ta  = build_tree_arrays(fast_tree)
+    obs = build_obs_matrix(ta, df)
+    ub  = compute_branch_upper_bound(fast_tree)
+    return ta, obs, list(_FAST_TRAITS.keys()), ub
+
+
+# ===========================================================================
+# Fast ACR — core algorithm tests (TestFastACR)
+# ===========================================================================
+
+@_fast_acr_only
+class TestFastACR:
+
+    def test_build_tree_arrays_node_count(self, fast_tree):
+        ta = build_tree_arrays(fast_tree)
+        expected = len(list(fast_tree.traverse()))
+        assert ta.n_nodes == expected
+        assert len(ta.node_names) == expected
+
+    def test_build_obs_matrix_shape(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        assert obs.shape == (len(trait_names), ta.n_nodes)
+
+    def test_fast_acr_ml_result_shape(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="ml")
+        assert len(res.trait_names) == len(trait_names)
+        assert res.joint_states.shape == (len(trait_names), ta.n_nodes)
+
+    def test_fast_acr_empirical_result_shape(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="empirical")
+        assert len(res.trait_names) == len(trait_names)
+
+    def test_marginal_probs_sum_to_one(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="ml")
+        for t_idx in range(len(trait_names)):
+            mp = marginal_probs_df(res, t_idx)
+            row_sums = mp["0"].astype(float) + mp["1"].astype(float)
+            assert np.allclose(row_sums, 1.0, atol=1e-6), (
+                f"Marginal probs don't sum to 1 for trait {trait_names[t_idx]}"
+            )
+
+    def test_pi1_in_unit_interval(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        for mode in ("ml", "empirical"):
+            res = fast_acr(ta, obs, trait_names, mode=mode)
+            assert np.all(res.pi1 >= 0.0) and np.all(res.pi1 <= 1.0), (
+                f"pi1 out of [0,1] in {mode} mode"
+            )
+
+    def test_log_lh_finite(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="ml")
+        assert np.all(np.isfinite(res.log_lh)), "log_lh contains non-finite values"
+
+    def test_joint_states_are_binary(self, fast_setup):
+        ta, obs, trait_names, _ = fast_setup
+        for mode in ("ml", "empirical"):
+            res = fast_acr(ta, obs, trait_names, mode=mode)
+            assert set(np.unique(res.joint_states)).issubset({0, 1}), (
+                f"Non-binary JOINT states in {mode} mode"
+            )
+
+    def test_known_clade_marginals(self, fast_setup):
+        """gA=[1,1,0,0]: Int1 (parent of T1,T2) should be mostly in state 1;
+        Int2 (parent of T3,T4) should be mostly in state 0."""
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="ml")
+        t_idx = trait_names.index("gA")
+        mp = marginal_probs_df(res, t_idx)
+        assert float(mp.loc["Int1", "1"]) > 0.5, "Int1 P(1) should be > 0.5 for gA"
+        assert float(mp.loc["Int2", "1"]) < 0.5, "Int2 P(1) should be < 0.5 for gA"
+
+    def test_empirical_pi1_equals_frequency(self, fast_setup):
+        """Empirical π₁ must equal the observed leaf frequency for each trait."""
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="empirical")
+        df = pd.DataFrame(_FAST_TRAITS, index=_FAST_TAXA)
+        for t_idx, gene in enumerate(trait_names):
+            expected_pi1 = float(df[gene].mean())
+            assert res.pi1[t_idx] == pytest.approx(expected_pi1, abs=1e-6), (
+                f"Empirical π₁ mismatch for {gene}"
+            )
+
+    def test_ml_log_lh_geq_empirical(self, fast_setup):
+        """ML mode maximises the likelihood, so its log-LH must be ≥ empirical."""
+        ta, obs, trait_names, _ = fast_setup
+        res_emp = fast_acr(ta, obs, trait_names, mode="empirical")
+        res_ml  = fast_acr(ta, obs, trait_names, mode="ml")
+        assert np.all(res_ml.log_lh >= res_emp.log_lh - 1e-6), (
+            "ML log-LH should be ≥ empirical log-LH for all traits"
+        )
+
+    def test_marginal_probs_df_has_correct_index(self, fast_setup):
+        """marginal_probs_df index should match all node names in the tree."""
+        ta, obs, trait_names, _ = fast_setup
+        res = fast_acr(ta, obs, trait_names, mode="ml")
+        mp = marginal_probs_df(res, 0)
+        assert set(mp.index) == set(ta.node_names)
+        assert "0" in mp.columns and "1" in mp.columns
+
+
+# ===========================================================================
+# Fast ACR — pipeline wrapper tests (TestReconstructChunkFast)
+# ===========================================================================
+
+@_fast_acr_only
+class TestReconstructChunkFast:
+    """Tests for reconstruct_chunk_fast() — the main() integration wrapper."""
+
+    @pytest.fixture(scope="class")
+    def chunk_setup(self, fast_tree):
+        df  = pd.DataFrame(_FAST_TRAITS, index=_FAST_TAXA)
+        ta  = build_tree_arrays(fast_tree)
+        obs = build_obs_matrix(ta, df)
+        ub  = compute_branch_upper_bound(fast_tree)
+        gene_sums = {g: int(df[g].sum()) for g in _FAST_TRAITS}
+        return fast_tree, ta, obs, list(_FAST_TRAITS.keys()), gene_sums, ub
+
+    def test_returns_one_row_per_trait(self, chunk_setup):
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(tree, ta, obs, names, sums, ub, "all", acr_mode="ml")
+        assert len(rows) == len(names)
+        assert {r["gene"] for r in rows} == set(names)
+
+    def test_all_mode_has_joint_columns(self, chunk_setup):
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(tree, ta, obs, names, sums, ub, "all", acr_mode="ml")
+        for row in rows:
+            for col in ("gains", "losses", "root_state", "gain_subsize",
+                        "gain_subsize_nofilter", "gain_subsize_thresh"):
+                assert col in row, f"Missing JOINT column '{col}' for {row['gene']}"
+
+    def test_all_mode_has_marginal_columns(self, chunk_setup):
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(tree, ta, obs, names, sums, ub, "all", acr_mode="ml")
+        for row in rows:
+            for col in ("gains_flow", "losses_flow", "gain_subsize_marginal", "root_prob"):
+                assert col in row, f"Missing MPPA column '{col}' for {row['gene']}"
+
+    def test_no_path_columns(self, chunk_setup):
+        """Fast ACR must not produce _path suffix columns (those are PastML-only)."""
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(tree, ta, obs, names, sums, ub, "all", acr_mode="ml")
+        for row in rows:
+            path_cols = [k for k in row if k.endswith("_path")]
+            assert len(path_cols) == 0, (
+                f"Unexpected _path columns for {row['gene']}: {path_cols}"
+            )
+
+    def test_constant_trait_excluded_from_output(self, fast_tree):
+        """A constant trait (all 0s) must be absent from the output rows."""
+        df = pd.DataFrame({
+            "gConst": [0, 0, 0, 0],
+            "gOk":    [1, 1, 0, 0],
+        }, index=_FAST_TAXA)
+        ta  = build_tree_arrays(fast_tree)
+        obs = build_obs_matrix(ta, df)
+        ub  = compute_branch_upper_bound(fast_tree)
+        gene_sums = {"gConst": 0, "gOk": 2}
+        rows = reconstruct_chunk_fast(
+            fast_tree, ta, obs, ["gConst", "gOk"], gene_sums, ub, "all"
+        )
+        genes_out = {r["gene"] for r in rows}
+        assert "gConst" not in genes_out, "Constant trait should be skipped"
+        assert "gOk" in genes_out
+
+    def test_empirical_mode_runs(self, chunk_setup):
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(
+            tree, ta, obs, names, sums, ub, "all", acr_mode="empirical"
+        )
+        assert len(rows) == len(names)
+
+    def test_joint_only_reconstruction(self, chunk_setup):
+        """reconstruction='JOINT' → JOINT columns present, no marginal columns."""
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(
+            tree, ta, obs, names, sums, ub, "JOINT", acr_mode="ml"
+        )
+        assert len(rows) == len(names)
+        for row in rows:
+            assert "gains" in row
+            assert "gains_flow" not in row
+
+    def test_mppa_only_reconstruction(self, chunk_setup):
+        """reconstruction='MPPA' → marginal columns present."""
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(
+            tree, ta, obs, names, sums, ub, "MPPA", acr_mode="ml"
+        )
+        assert len(rows) == len(names)
+        for row in rows:
+            assert "gains_flow" in row
+
+    def test_gains_nonneg_finite(self, chunk_setup):
+        """gains and gains_flow must be non-negative and finite for all traits."""
+        tree, ta, obs, names, sums, ub = chunk_setup
+        rows = reconstruct_chunk_fast(tree, ta, obs, names, sums, ub, "all", acr_mode="ml")
+        for row in rows:
+            assert row["gains"] >= 0 and np.isfinite(row["gains"])
+            assert row["gains_flow"] >= 0 and np.isfinite(row["gains_flow"])

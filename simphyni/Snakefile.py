@@ -148,6 +148,21 @@ acr_shard_size = int(config.get('acr_shard_size', 0))
 # Override the default: --config reconstruction=JOINT
 reconstruction_mode = config.get('reconstruction', 'all')
 
+# use_pastml: when True, pass --pastml to run_ancestral_reconstruction.py to
+# restore the original PastML API behaviour.
+# Default False = fast Numba engine (fast_binary_acr, ~6 ms/trait in ML mode).
+# Override with:  --config use_pastml=True
+use_pastml = config.get('use_pastml', False)
+pastml_flag = "--pastml" if use_pastml else ""
+
+# acr_mode: fast ACR optimisation mode passed via --acr_mode.
+# 'ml' (default) jointly optimises sf and π₁.
+# 'empirical' fixes π₁ = observed frequency (~12x faster, slightly less accurate).
+# Ignored when use_pastml=True.
+# Override with:  --config acr_mode=empirical
+acr_mode = config.get('acr_mode', 'ml')
+acr_mode_flag = f"--acr_mode {acr_mode}" if not use_pastml else ""
+
 # --- Legacy pipeline: pastml CLI + GL_tab aggregation (unchanged) ----------
 
 rule pastml:
@@ -201,7 +216,9 @@ rule ancestral_reconstruction:
         annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
     params:
         max_workers=lambda wildcards, threads: threads,
-        runtype=lambda w: len(run_dict.get(w.sample, []))
+        runtype=lambda w: len(run_dict.get(w.sample, [])),
+        pastml_flag=pastml_flag,
+        acr_mode_flag=acr_mode_flag,
     conda:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
@@ -212,7 +229,8 @@ rule ancestral_reconstruction:
         '--max_workers {params.max_workers} '
         '-r {params.runtype} '
         '--reconstruction ' + reconstruction_mode + ' '
-        '--{prefilter}'
+        '--{prefilter} '
+        '{params.pastml_flag} {params.acr_mode_flag}'
 
 # --- Optional sharded API pipeline (acr_shard_size > 0) ------------------
 # Splits the reformatted Parquet into N CSV column-shards, runs one
@@ -245,7 +263,9 @@ if acr_shard_size > 0:
             annotation=f"{base_tmp}/{{sample}}/1-PastML-api/shards/{{shard}}.csv"
         params:
             max_workers=lambda wildcards, threads: threads,
-            runtype=lambda w: len(run_dict.get(w.sample, []))
+            runtype=lambda w: len(run_dict.get(w.sample, [])),
+            pastml_flag=pastml_flag,
+            acr_mode_flag=acr_mode_flag,
         resources:
             mem_mb=16000
         conda:
@@ -258,7 +278,8 @@ if acr_shard_size > 0:
             '--max_workers {params.max_workers} '
             '-r {params.runtype} '
             '--reconstruction ' + reconstruction_mode + ' '
-            '--{prefilter}'
+            '--{prefilter} '
+            '{params.pastml_flag} {params.acr_mode_flag}'
 
     def _acr_shard_outputs(wildcards):
         shard_dir = checkpoints.split_traits.get(sample=wildcards.sample).output.shard_dir

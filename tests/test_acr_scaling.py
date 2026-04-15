@@ -72,6 +72,7 @@ _SCRIPT = str(Path(acr_mod.__file__).resolve())
 
 
 def _run_acr(trait_csv, tree_nwk, out_csv, extra_args=()):
+    """Run ACR via fast ACR engine (default — no --pastml)."""
     cmd = [
         sys.executable, _SCRIPT,
         "--inputs_file", str(trait_csv),
@@ -79,6 +80,21 @@ def _run_acr(trait_csv, tree_nwk, out_csv, extra_args=()):
         "--output_csv",  str(out_csv),
         "--max_workers", "2",
         "--reconstruction", "MPPA",
+        *extra_args,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result
+
+
+def _run_acr_pastml(trait_csv, tree_nwk, out_csv, extra_args=()):
+    """Run ACR via PastML engine (--pastml).  Use only 1-trait CSVs for speed."""
+    cmd = [
+        sys.executable, _SCRIPT,
+        "--inputs_file", str(trait_csv),
+        "--tree_file",   str(tree_nwk),
+        "--output_csv",  str(out_csv),
+        "--pastml",
+        "--reconstruction", "all",
         *extra_args,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -335,3 +351,102 @@ class TestSplitTraits:
         pd.testing.assert_frame_equal(
             merged[shared_num], single[shared_num], check_like=True, atol=1e-9
         )
+
+
+# ===========================================================================
+# 4. --pastml flag — PastML fallback smoke tests
+#    Uses a single-trait CSV so these tests complete quickly.
+# ===========================================================================
+
+@pytest.fixture(scope="module")
+def single_trait_csv(tmp_path_factory) -> Path:
+    """CSV with one trait (T1) — keeps PastML tests fast."""
+    p = tmp_path_factory.mktemp("pastml_data") / "single_trait.csv"
+    df = pd.DataFrame({"T1": _TRAIT_MATRIX["T1"]}, index=_TAXA)
+    df.index.name = "taxon"
+    df.to_csv(p)
+    return p
+
+
+class TestPastMLFlag:
+    """Tests for the --pastml engine fallback (single trait for speed)."""
+
+    def test_pastml_runs_and_produces_output(self, single_trait_csv, tree_nwk, tmp_path):
+        """--pastml flag runs successfully and writes a single-row CSV."""
+        out = tmp_path / "pastml_out.csv"
+        r = _run_acr_pastml(single_trait_csv, tree_nwk, out)
+        assert r.returncode == 0, f"--pastml run failed:\n{r.stderr}"
+        df = pd.read_csv(out)
+        assert len(df) == 1
+        assert df["gene"].iloc[0] == "T1"
+
+    def test_pastml_has_core_columns(self, single_trait_csv, tree_nwk, tmp_path):
+        """--pastml output includes JOINT + MPPA core columns."""
+        out = tmp_path / "pastml_out.csv"
+        r = _run_acr_pastml(single_trait_csv, tree_nwk, out)
+        assert r.returncode == 0, r.stderr
+        df = pd.read_csv(out)
+        for col in ("gains", "losses", "root_state",
+                    "gains_flow", "losses_flow", "gain_subsize_marginal", "root_prob"):
+            assert col in df.columns, f"Missing column '{col}' in --pastml output"
+
+    def test_pastml_has_path_columns(self, single_trait_csv, tree_nwk, tmp_path):
+        """--pastml output includes _path suffix columns (PastML-specific)."""
+        out = tmp_path / "pastml_out.csv"
+        r = _run_acr_pastml(single_trait_csv, tree_nwk, out)
+        assert r.returncode == 0, r.stderr
+        df = pd.read_csv(out)
+        path_cols = [c for c in df.columns if c.endswith("_path")]
+        assert len(path_cols) > 0, (
+            "Expected _path columns in --pastml output but found none"
+        )
+
+    def test_fast_acr_has_no_path_columns(self, single_trait_csv, tree_nwk, tmp_path):
+        """Fast ACR output must NOT include any _path suffix columns."""
+        out = tmp_path / "fast_out.csv"
+        r = _run_acr(single_trait_csv, tree_nwk, out, ["--reconstruction", "all"])
+        assert r.returncode == 0, r.stderr
+        df = pd.read_csv(out)
+        path_cols = [c for c in df.columns if c.endswith("_path")]
+        assert len(path_cols) == 0, (
+            f"Fast ACR should not produce _path columns; found: {path_cols}"
+        )
+
+    def test_short_with_fast_acr_produces_trimmed_output(self, single_trait_csv, tree_nwk, tmp_path):
+        """--short without --pastml should succeed and write only core columns."""
+        out = tmp_path / "fast_short.csv"
+        r = _run_acr(single_trait_csv, tree_nwk, out,
+                     extra_args=["--short", "--reconstruction", "all"])
+        assert r.returncode == 0, f"--short with fast ACR failed:\n{r.stderr}"
+        df = pd.read_csv(out)
+        # Short 'all' mode: union of _short_joint + _short_mppa
+        for col in ("gains", "losses", "gains_flow", "losses_flow",
+                    "gain_subsize_marginal", "root_prob"):
+            assert col in df.columns, f"Missing short column '{col}'"
+        # Full-width columns should be absent
+        assert "gain_subsize_nofilter" not in df.columns
+        assert "gains_entropy" not in df.columns
+
+    def test_pastml_and_fast_acr_shared_columns_are_finite_nonneg(
+        self, single_trait_csv, tree_nwk, tmp_path
+    ):
+        """Common numeric columns between fast ACR and PastML must be finite and ≥ 0."""
+        out_fast   = tmp_path / "fast.csv"
+        out_pastml = tmp_path / "pastml.csv"
+        r_f = _run_acr(single_trait_csv, tree_nwk, out_fast, ["--reconstruction", "all"])
+        r_p = _run_acr_pastml(single_trait_csv, tree_nwk, out_pastml)
+        assert r_f.returncode == 0, r_f.stderr
+        assert r_p.returncode == 0, r_p.stderr
+
+        df_fast   = pd.read_csv(out_fast)
+        df_pastml = pd.read_csv(out_pastml)
+
+        shared_num = [
+            c for c in set(df_fast.columns) & set(df_pastml.columns)
+            if pd.api.types.is_numeric_dtype(df_fast[c]) and c != "gene"
+        ]
+        for col in shared_num:
+            assert np.isfinite(float(df_fast[col].iloc[0])),   f"fast ACR   {col} not finite"
+            assert np.isfinite(float(df_pastml[col].iloc[0])), f"PastML     {col} not finite"
+            assert float(df_fast[col].iloc[0])   >= 0,         f"fast ACR   {col} < 0"
+            assert float(df_pastml[col].iloc[0]) >= 0,         f"PastML     {col} < 0"
