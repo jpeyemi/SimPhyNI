@@ -282,7 +282,189 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     else:
         out['root_state'] = src['root_state'].values.astype(int)
 
+    # Carry through raw JOINT discrete counts and tip prevalence as auxiliary
+    # columns for downstream flagging (prefix _raw_ to distinguish from
+    # simulation params).  These are optional: if the source columns are absent
+    # (legacy CSV without JOINT counts) the auxiliary columns are omitted and
+    # flag_uncalibratable_traits falls back to the canonical FLOW values.
+    for raw_col, raw_alias in [('gains', '_raw_gains'), ('losses', '_raw_losses'),
+                                ('count',  '_raw_count')]:
+        if raw_col in src.columns:
+            out[raw_alias] = src[raw_col].values
+
     return out
+
+
+# ---------------------------------------------------------------------------
+# flag_uncalibratable_traits: data-driven detection of miscalibrated nulls
+# ---------------------------------------------------------------------------
+
+def flag_uncalibratable_traits(
+    params: pd.DataFrame,
+    subsize_ratio_percentile: float = 99.0,
+    rate_iqr_multiplier: float = 3.0,
+    max_sparse_events: int = 5,
+    max_prevalence_fraction: float = 0.80,
+) -> pd.DataFrame:
+    """
+    Identify traits whose Poisson null distribution will be systematically
+    miscalibrated due to sparse events combined with highly asymmetric
+    eligible regions.
+
+    All thresholds are derived from the input dataset so the method
+    generalises to any tree size or branch-length scale.
+
+    Two structural failure modes are detected, both gated on sparse JOINT
+    event counts AND intermediate-to-low tip prevalence.  High-prevalence
+    traits (present in >``max_prevalence_fraction`` of tips) are excluded
+    from flagging even when they show rate asymmetry: for those traits a
+    large rate on a small eligible region correctly simulates high prevalence,
+    so the null is well-calibrated.
+
+    **Failure mode 1 — Subsize asymmetry with sparse events**
+        The eligible region for gains is orders of magnitude larger than for
+        losses (or vice versa).  The rate estimated from the small region is
+        then applied across the large simulation region, catastrophically
+        inflating or deflating the effective rate.
+        Example: perR, yfjM — one loss on a 0.009-unit branch → loss_rate 113,
+        which fires ~600× on the full 5.5-unit simulation region.
+        Detected via the dimensionless ratio
+        ``max(gain_subsize, loss_subsize) / min(gain_subsize, loss_subsize)``
+        exceeding the ``subsize_ratio_percentile`` th percentile of the dataset,
+        gated on JOINT gains + losses ≤ ``max_sparse_events``.
+
+    **Failure mode 2 — Single clade-specific gain with no loss process**
+        The trait was acquired once in a specific large clade and never lost.
+        The simulation places that gain uniformly across the entire eligible
+        region (proportional to branch length), almost always landing on tiny
+        terminal branches and under-predicting prevalence by 7–43×.
+        Example: espZ — one gain at an internal node with 61 descendants,
+        but the MRCA branch is only 0.16 % of eligible branch length.
+        Detected when JOINT gains == 1 AND JOINT losses == 0 AND the subsize
+        ratio exceeds the dataset median × 3.
+
+    Parameters
+    ----------
+    params : pd.DataFrame
+        Canonical params DataFrame from ``build_sim_params()``.  Must contain
+        columns gene, gains, losses, gain_subsize, loss_subsize.  The auxiliary
+        columns ``_raw_gains``, ``_raw_losses``, ``_raw_count`` written by
+        ``build_sim_params`` from the ACR CSV are used when present (JOINT
+        discrete counts and tip prevalence); the function falls back to the
+        canonical columns otherwise.
+    subsize_ratio_percentile : float
+        Dataset percentile cutoff for the subsize asymmetry flag (default 99.0).
+        Traits above this percentile AND satisfying the sparse/prevalence gate
+        are flagged.
+    rate_iqr_multiplier : float
+        Reserved for future use; currently unused in the simplified two-flag
+        design.  Kept for API stability.
+    max_sparse_events : int
+        Maximum total JOINT event count (gains + losses) for a trait to be
+        considered sparse (default 5).  Only sparse traits are eligible for
+        flagging.
+    max_prevalence_fraction : float
+        Maximum tip prevalence fraction for a trait to be eligible for
+        flagging (default 0.80).  High-prevalence traits are excluded because
+        their null distributions are well-calibrated even with asymmetric rates.
+        Requires ``_raw_count`` in params; if absent, no prevalence gate is
+        applied.
+
+    Returns
+    -------
+    flagged : pd.DataFrame
+        Rows for each flagged trait.  Columns: ``gene``, ``gains``,
+        ``losses``, ``gain_subsize``, ``loss_subsize``, ``gain_rate``,
+        ``loss_rate``, ``subsize_ratio``, ``flag_subsize``,
+        ``flag_single_gain``, ``flag_reasons``.
+        Empty DataFrame if no traits are flagged.
+    """
+    eps = 1e-12
+
+    df = params.reset_index() if params.index.name == 'gene' else params.copy()
+    if 'gene' not in df.columns:
+        df = df.reset_index().rename(columns={'index': 'gene'})
+
+    base_cols = ['gene', 'gains', 'losses', 'gain_subsize', 'loss_subsize']
+    aux_cols  = [c for c in ('_raw_gains', '_raw_losses', '_raw_count')
+                 if c in df.columns]
+    df = df[base_cols + aux_cols].copy()
+
+    # Use raw JOINT discrete counts for stratification/gating when available
+    raw_gains  = df['_raw_gains'].round()  if '_raw_gains'  in df.columns else df['gains'].round()
+    raw_losses = df['_raw_losses'].round() if '_raw_losses' in df.columns else df['losses'].round()
+
+    # ------------------------------------------------------------------ #
+    # Derived quantities
+    # ------------------------------------------------------------------ #
+    df['gain_rate'] = np.where(df['gain_subsize'] > eps,
+                               df['gains'] / df['gain_subsize'], 0.0)
+    df['loss_rate'] = np.where(df['loss_subsize'] > eps,
+                               df['losses'] / df['loss_subsize'], 0.0)
+    df['subsize_ratio'] = (
+        np.maximum(df['gain_subsize'], df['loss_subsize']) /
+        (np.minimum(df['gain_subsize'], df['loss_subsize']) + eps)
+    )
+
+    # ------------------------------------------------------------------ #
+    # Sparse-event and prevalence gates (applied to both failure modes)
+    # ------------------------------------------------------------------ #
+    sparse = (raw_gains + raw_losses) <= max_sparse_events
+
+    if '_raw_count' in df.columns:
+        n_tips_est   = df['_raw_count'].max()
+        prevalence   = df['_raw_count'] / n_tips_est
+        low_prev     = prevalence < max_prevalence_fraction
+    else:
+        low_prev = pd.Series(True, index=df.index)   # no prevalence info — flag all
+
+    eligible = sparse & low_prev
+
+    # ------------------------------------------------------------------ #
+    # Flag 1 — subsize asymmetry among sparse, intermediate-prevalence traits
+    # ------------------------------------------------------------------ #
+    ratio_threshold = df['subsize_ratio'].quantile(subsize_ratio_percentile / 100.0)
+    df['flag_subsize'] = eligible & (df['subsize_ratio'] > ratio_threshold)
+
+    # ------------------------------------------------------------------ #
+    # Flag 2 — single gain, no loss, subsize asymmetry above dataset median
+    # (clade-specific acquisition: gain placed randomly on eligible tree)
+    # ------------------------------------------------------------------ #
+    median_ratio = df['subsize_ratio'].median()
+    df['flag_single_gain'] = (
+        low_prev &
+        (raw_gains == 1) &
+        (raw_losses == 0) &
+        (df['subsize_ratio'] > median_ratio * 3)
+    )
+
+    # ------------------------------------------------------------------ #
+    # Combine and annotate reasons
+    # ------------------------------------------------------------------ #
+    flagged_mask = df['flag_subsize'] | df['flag_single_gain']
+
+    def _reasons(row):
+        r = []
+        if row['flag_subsize']:
+            r.append(
+                f"subsize_ratio={row['subsize_ratio']:.1f}>{ratio_threshold:.1f} "
+                f"(>{subsize_ratio_percentile:.0f}th pctile) with "
+                f"JOINT events={int(raw_gains[row.name]+raw_losses[row.name])}"
+            )
+        if row['flag_single_gain']:
+            r.append(
+                f"single_clade_gain: JOINT gains=1, losses=0, "
+                f"subsize_ratio={row['subsize_ratio']:.1f}>{median_ratio*3:.1f}"
+            )
+        return '; '.join(r)
+
+    flagged = df[flagged_mask].copy()
+    if not flagged.empty:
+        flagged['flag_reasons'] = flagged.apply(_reasons, axis=1)
+    else:
+        flagged['flag_reasons'] = pd.Series(dtype=str)
+
+    return flagged.reset_index(drop=True)
 
 
 ### Simulation Methods

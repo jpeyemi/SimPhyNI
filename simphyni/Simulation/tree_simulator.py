@@ -358,7 +358,8 @@ class TreeSimulator:
 
         return valid_pairs, stats
 
-    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None, gamma=False):
+    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
+                       gamma=False, include_flagged=False):
         """
         Runs the tree simulation and stores results.
 
@@ -372,13 +373,18 @@ class TreeSimulator:
                       Gamma(count + 0.5, 1/subsize) instead of using the point estimate.
                       Widens the null for traits with few events; negligible effect for
                       large counts.  Default False.
+        :param include_flagged: If False (default), pairs involving traits with miscalibrated
+                                null distributions are excluded from simulation and assigned p=0.5
+                                in multiple-testing correction.  If True, those pairs are simulated
+                                normally but marked with null_calibrated=False in the results so
+                                downstream users can distinguish them.
         """
         self._gain_mask  = gain_mask
         self._loss_mask  = loss_mask
         self._gene_order = gene_order or []
-        self._simulate_and_evaluate(cores=cores, gamma=gamma)
+        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
 
-    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False):
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=False):
         traits_to_simulate = np.unique(self.pairs.flatten())
 
         # PastML skips constant traits (< 2 unique states), so they are absent
@@ -407,6 +413,55 @@ class TreeSimulator:
 
         traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
 
+        # ------------------------------------------------------------------
+        # Detect traits whose Poisson null distribution is systematically
+        # miscalibrated (sparse events + subsize asymmetry).
+        #
+        # include_flagged=False (default): remove their pairs from simulation
+        #   so they fall into the p=0.5 bucket in _multiple_test_correction.
+        # include_flagged=True: simulate normally but annotate results with
+        #   null_calibrated=False so downstream users can distinguish them.
+        # ------------------------------------------------------------------
+        self.flagged_traits = flag_uncalibratable_traits(traits_to_simulate_pastml)
+        if not self.flagged_traits.empty:
+            flagged_genes = set(self.flagged_traits['gene'])
+            n_flagged = len(flagged_genes)
+            if not include_flagged:
+                print(
+                    f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
+                    f"null distributions. Their pairs are excluded from simulation "
+                    f"and assigned p=0.5. Use --include-flagged to test them anyway. "
+                    f"Access via Sim.flagged_traits for details."
+                )
+                keep_pairs = (
+                    ~np.isin(self.pairs[:, 0], list(flagged_genes)) &
+                    ~np.isin(self.pairs[:, 1], list(flagged_genes))
+                )
+                self.pairs         = self.pairs[keep_pairs]
+                self.obspairs      = self.obspairs[keep_pairs]
+                traits_to_simulate = np.unique(self.pairs.flatten())
+                traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
+            else:
+                print(
+                    f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
+                    f"null distributions. --include-flagged is set: pairs will be "
+                    f"simulated and marked null_calibrated=False in results. "
+                    f"Access via Sim.flagged_traits for details."
+                )
+        else:
+            self.flagged_traits = pd.DataFrame()  # empty but consistent
+
+        # Track which pairs involve a flagged trait so we can annotate results
+        # after simulation when include_flagged=True.
+        if include_flagged and not self.flagged_traits.empty:
+            _fg = set(self.flagged_traits['gene'])
+            self._flagged_pair_mask = (
+                np.isin(self.pairs[:, 0], list(_fg)) |
+                np.isin(self.pairs[:, 1], list(_fg))
+            )
+        else:
+            self._flagged_pair_mask = np.zeros(len(self.pairs), dtype=bool)
+
         # Sub-select mask columns for the traits being simulated
         gm = lm = None
         if getattr(self, '_gain_mask', None) is not None and self._gene_order:
@@ -423,6 +478,10 @@ class TreeSimulator:
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
+
+        # Annotate rows for flagged-trait pairs when include_flagged=True
+        self.simulation_result['null_calibrated'] = ~self._flagged_pair_mask
+
         self._multiple_test_correction(alpha)
     
     def _multiple_test_correction(self,alpha = 0.05):
@@ -451,13 +510,26 @@ class TreeSimulator:
         # Naive (just keep the original p-value)
         res['pval_naive'] = res.loc[:,'p-value'][:simulated_pairs]
 
-        self.result = res[['T1','T2','direction','effect size',
-                'prevalence_T1','prevalence_T2',
-                'pval_naive','pval_bh','pval_by','pval_bonf']]
+        base_cols = ['T1','T2','direction','effect size',
+                     'prevalence_T1','prevalence_T2',
+                     'pval_naive','pval_bh','pval_by','pval_bonf']
+        if 'null_calibrated' in res.columns:
+            base_cols.append('null_calibrated')
+        self.result = res[base_cols]
         
 
     def get_results(self):
         return self.get_top_results(top = len(self.result['T1']))
+
+    def get_flagged_traits(self) -> pd.DataFrame:
+        """
+        Return traits excluded from simulation due to miscalibrated null
+        distributions (subsize asymmetry or rate inflation).
+
+        Returns an empty DataFrame if no traits were flagged, or if
+        run_simulation() has not been called yet.
+        """
+        return getattr(self, 'flagged_traits', pd.DataFrame())
     
     def get_top_results(self, top = 15, direction: Literal[-1,0,1]=0, by: Literal['p-value','effect size']='effect size'):
         res = self.result

@@ -33,6 +33,19 @@ def main():
         )
     parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False,
                         help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
+    parser.add_argument(
+        "--include-flagged",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include traits with miscalibrated null distributions in significance "
+            "testing. By default these traits are excluded and their pairs assigned "
+            "p=0.5. With --include-flagged they are simulated normally and results "
+            "are annotated with a null_calibrated=False column. "
+            "Use Sim.get_flagged_traits() or check null_calibrated in the output CSV "
+            "to identify which pairs are affected. (Default: disabled)"
+        ),
+    )
     args = parser.parse_args()
 
     # ----------------------
@@ -89,7 +102,7 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores, gamma = False)
+    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged)
 
     # ----------------------
     # Save Outputs
