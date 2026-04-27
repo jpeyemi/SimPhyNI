@@ -35,6 +35,18 @@ Rate optimisation modes
 
 Both modes run with Numba @njit(parallel=True) across traits via prange.
 
+Performance notes
+-----------------
+* Requires Numba >= 0.55 (for numba.get_thread_id() inside prange).
+* The kernel allocates O(n_threads × n_nodes) scratch instead of
+  O(n_traits × n_nodes) temporaries per golden-section evaluation, so
+  heap allocation pressure inside prange is eliminated.
+* Thread count defaults to physical cores (not logical/HT) to avoid FPU
+  contention.  Override with n_threads kwarg or NUMBA_NUM_THREADS env var.
+* build_obs_matrix() uses a vectorised NumPy reindex path instead of a
+  pure-Python double loop — O(n_leaves × n_traits) NumPy ops vs. the same
+  count of CPython bytecodes.
+
 Outputs
 -------
 fast_acr() returns a FastACRResult with:
@@ -43,6 +55,7 @@ fast_acr() returns a FastACRResult with:
   sf           : float64[n_traits]          — optimised scaling factors
   pi1          : float64[n_traits]          — used equilibrium frequencies
   log_lh       : float64[n_traits]          — final log-likelihoods
+  timing       : dict                       — walltime (s) per phase
 
 The marginal_p1 array can be sliced per-trait to build a PastML-compatible
 marginal_probabilities DataFrame via marginal_probs_df().
@@ -51,14 +64,85 @@ marginal_probabilities DataFrame via marginal_probs_df().
 from __future__ import annotations
 
 import math
+import os
+import platform
+import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import numba
 import numpy as np
 import pandas as pd
 from ete3 import Tree
 from numba import njit, prange
+
+
+# ---------------------------------------------------------------------------
+# Thread configuration
+# ---------------------------------------------------------------------------
+
+_threads_configured: bool = False
+
+
+def _get_physical_cores() -> Optional[int]:
+    """Return the number of physical CPU cores, or None if undetectable."""
+    try:
+        sys_name = platform.system()
+        if sys_name == "Darwin":
+            r = subprocess.run(
+                ["sysctl", "-n", "hw.physicalcpu"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return int(r.stdout.strip())
+        if sys_name == "Linux":
+            cores: set = set()
+            phys_id = core_id = None
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("physical id"):
+                        phys_id = line.split(":")[1].strip()
+                    elif line.startswith("core id"):
+                        core_id = line.split(":")[1].strip()
+                    elif line.strip() == "" and phys_id is not None and core_id is not None:
+                        cores.add((phys_id, core_id))
+                        phys_id = core_id = None
+            return len(cores) if cores else None
+    except Exception:
+        return None
+
+
+def configure_numba_threads(n_threads: Optional[int] = None) -> int:
+    """Set Numba's thread count and return the value used.
+
+    Call before the first fast_acr() to avoid recompiling with a different
+    thread count.  If *n_threads* is None and NUMBA_NUM_THREADS is not set,
+    attempts to use physical core count (avoids hyperthreading FPU contention).
+
+    Parameters
+    ----------
+    n_threads : int or None
+        Explicit thread count.  None = auto-detect.
+
+    Returns
+    -------
+    int : thread count actually set.
+    """
+    global _threads_configured
+    if n_threads is not None:
+        numba.set_num_threads(int(n_threads))
+        _threads_configured = True
+        return numba.get_num_threads()
+    if "NUMBA_NUM_THREADS" in os.environ:
+        _threads_configured = True
+        return numba.get_num_threads()
+    physical = _get_physical_cores()
+    current  = numba.get_num_threads()
+    if physical and 0 < physical < current:
+        numba.set_num_threads(physical)
+    _threads_configured = True
+    return numba.get_num_threads()
+
 
 # ---------------------------------------------------------------------------
 # Tree array representation
@@ -166,29 +250,55 @@ def build_obs_matrix(
     ta: TreeArrays,
     trait_df: pd.DataFrame,
 ) -> np.ndarray:
-    """Build obs[n_traits, n_nodes] int8 matrix.
+    """Build obs[n_traits, n_nodes] int8 matrix — vectorised NumPy implementation.
 
     trait_df : DataFrame with taxa as index, traits as columns.
-               Values should be 0 / 1 (or convertible).  Missing taxa (not
-               in the tree) are silently ignored.  Tree leaves not in
+               Values should be 0 / 1 (or numeric-convertible).  Missing taxa
+               (not in the tree) are silently ignored.  Tree leaves not in
                trait_df are encoded as -1 (unknown/ambiguous).
 
     Returns int8 array: 0 = absent, 1 = present, -1 = unknown.
+
+    Implementation
+    --------------
+    Replaces the original O(n_traits × n_taxa) CPython double-loop with a
+    vectorised NumPy path operating on a (n_leaves × n_traits) block:
+
+      1. reindex rows to tree-leaf order  — drops taxa not in tree,
+                                            NaN-fills leaves absent from df
+      2. coerce to float64 (non-numeric → NaN)
+      3. cast NaN → -1, finite → int8
+      4. scatter-write into obs via ta.leaf_node_idx (one row-assignment)
+
+    Peak extra RAM: one float64 (n_leaves × n_traits) slice, released on
+    return.  The full n_nodes dimension is never materialised in float64.
+    Internal nodes stay at their initial -1 sentinel.
     """
     n_traits = len(trait_df.columns)
-    n_nodes  = ta.n_nodes
-    obs = np.full((n_traits, n_nodes), -1, dtype=np.int8)
+    obs = np.full((n_traits, ta.n_nodes), -1, dtype=np.int8)
 
-    for t_idx, col in enumerate(trait_df.columns):
-        series = trait_df[col]
-        for taxon, val in series.items():
-            if taxon in ta.name_to_idx:
-                node_i = ta.name_to_idx[taxon]
-                if ta.is_leaf[node_i]:
-                    try:
-                        obs[t_idx, node_i] = np.int8(int(val))
-                    except (ValueError, OverflowError):
-                        pass  # leave as -1
+    if n_traits == 0:
+        return obs
+
+    # Leaf names in node-index order (only leaves, not internal nodes)
+    leaf_names = [ta.node_names[i] for i in ta.leaf_node_idx]
+
+    # Align rows to leaf order.
+    #   taxa not in tree  → not in leaf_names → absent from aligned (no NaN row)
+    #   leaves not in df  → NaN row in aligned
+    aligned = trait_df.reindex(leaf_names)          # (n_leaves, n_traits)
+
+    # Coerce to float64; non-numeric strings / objects become NaN
+    vals = aligned.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    # vals shape: (n_leaves, n_traits)
+
+    # Build int8 with NaN → -1 sentinel; clip guards against out-of-range casts
+    known    = np.isfinite(vals)
+    int_vals = np.where(known, np.clip(vals, -128, 127).astype(np.int8), np.int8(-1))
+    # int_vals shape: (n_leaves, n_traits)
+
+    # obs[t, leaf_node_idx[l]] = int_vals[l, t]  — one vectorised assignment
+    obs[:, ta.leaf_node_idx] = int_vals.T          # (n_traits, n_leaves)
 
     return obs
 
@@ -231,19 +341,18 @@ def _f81_log_probs(bl: float, sf: float, pi1: float):
 
 
 # ---------------------------------------------------------------------------
-# Bottom-up pass — marginal (sum-product)
+# Bottom-up pass — marginal (sum-product), in-place
 # ---------------------------------------------------------------------------
 
 @njit
-def _bu_marginal(postorder, children_ptr, children_list, bl, obs_col,
-                 sf, pi1, is_leaf, n_nodes):
-    """Bottom-up marginal pass (sum-product) in log-space.
+def _bu_marginal_into(postorder, children_ptr, children_list, bl, obs_col,
+                      sf, pi1, is_leaf, n_nodes, log_bu):
+    """Fill log_bu[n_nodes, 2] in-place.
 
-    Returns log_bu[n_nodes, 2] where log_bu[i, s] = log P(data below i | state s).
+    log_bu[i, s] = log P(data below node i | state s at node i).
+    Overwrites all entries; caller must treat the buffer as scratch.
     """
-    log_bu = np.empty((n_nodes, 2), dtype=np.float64)
     NEG_INF = -math.inf
-
     for ki in range(len(postorder)):
         node = postorder[ki]
         if is_leaf[node]:
@@ -265,28 +374,21 @@ def _bu_marginal(postorder, children_ptr, children_list, bl, obs_col,
             for ci in range(cs, ce):
                 child = children_list[ci]
                 la, lb, l1ma, l1mb = _f81_log_probs(bl[child], sf, pi1)
-                # sum over child states for each parent state
                 log_bu[node, 0] += _log_sum_exp2(l1ma + log_bu[child, 0],
                                                   la   + log_bu[child, 1])
                 log_bu[node, 1] += _log_sum_exp2(lb   + log_bu[child, 0],
                                                   l1mb + log_bu[child, 1])
-    return log_bu
 
 
 # ---------------------------------------------------------------------------
-# Bottom-up pass — JOINT (max-product)
+# Bottom-up pass — JOINT (max-product), in-place
 # ---------------------------------------------------------------------------
 
 @njit
-def _bu_joint(postorder, children_ptr, children_list, bl, obs_col,
-              sf, pi1, is_leaf, n_nodes):
-    """Bottom-up JOINT pass (max-product) in log-space.
-
-    Returns log_bu[n_nodes, 2].
-    """
-    log_bu = np.empty((n_nodes, 2), dtype=np.float64)
+def _bu_joint_into(postorder, children_ptr, children_list, bl, obs_col,
+                   sf, pi1, is_leaf, n_nodes, log_bu):
+    """Fill log_bu[n_nodes, 2] in-place (bottom-up JOINT, max-product, log-space)."""
     NEG_INF = -math.inf
-
     for ki in range(len(postorder)):
         node = postorder[ki]
         if is_leaf[node]:
@@ -314,17 +416,16 @@ def _bu_joint(postorder, children_ptr, children_list, bl, obs_col,
                 v11 = l1mb + log_bu[child, 1]   # P(par=1, ch=1)
                 log_bu[node, 0] += max(v00, v01)
                 log_bu[node, 1] += max(v10, v11)
-    return log_bu
 
 
 # ---------------------------------------------------------------------------
-# Top-down pass — marginal
+# Top-down pass — marginal, in-place
 # ---------------------------------------------------------------------------
 
 @njit
-def _td_marginal(preorder, parent, children_ptr, children_list, bl,
-                 log_bu, sf, pi0, pi1, n_nodes, root_idx):
-    """Top-down marginal pass in log-space.
+def _td_marginal_into(preorder, parent, children_ptr, children_list, bl,
+                      log_bu, sf, pi0, pi1, n_nodes, root_idx, log_td):
+    """Fill log_td[n_nodes, 2] in-place (top-down marginal, log-space).
 
     log_td[node][j] integrates over all states of the "rest of the tree"
     (everything outside the subtree rooted at node).
@@ -332,10 +433,8 @@ def _td_marginal(preorder, parent, children_ptr, children_list, bl,
         TD[child][j] = Σ_i  (TD[par][i] · BU[par][i] / contrib[i]) · P[i,j]
 
     where contrib[i] = Σ_j P[i,j] · BU[child][j].
-
-    Returns log_td[n_nodes, 2].
+    log_bu is read-only; log_td is write-only.
     """
-    log_td = np.empty((n_nodes, 2), dtype=np.float64)
     log_td[root_idx, 0] = math.log(pi0) if pi0 > 1e-300 else -math.inf
     log_td[root_idx, 1] = math.log(pi1) if pi1 > 1e-300 else -math.inf
 
@@ -351,7 +450,6 @@ def _td_marginal(preorder, parent, children_ptr, children_list, bl,
         lc1 = _log_sum_exp2(lb   + log_bu[node, 0], l1mb + log_bu[node, 1])
 
         # log p_without[i] = log_td[p][i] + log_bu[p][i] − log_contrib[i]
-        # Guard: -inf - (-inf) = nan; treat as -inf (impossible state).
         NEG_INF = -math.inf
         lpw0 = NEG_INF if lc0 == NEG_INF else log_td[p, 0] + log_bu[p, 0] - lc0
         lpw1 = NEG_INF if lc1 == NEG_INF else log_td[p, 1] + log_bu[p, 1] - lc1
@@ -360,53 +458,47 @@ def _td_marginal(preorder, parent, children_ptr, children_list, bl,
         log_td[node, 0] = _log_sum_exp2(lpw0 + l1ma, lpw1 + lb)
         log_td[node, 1] = _log_sum_exp2(lpw0 + la,   lpw1 + l1mb)
 
-    return log_td
-
 
 # ---------------------------------------------------------------------------
-# Marginal probabilities from BU + TD
+# Marginal probabilities from BU + TD, in-place
 # ---------------------------------------------------------------------------
 
 @njit
-def _marginal_p1(log_bu, log_td, pi0, pi1, n_nodes):
-    """P(state=1 | data) at every node, given BU and TD log-likelihoods.
+def _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, out_p1):
+    """Write P(state=1 | data) at every node into out_p1[n_nodes].
 
     marginal[node][s] ∝ BU[node][s] · TD[node][s]
 
-    The π prior is already embedded in TD via the root initialization
-    (log_td[root] = [log(π₀), log(π₁)]), so we do NOT add π here again.
+    The π prior is embedded in TD via the root initialisation, so π is not
+    added here again.  out_p1 must be a contiguous float64[n_nodes] buffer.
     """
-    p1 = np.empty(n_nodes, dtype=np.float64)
     for i in range(n_nodes):
         lm0 = log_bu[i, 0] + log_td[i, 0]
         lm1 = log_bu[i, 1] + log_td[i, 1]
         lt  = _log_sum_exp2(lm0, lm1)
-        p1[i] = math.exp(lm1 - lt) if lt > -math.inf else 0.5
-    return p1
+        out_p1[i] = math.exp(lm1 - lt) if lt > -math.inf else 0.5
 
 
 # ---------------------------------------------------------------------------
-# JOINT traceback
+# JOINT traceback, in-place
 # ---------------------------------------------------------------------------
 
 @njit
-def _joint_traceback(preorder, parent, bl, log_bu, sf, pi1, n_nodes, root_idx):
-    """Top-down JOINT traceback — assigns MAP state to every node.
-
-    Returns joint_states[n_nodes] as int8 (0 or 1; -1 = unreachable).
-    """
-    joint = np.full(n_nodes, -1, dtype=np.int8)
-    pi0   = 1.0 - pi1
-    # Root: argmax( π_s · BU[root][s] )
-    lpi0  = math.log(pi0) if pi0 > 1e-300 else -math.inf
-    lpi1  = math.log(pi1) if pi1 > 1e-300 else -math.inf
-    joint[root_idx] = np.int8(1 if (lpi1 + log_bu[root_idx, 1]) >= (lpi0 + log_bu[root_idx, 0]) else 0)
+def _joint_traceback_into(preorder, parent, bl, log_bu, sf, pi1,
+                           n_nodes, root_idx, out_joint):
+    """Write MAP state (0 or 1; -1 = unreachable) into out_joint[n_nodes] (int8)."""
+    pi0  = 1.0 - pi1
+    lpi0 = math.log(pi0) if pi0 > 1e-300 else -math.inf
+    lpi1 = math.log(pi1) if pi1 > 1e-300 else -math.inf
+    out_joint[root_idx] = np.int8(
+        1 if (lpi1 + log_bu[root_idx, 1]) >= (lpi0 + log_bu[root_idx, 0]) else 0
+    )
 
     for ki in range(len(preorder)):
         node = preorder[ki]
         if node == root_idx:
             continue
-        ps = joint[parent[node]]
+        ps = out_joint[parent[node]]
         if ps < 0:
             continue
         la, lb, l1ma, l1mb = _f81_log_probs(bl[node], sf, pi1)
@@ -416,9 +508,7 @@ def _joint_traceback(preorder, parent, bl, log_bu, sf, pi1, n_nodes, root_idx):
         else:
             v0 = lb   + log_bu[node, 0]
             v1 = l1mb + log_bu[node, 1]
-        joint[node] = np.int8(1 if v1 >= v0 else 0)
-
-    return joint
+        out_joint[node] = np.int8(1 if v1 >= v0 else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -434,38 +524,39 @@ def _log_lh(log_bu_root, pi0, pi1):
 
 
 # ---------------------------------------------------------------------------
-# Rate optimisation — golden-section search (1-D, Numba-native)
+# Rate optimisation helpers — accept pre-allocated scratch buffer
 # ---------------------------------------------------------------------------
 
 @njit(inline="always")
 def _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
-               pi0, pi1, is_leaf, n_nodes, root_idx, log_sf):
-    """Evaluate log P(data | sf) for golden-section use."""
+               pi0, pi1, is_leaf, n_nodes, root_idx, log_sf, log_bu_scratch):
+    """Evaluate log P(data | sf); overwrites log_bu_scratch[n_nodes, 2] in-place."""
     sf_ = math.exp(log_sf)
-    lbu = _bu_marginal(postorder, children_ptr, children_list, bl,
-                       obs_col, sf_, pi1, is_leaf, n_nodes)
-    return _log_lh(lbu[root_idx], pi0, pi1)
+    _bu_marginal_into(postorder, children_ptr, children_list, bl,
+                      obs_col, sf_, pi1, is_leaf, n_nodes, log_bu_scratch)
+    return _log_lh(log_bu_scratch[root_idx], pi0, pi1)
 
 
 @njit(inline="always")
 def _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
-                sf, is_leaf, n_nodes, root_idx, pi1_):
-    """Evaluate log P(data | pi1) for golden-section use."""
+                sf, is_leaf, n_nodes, root_idx, pi1_, log_bu_scratch):
+    """Evaluate log P(data | π₁); overwrites log_bu_scratch[n_nodes, 2] in-place."""
     pi0_ = 1.0 - pi1_
-    lbu  = _bu_marginal(postorder, children_ptr, children_list, bl,
-                        obs_col, sf, pi1_, is_leaf, n_nodes)
-    return _log_lh(lbu[root_idx], pi0_, pi1_)
+    _bu_marginal_into(postorder, children_ptr, children_list, bl,
+                      obs_col, sf, pi1_, is_leaf, n_nodes, log_bu_scratch)
+    return _log_lh(log_bu_scratch[root_idx], pi0_, pi1_)
 
 
 @njit
 def _golden_section_sf(
     postorder, children_ptr, children_list, bl, obs_col,
     pi0, pi1, is_leaf, n_nodes, root_idx,
-    log_sf_lo, log_sf_hi, n_iter=32,
+    log_sf_lo, log_sf_hi, n_iter, log_bu_scratch,
 ):
     """Maximise log-likelihood over log(sf) using golden-section search.
 
-    Searches in log-space so the interval is uniform in multiplicative scale.
+    log_bu_scratch[n_nodes, 2] is used as working space and overwritten on
+    every likelihood evaluation — no heap allocation inside the loop.
     Returns (sf_opt, log_lh_opt).
     """
     PHI = (math.sqrt(5.0) - 1.0) / 2.0  # ≈ 0.618
@@ -473,9 +564,9 @@ def _golden_section_sf(
     c = b - PHI * (b - a)
     d = a + PHI * (b - a)
     fc = _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
-                    pi0, pi1, is_leaf, n_nodes, root_idx, c)
+                    pi0, pi1, is_leaf, n_nodes, root_idx, c, log_bu_scratch)
     fd = _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
-                    pi0, pi1, is_leaf, n_nodes, root_idx, d)
+                    pi0, pi1, is_leaf, n_nodes, root_idx, d, log_bu_scratch)
 
     for _ in range(n_iter):
         if fc >= fd:
@@ -483,13 +574,13 @@ def _golden_section_sf(
             d  = c; fd = fc
             c  = b - PHI * (b - a)
             fc = _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
-                            pi0, pi1, is_leaf, n_nodes, root_idx, c)
+                            pi0, pi1, is_leaf, n_nodes, root_idx, c, log_bu_scratch)
         else:
             a  = c
             c  = d; fc = fd
             d  = a + PHI * (b - a)
             fd = _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
-                            pi0, pi1, is_leaf, n_nodes, root_idx, d)
+                            pi0, pi1, is_leaf, n_nodes, root_idx, d, log_bu_scratch)
 
     sf_opt = math.exp((a + b) / 2.0)
     return sf_opt, (fc + fd) / 2.0
@@ -499,17 +590,21 @@ def _golden_section_sf(
 def _golden_section_pi1(
     postorder, children_ptr, children_list, bl, obs_col,
     sf, is_leaf, n_nodes, root_idx,
-    pi1_lo, pi1_hi, n_iter=32,
+    pi1_lo, pi1_hi, n_iter, log_bu_scratch,
 ):
-    """Maximise log-likelihood over π₁ with sf fixed.  Returns (pi1_opt, lh_opt)."""
+    """Maximise log-likelihood over π₁ with sf fixed.
+
+    log_bu_scratch[n_nodes, 2] is used as working space.
+    Returns (pi1_opt, lh_opt).
+    """
     PHI = (math.sqrt(5.0) - 1.0) / 2.0
     a, b = pi1_lo, pi1_hi
     c = b - PHI * (b - a)
     d = a + PHI * (b - a)
     fc = _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
-                     sf, is_leaf, n_nodes, root_idx, c)
+                     sf, is_leaf, n_nodes, root_idx, c, log_bu_scratch)
     fd = _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
-                     sf, is_leaf, n_nodes, root_idx, d)
+                     sf, is_leaf, n_nodes, root_idx, d, log_bu_scratch)
 
     for _ in range(n_iter):
         if fc >= fd:
@@ -517,19 +612,19 @@ def _golden_section_pi1(
             d  = c; fd = fc
             c  = b - PHI * (b - a)
             fc = _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
-                             sf, is_leaf, n_nodes, root_idx, c)
+                             sf, is_leaf, n_nodes, root_idx, c, log_bu_scratch)
         else:
             a  = c
             c  = d; fc = fd
             d  = a + PHI * (b - a)
             fd = _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
-                             sf, is_leaf, n_nodes, root_idx, d)
+                             sf, is_leaf, n_nodes, root_idx, d, log_bu_scratch)
 
     return (a + b) / 2.0, (fc + fd) / 2.0
 
 
 # ---------------------------------------------------------------------------
-# Parallel batch kernel
+# Parallel batch kernel — per-thread scratch, no heap allocation in prange
 # ---------------------------------------------------------------------------
 
 @njit(parallel=True)
@@ -546,6 +641,11 @@ def _batch_acr_kernel(
 ):
     """Parallel binary F81 ACR for every trait.
 
+    Per-thread scratch arrays (n_threads × n_nodes × 2) are allocated once
+    before the prange loop.  Each thread indexes its own slice via
+    numba.get_thread_id(), eliminating all heap allocation inside the loop.
+    Requires Numba >= 0.55 for get_thread_id().
+
     Returns
     -------
     sf_out       : float64[n_traits]
@@ -559,19 +659,30 @@ def _batch_acr_kernel(
     pi1_out      = np.empty(n_traits, dtype=np.float64)
     log_lh_out   = np.empty(n_traits, dtype=np.float64)
     marginal_p1  = np.empty((n_traits, n_nodes), dtype=np.float64)
-    joint_states = np.empty((n_traits, n_nodes), dtype=np.int8)
+    joint_states = np.full((n_traits, n_nodes), np.int8(-1), dtype=np.int8)
+
+    # Allocate per-thread scratch: O(n_threads × n_nodes) total, not O(n_traits).
+    # Each thread's slice is used exclusively by that thread throughout prange.
+    n_th         = numba.get_num_threads()
+    scratch_bu   = np.empty((n_th, n_nodes, 2), dtype=np.float64)  # marginal BU / rate opt
+    scratch_td   = np.empty((n_th, n_nodes, 2), dtype=np.float64)  # TD pass
+    scratch_bu_j = np.empty((n_th, n_nodes, 2), dtype=np.float64)  # joint BU
 
     for t in prange(n_traits):
-        obs_col   = obs[t]
-        pi1_emp   = pi1_init[t]
+        tid      = numba.get_thread_id()
+        log_bu   = scratch_bu[tid]    # private (n_nodes, 2) view for this thread
+        log_td   = scratch_td[tid]
+        log_bu_j = scratch_bu_j[tid]
 
-        # --- Rate optimisation ---
-        # Always run from empirical π₁ first.
-        pi0_emp       = 1.0 - pi1_emp
-        sf, log_lh_v  = _golden_section_sf(
+        obs_col  = obs[t]
+        pi1_emp  = pi1_init[t]
+        pi0_emp  = 1.0 - pi1_emp
+
+        # --- Rate optimisation: always start from empirical π₁ ---
+        sf, log_lh_v = _golden_section_sf(
             postorder, children_ptr, children_list, bl, obs_col,
             pi0_emp, pi1_emp, is_leaf, n_nodes, root_idx,
-            log_sf_lo, log_sf_hi, n_gs_sf,
+            log_sf_lo, log_sf_hi, n_gs_sf, log_bu,
         )
         pi1 = pi1_emp
 
@@ -581,36 +692,35 @@ def _batch_acr_kernel(
                 pi1, log_lh_v = _golden_section_pi1(
                     postorder, children_ptr, children_list, bl, obs_col,
                     sf, is_leaf, n_nodes, root_idx,
-                    pi1_lo, pi1_hi, n_gs_pi1,
+                    pi1_lo, pi1_hi, n_gs_pi1, log_bu,
                 )
                 pi0 = 1.0 - pi1
                 sf, log_lh_v = _golden_section_sf(
                     postorder, children_ptr, children_list, bl, obs_col,
                     pi0, pi1, is_leaf, n_nodes, root_idx,
-                    log_sf_lo, log_sf_hi, n_gs_sf,
+                    log_sf_lo, log_sf_hi, n_gs_sf, log_bu,
                 )
 
-            # --- Multi-start: also try JC (π₁=0.5) and flipped (π₁=1−emp) ---
-            # This is critical for high-frequency traits where the empirical
-            # start locks onto a saturated (sf→∞, p≈π₁ everywhere) optimum
-            # that gives nearly-flat marginals and wrong gains_flow.
+            # Multi-start: also try JC (π₁=0.5) and flipped (π₁=1−emp).
+            # Critical for high-frequency traits where the empirical start
+            # locks onto a saturated (sf→∞, p≈π₁ everywhere) optimum.
             for pi1_start in (0.5, 1.0 - pi1_emp):
                 pi1_s = max(pi1_lo, min(pi1_hi, pi1_start))
                 sf_s, lh_s = _golden_section_sf(
                     postorder, children_ptr, children_list, bl, obs_col,
                     1.0 - pi1_s, pi1_s, is_leaf, n_nodes, root_idx,
-                    log_sf_lo, log_sf_hi, n_gs_sf,
+                    log_sf_lo, log_sf_hi, n_gs_sf, log_bu,
                 )
                 for _cycle in range(2):
                     pi1_s, lh_s = _golden_section_pi1(
                         postorder, children_ptr, children_list, bl, obs_col,
                         sf_s, is_leaf, n_nodes, root_idx,
-                        pi1_lo, pi1_hi, n_gs_pi1,
+                        pi1_lo, pi1_hi, n_gs_pi1, log_bu,
                     )
                     sf_s, lh_s = _golden_section_sf(
                         postorder, children_ptr, children_list, bl, obs_col,
                         1.0 - pi1_s, pi1_s, is_leaf, n_nodes, root_idx,
-                        log_sf_lo, log_sf_hi, n_gs_sf,
+                        log_sf_lo, log_sf_hi, n_gs_sf, log_bu,
                     )
                 if lh_s > log_lh_v:
                     sf, pi1, log_lh_v = sf_s, pi1_s, lh_s
@@ -620,18 +730,20 @@ def _batch_acr_kernel(
         pi1_out[t]    = pi1
         log_lh_out[t] = log_lh_v
 
-        # --- Marginal BU + TD + probabilities ---
-        log_bu = _bu_marginal(postorder, children_ptr, children_list, bl,
-                              obs_col, sf, pi1, is_leaf, n_nodes)
-        log_td = _td_marginal(preorder, parent, children_ptr, children_list,
-                              bl, log_bu, sf, pi0, pi1, n_nodes, root_idx)
-        marginal_p1[t] = _marginal_p1(log_bu, log_td, pi0, pi1, n_nodes)
+        # --- Final marginal BU + TD + marginal probabilities ---
+        # Re-run BU with the converged (sf, pi1) — golden-section left log_bu
+        # in an indeterminate state (last evaluation may not be the optimum).
+        _bu_marginal_into(postorder, children_ptr, children_list, bl,
+                          obs_col, sf, pi1, is_leaf, n_nodes, log_bu)
+        _td_marginal_into(preorder, parent, children_ptr, children_list,
+                          bl, log_bu, sf, pi0, pi1, n_nodes, root_idx, log_td)
+        _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, marginal_p1[t])
 
-        # --- JOINT BU + traceback ---
-        log_bu_j = _bu_joint(postorder, children_ptr, children_list, bl,
-                             obs_col, sf, pi1, is_leaf, n_nodes)
-        joint_states[t] = _joint_traceback(preorder, parent, bl, log_bu_j,
-                                           sf, pi1, n_nodes, root_idx)
+        # --- Final JOINT BU + traceback ---
+        _bu_joint_into(postorder, children_ptr, children_list, bl,
+                       obs_col, sf, pi1, is_leaf, n_nodes, log_bu_j)
+        _joint_traceback_into(preorder, parent, bl, log_bu_j,
+                              sf, pi1, n_nodes, root_idx, joint_states[t])
 
     return sf_out, pi1_out, log_lh_out, marginal_p1, joint_states
 
@@ -655,6 +767,7 @@ class FastACRResult:
     trait_names:  List[str]
     ta:           TreeArrays
     elapsed_s:    float
+    timing:       Dict[str, float] = field(default_factory=dict)
 
 
 def fast_acr(
@@ -668,6 +781,7 @@ def fast_acr(
     sf_hi_mult: float = 100.0,
     pi1_lo: float = 1e-4,
     pi1_hi_off: float = 1e-4,
+    n_threads: Optional[int] = None,
 ) -> FastACRResult:
     """Run fast binary F81 ACR on all traits in parallel.
 
@@ -685,6 +799,8 @@ def fast_acr(
     sf_hi_mult   : sf upper bound = sf_hi_mult / avg_bl
     pi1_lo       : π₁ lower bound for ml mode
     pi1_hi_off   : π₁ upper bound = 1 − pi1_hi_off  for ml mode
+    n_threads    : Numba thread count (None = auto via configure_numba_threads())
+                   Ignored if NUMBA_NUM_THREADS env var is already set.
 
     Returns
     -------
@@ -693,32 +809,42 @@ def fast_acr(
     if mode not in ("empirical", "ml"):
         raise ValueError(f"mode must be 'empirical' or 'ml', got {mode!r}")
 
+    timing: Dict[str, float] = {}
+
+    # ---- Thread configuration (once per process, or whenever n_threads given) ----
+    if n_threads is not None or not _threads_configured:
+        n_actual = configure_numba_threads(n_threads)
+        print(f"  [fast_acr] Numba threads: {n_actual}", flush=True)
+
     n_traits, n_nodes = obs.shape
     assert n_nodes == ta.n_nodes
 
-    # ---- Empirical π₁ per trait (from observed tip values) ----
-    # Use the leaf-restricted obs values; unknown (-1) excluded from mean.
-    pi1_init = np.empty(n_traits, dtype=np.float64)
-    leaf_idx  = ta.leaf_node_idx
-    for t in range(n_traits):
-        col = obs[t, leaf_idx]
-        known = col[col >= 0]
-        if len(known) == 0 or known.sum() == 0:
-            pi1_init[t] = 0.01
-        elif known.sum() == len(known):
-            pi1_init[t] = 0.99
-        else:
-            pi1_init[t] = float(known.sum()) / float(len(known))
+    # ---- Empirical π₁ per trait — vectorised NumPy (replaces Python loop) ----
+    t0 = time.perf_counter()
+    leaf_idx = ta.leaf_node_idx
+    leaf_obs = obs[:, leaf_idx]                          # int8[n_traits, n_leaves]
+    known    = leaf_obs >= 0                             # bool[n_traits, n_leaves]
+    n_known  = known.sum(axis=1)                         # int64[n_traits]
+    n_ones   = np.where(known, leaf_obs.astype(np.int32), 0).sum(axis=1)
+    safe_cnt = np.maximum(n_known, 1).astype(np.float64)
+    pi1_init = np.where(
+        n_known == 0,      0.01,
+        np.where(
+            n_ones == n_known, 0.99,
+            n_ones.astype(np.float64) / safe_cnt,
+        ),
+    ).astype(np.float64)
+    timing["pi1_init"] = time.perf_counter() - t0
 
     # ---- sf search bounds (in log-space) ----
     log_sf_lo = math.log(sf_lo_mult / ta.avg_bl)
     log_sf_hi = math.log(sf_hi_mult / ta.avg_bl)
     pi1_lo_v  = float(pi1_lo)
     pi1_hi_v  = float(1.0 - pi1_hi_off)
+    ml_mode   = (mode == "ml")
 
-    ml_mode = (mode == "ml")
-
-    # ---- Warm-up Numba JIT on a single trait (avoids timing the compile) ----
+    # ---- Warm-up: trigger Numba JIT before timing the real run ----
+    t0 = time.perf_counter()
     _batch_acr_kernel(
         ta.postorder, ta.preorder, ta.parent,
         ta.children_ptr, ta.children_list,
@@ -730,6 +856,7 @@ def fast_acr(
         n_gs_sf, n_gs_pi1,
         ml_mode,
     )
+    timing["warmup"] = time.perf_counter() - t0
 
     # ---- Full batch run ----
     t0 = time.perf_counter()
@@ -744,7 +871,8 @@ def fast_acr(
         n_gs_sf, n_gs_pi1,
         ml_mode,
     )
-    elapsed = time.perf_counter() - t0
+    timing["kernel"] = time.perf_counter() - t0
+    timing["total"]  = sum(timing.values())
 
     return FastACRResult(
         marginal_p1=marginal_p1,
@@ -754,7 +882,8 @@ def fast_acr(
         log_lh=log_lh_out,
         trait_names=list(trait_names),
         ta=ta,
-        elapsed_s=elapsed,
+        elapsed_s=timing["total"],
+        timing=timing,
     )
 
 
