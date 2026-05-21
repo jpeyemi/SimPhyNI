@@ -100,7 +100,8 @@ def run_simphyni(args):
         f"prefilter=False", #{args.prefilter}", #Top level removal of prefilter funtion due to variable performance and minimal efficiency gains. May reimplement in later version
         f"plot={args.plot}",
         f"directory={outdir}",
-        f"save_object={args.save_object}"
+        f"save_object={args.save_object}",
+        f"include_flagged={args.include_flagged}",
     ]
 
     # profile flag handling
@@ -175,6 +176,7 @@ def main():
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
     run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
+    run_parser.add_argument("--include-flagged", action=argparse.BooleanOptionalAction, default=False, help="Include traits with miscalibrated null distributions in significance testing (Default: disabled)")
     run_parser.add_argument(
         "snakemake_args",
         nargs=argparse.REMAINDER,

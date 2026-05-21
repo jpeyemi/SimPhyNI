@@ -178,7 +178,11 @@ class TreeSimulator:
         to_prune = set()
         while(node_queue):
             current_node: TreeNode = node_queue.pop()
-            sibling: TreeNode = current_node.get_sisters()[0]
+            sisters = current_node.get_sisters()
+            if not sisters:
+                to_prune.add(current_node)
+                continue
+            sibling: TreeNode = sisters[0]
             if not sibling.is_leaf():
                 to_prune.add(current_node)
                 continue
@@ -264,8 +268,6 @@ class TreeSimulator:
             # Get indices of significant pairs
             i_idx, j_idx = np.where(sig_mask)
 
-            print(p_two)
-
             sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
             sig_pvals = p_two[i_idx, j_idx]
 
@@ -274,7 +276,6 @@ class TreeSimulator:
         # Filter by fishers exact test if prefilter enabled
         if pre_filter:
             pairs, pvals = fisher_significant_pairs(vars[valid_vars],targets[valid_targets],valid_vars,valid_targets)
-            print(pairs)
         else:
             X, Y = np.meshgrid(valid_vars, valid_targets, indexing='ij')
             pairs = np.column_stack((X.ravel(), Y.ravel()))
@@ -359,7 +360,7 @@ class TreeSimulator:
         return valid_pairs, stats
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
-                       gamma=False, include_flagged=False):
+                       gamma=False, include_flagged=False, use_clade_mask=False):
         """
         Runs the tree simulation and stores results.
 
@@ -379,9 +380,10 @@ class TreeSimulator:
                                 normally but marked with null_calibrated=False in the results so
                                 downstream users can distinguish them.
         """
-        self._gain_mask  = gain_mask
-        self._loss_mask  = loss_mask
-        self._gene_order = gene_order or []
+        self._gain_mask      = gain_mask
+        self._loss_mask      = loss_mask
+        self._gene_order     = gene_order or []
+        self._use_clade_mask = use_clade_mask and (gain_mask is None)
         self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
 
     def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=False):
@@ -462,9 +464,23 @@ class TreeSimulator:
         else:
             self._flagged_pair_mask = np.zeros(len(self.pairs), dtype=bool)
 
-        # Sub-select mask columns for the traits being simulated
+        # Build per-trait eligibility masks for simulation
         gm = lm = None
-        if getattr(self, '_gain_mask', None) is not None and self._gene_order:
+        if self._use_clade_mask:
+            from .simulation import build_clade_mask
+            root_states = traits_to_simulate_pastml['root_state']
+            gm, lm, mrca_bl = build_clade_mask(
+                self.tree, self.obsdf_modified,
+                list(traits_to_simulate),
+                root_states,
+            )
+            # Recalibrate subsize to the MRCA subtree branch length so the
+            # Poisson rate (count / subsize) matches the eligible region.
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = mrca_bl
+            traits_to_simulate_pastml['loss_subsize'] = mrca_bl
+        elif getattr(self, '_gain_mask', None) is not None and self._gene_order:
+            # Legacy: explicit mask passed by the caller
             col_idx = [self._gene_order.index(g) for g in traits_to_simulate
                        if g in self._gene_order]
             if col_idx:

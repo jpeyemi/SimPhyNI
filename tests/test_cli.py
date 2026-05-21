@@ -49,6 +49,7 @@ def mock_args_obj(**kwargs):
     args.temp_dir = "tmp"
     args.plot = False
     args.save_object = False
+    args.include_flagged = False
     args.cores = None
     args.profile = None
     args.dry_run = False
