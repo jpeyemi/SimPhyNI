@@ -2,12 +2,25 @@
 
 import argparse
 import os
+import sys
+import tempfile
+import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import pandas as pd
 import numpy as np
-from scipy.special import loggamma
+
+# Ensure the scripts directory is on sys.path so traits_io can be imported
+# both when run as a script (Snakemake) and when imported as a package module.
+sys.path.insert(0, str(Path(__file__).parent))
+from traits_io import (
+    get_trait_metadata,
+    load_trait_columns,
+    load_trait_columns_filtered,
+    prefilter_traits_chunked,
+    _is_parquet,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--inputs_file", required=True)
@@ -24,75 +37,33 @@ parser.add_argument(
 parser.add_argument("-r", "--run_traits", type=int, default=0)
 args = parser.parse_args()
 
-def prefiltering(obs):
-    valid_obs= np.array(obs.columns)
-
-    def fisher_significant_pairs(vars: pd.DataFrame, targets: pd.DataFrame, valid_vars, valid_targets, pval_threshold: float = 0.05):
-        X = vars.to_numpy().astype(bool)
-        Y = targets.to_numpy().astype(bool)
-        n = X.shape[0]
-
-        # Compute all pairwise contingency counts efficiently
-        a = X.T @ Y                      # (n_vars x n_targets) both=1
-        sX = X.sum(axis=0)               # (n_vars,)
-        sY = Y.sum(axis=0)               # (n_targets,)
-
-        b = sX[:, None] - a              # (i=1, j=0)
-        c = sY[None, :] - a              # (i=0, j=1)
-        d = n - (a + b + c)              # both=0
-
-        # Compute marginals
-        row1 = a + b
-        row2 = c + d
-        col1 = a + c
-        n_all = n
-
-        # Log-binomial function
-        def logC(n, k):
-            return loggamma(n + 1) - loggamma(k + 1) - loggamma(n - k + 1)
-
-        # log probability of observed a under null
-        logp_obs = logC(row1, a) + logC(row2, col1 - a) - logC(n_all, col1)
-        p_obs = np.exp(logp_obs)
-
-        # approximate two-sided p-value as 2 * min(one-sided, 1)
-        p_two = np.minimum(1.0, 2 * p_obs)
-
-        # Mask NaNs and invalids
-        p_two[np.isnan(p_two)] = 1.0
-
-        # Apply significance threshold
-        sig_mask = p_two < pval_threshold
-
-        # Get indices of significant pairs
-        i_idx, j_idx = np.where(sig_mask)
-
-        sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
-        sig_pvals = p_two[i_idx, j_idx]
-
-        return sig_pairs, sig_pvals
-    
-    if args.run_traits == 0:
-        pairs, pvals = fisher_significant_pairs(obs,obs,valid_obs,valid_obs)
-    else:
-        pairs, pvals = fisher_significant_pairs(obs[valid_obs[:args.run_traits]],obs[valid_obs[args.run_traits:]],valid_obs[:args.run_traits],valid_obs[args.run_traits:])
-
-    filtered_obs = np.unique(pairs.flatten())
-    return filtered_obs
-
 
 inputs_file = args.inputs_file
 tree_file = args.tree_file
 output_dir = Path(args.outdir)
-obs = pd.read_csv(inputs_file, index_col = 0)
+
+# ------------------------------------------------------------------
+# Prefiltering: use chunked Fisher test — never loads full matrix
+# ------------------------------------------------------------------
+index_col, all_traits = get_trait_metadata(inputs_file)
+
 if args.prefilter:
-    sample_ids = prefiltering(obs)
+    print("Pre-filtering traits by Fisher exact test (chunked) ...", flush=True)
+    sample_ids = prefilter_traits_chunked(
+        inputs_file,
+        index_col,
+        valid_rows=None,   # no row restriction at this stage
+        run_traits=args.run_traits,
+    )
+    print(f"  {len(sample_ids)} traits retained (of {len(all_traits)} input)", flush=True)
 else:
-    sample_ids = list(obs.columns)
+    sample_ids = list(all_traits)
+
 max_workers = args.max_workers
 summary_file = Path(args.summary_file)
 summary_file.parent.mkdir(parents=True, exist_ok=True)
 os.makedirs(output_dir, exist_ok=True)
+
 
 def run_pastml(sample_id):
     sample_dir = output_dir / sample_id
@@ -100,12 +71,28 @@ def run_pastml(sample_id):
     output_file = sample_dir / "combined_ancestral_states.tab"
     if output_file.exists() and os.path.getsize(output_file) > 10:
         return sample_id, "Skipped (output exists)"
+
+    # For Parquet input: write a per-sample mini CSV (index + this one column).
+    # This avoids loading the full matrix upfront; peak RAM per thread is
+    # proportional to n_rows × 1 column only.
+    local_tmp = None
+    if _is_parquet(inputs_file):
+        col_df = load_trait_columns(inputs_file, [sample_id], index_col)
+        local_tmp = tempfile.NamedTemporaryFile(
+            suffix=".csv", delete=False, mode="w"
+        )
+        col_df.to_csv(local_tmp.name)
+        local_tmp.close()
+        pastml_input = local_tmp.name
+    else:
+        pastml_input = inputs_file
+
     try:
         with open(sample_dir / "pastml.log", "w") as log:
             subprocess.run([
                 "pastml",
                 "--tree", str(tree_file),
-                "--data", str(inputs_file),
+                "--data", str(pastml_input),
                 "--columns", sample_id,
                 "--id_index", "0",
                 "-n", "outs",
@@ -118,6 +105,13 @@ def run_pastml(sample_id):
         return sample_id, "Success"
     except subprocess.CalledProcessError as e:
         return sample_id, f"Failed with error: {e}"
+    finally:
+        if local_tmp is not None:
+            try:
+                os.unlink(local_tmp.name)
+            except OSError:
+                pass
+
 
 results = {}
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -128,6 +122,8 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
             sample_id, status = future.result()
             results[sample_id] = status
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"  [FAILED] {sample_id}: {e}\n{tb}", file=sys.stderr, flush=True)
             results[sample_id] = f"Failed with exception: {e}"
 
 with open(summary_file, "w") as f:

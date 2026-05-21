@@ -30,6 +30,7 @@ base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
+include_flagged = 'include-flagged' if str(config.get('include_flagged')).lower() == 'true' else 'no-include-flagged'
 
 samples["MinPrev"] = samples.get("MinPrev", 0.05)
 samples["MaxPrev"] = samples.get("MaxPrev", 0.95)
@@ -57,12 +58,12 @@ TRAITS_ls = TRAITS_ls_raw.apply(parse_trait_cols)
 run_dict = dict(zip(SAMPLE_ls, TRAITS_ls))
 prev_dict = dict(zip(SAMPLE_ls, list(zip(samples['MinPrev'], samples['MaxPrev']))))
 
-def copy_files_to_inputs(file_paths, name):
+def copy_files_to_inputs(file_paths, names):
     input_dir = os.path.join(outdir, "inputs")
     os.makedirs(input_dir, exist_ok=True)
-    for file_path, n in zip(file_paths,name):
+    for file_path, n in zip(file_paths, names):
         file_name = os.path.basename(file_path)
-        name, ext = os.path.splitext(file_name)
+        stem, ext = os.path.splitext(file_name)
         destination_path = os.path.join(input_dir, f"{n}{ext}")
         if not os.path.exists(destination_path):
             shutil.copy(file_path, destination_path)
@@ -72,6 +73,13 @@ def copy_files_to_inputs(file_paths, name):
 
 copy_files_to_inputs(OBS_ls, SAMPLE_ls)
 copy_files_to_inputs(TREE_ls, SAMPLE_ls)
+
+# Map each sample to the file extension of its raw traits file (.csv or .parquet).
+# Used by the reformat_csv rule input so both formats are accepted.
+ext_dict = {
+    sample: os.path.splitext(obs)[1]
+    for sample, obs in zip(SAMPLE_ls, OBS_ls)
+}
 
 # Snakemake Rules
 
@@ -84,9 +92,9 @@ rule all:
 rule reformat_csv:
     threads: 1
     input:
-        inp=f"{outdir}/inputs/{{sample}}.csv"
+        inp=lambda w: f"{outdir}/inputs/{w.sample}{ext_dict[w.sample]}"
     output:
-        out= f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.csv'
+        out=f'{base_tmp}/{{sample}}/0-formatting/{{sample}}.parquet'
     params:
         min_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[0],
         max_prev=lambda w: prev_dict.get(w.sample, (0.05, 0.95))[1],
@@ -108,6 +116,56 @@ rule reformat_tree:
     shell:
         'python "{SCRIPTS_DIRECTORY}/reformat_tree.py" "{input.inp}" "{output.out}"'
 
+# reconstruction_method controls which ancestral reconstruction pipeline is used:
+#   'legacy'   -> original pastml CLI + GL_tab.py  (two-step, subprocess-based)
+#   'api'      -> run_ancestral_reconstruction.py  (single-step, Python API)
+# Default: 'api'.  Override with --config reconstruction_method=legacy
+reconstruction_method = config.get('reconstruction_method', 'api')
+
+# acr_shard_size: when > 0, split trait CSV into chunks of this many columns
+# and run ancestral_reconstruction as one job per shard (lower per-job memory,
+# scales across cluster nodes).  Set via --config acr_shard_size=20000.
+# Default 0 = no sharding (single-job API pipeline as before).
+acr_shard_size = int(config.get('acr_shard_size', 0))
+
+# reconstruction controls what run_ancestral_reconstruction.py writes to the ACR CSV,
+# which in turn determines which counting method runSimPhyNI.py can use:
+#
+#   'all' (default) — runs both JOINT and MPPA reconstruction; writes the full
+#              wide-format CSV including gains_flow, gains_markov, gains_entropy,
+#              marginal subsizes, dist_marginal, root_prob, etc.
+#              runSimPhyNI.py detects gains_flow and selects FLOW counting
+#              (the recommended, best-calibrated method per benchmark_reconstruction.py).
+#
+#   'JOINT'    — runs JOINT reconstruction only; writes only the JOINT columns
+#              (gains, losses, gain_subsize, dist, …).  runSimPhyNI.py falls back
+#              to JOINT counting.  Use for legacy-compatible output or to reproduce
+#              pre-marginal pipeline results.
+#
+#   'MPPA'     — runs MPPA reconstruction only; writes strictly marginal columns
+#              (gains_flow, gain_subsize_marginal, dist_marginal, root_prob, etc.).
+#              runSimPhyNI.py detects gains_flow and selects FLOW counting.
+#
+# Override the default: --config reconstruction=JOINT
+reconstruction_mode = config.get('reconstruction', 'all')
+
+# use_pastml: when True, pass --pastml to run_ancestral_reconstruction.py to
+# restore the original PastML API behaviour.
+# Default False = fast Numba engine (fast_binary_acr, ~6 ms/trait in ML mode).
+# Override with:  --config use_pastml=True
+use_pastml = config.get('use_pastml', False)
+pastml_flag = "--pastml" if use_pastml else ""
+
+# acr_mode: fast ACR optimisation mode passed via --acr_mode.
+# 'ml' (default) jointly optimises sf and π₁.
+# 'empirical' fixes π₁ = observed frequency (~12x faster, slightly less accurate).
+# Ignored when use_pastml=True.
+# Override with:  --config acr_mode=empirical
+acr_mode = config.get('acr_mode', 'ml')
+acr_mode_flag = f"--acr_mode {acr_mode}" if not use_pastml else ""
+
+# --- Legacy pipeline: pastml CLI + GL_tab aggregation (unchanged) ----------
+
 rule pastml:
     threads: 64
     input:
@@ -123,7 +181,7 @@ rule pastml:
         f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
     shell:
         # Note: We do not typically quote flags (e.g. --{prefilter}), only their values if they exist
-        'python "{SCRIPTS_DIRECTORY}/pastml.py" '
+        'python "{SCRIPTS_DIRECTORY}/run_pastml.py" '
         '--inputs_file "{input.inputsFile}" '
         '--tree_file "{input.tree}" '
         '--outdir "{params.outdir}" '
@@ -148,10 +206,114 @@ rule aggregatepastml:
         'python "{SCRIPTS_DIRECTORY}/GL_tab.py" '
         '"{input.inputsFile}" "{input.tree}" "{params.pastml_folder}" "{output.annotation}"'
 
+# --- API pipeline: single script, Python API, configurable reconstruction mode -
+
+rule ancestral_reconstruction:
+    threads: 64
+    input:
+        inputsFile=rules.reformat_csv.output.out,
+        tree=rules.reformat_tree.output.out
+    output:
+        annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
+    params:
+        max_workers=lambda wildcards, threads: threads,
+        runtype=lambda w: len(run_dict.get(w.sample, [])),
+        pastml_flag=pastml_flag,
+        acr_mode_flag=acr_mode_flag,
+    conda:
+        f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+    shell:
+        'python "{SCRIPTS_DIRECTORY}/run_ancestral_reconstruction.py" '
+        '--inputs_file "{input.inputsFile}" '
+        '--tree_file "{input.tree}" '
+        '--output_csv "{output.annotation}" '
+        '--max_workers {params.max_workers} '
+        '-r {params.runtype} '
+        '--reconstruction ' + reconstruction_mode + ' '
+        '--{prefilter} '
+        '{params.pastml_flag} {params.acr_mode_flag}'
+
+# --- Optional sharded API pipeline (acr_shard_size > 0) ------------------
+# Splits the reformatted Parquet into N CSV column-shards, runs one
+# ancestral_reconstruction job per shard (lower per-job memory), then merges.
+# Activate with:  --config acr_shard_size=20000
+
+if acr_shard_size > 0:
+    checkpoint split_traits:
+        threads: 1
+        input:
+            inp=rules.reformat_csv.output.out
+        output:
+            shard_dir=directory(f"{base_tmp}/{{sample}}/0-formatting/shards")
+        params:
+            shard_size=acr_shard_size
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        shell:
+            'python "{SCRIPTS_DIRECTORY}/split_traits.py" '
+            '--inputs_file "{input.inp}" '
+            '--output_dir "{output.shard_dir}" '
+            '--shard_size {params.shard_size}'
+
+    rule ancestral_reconstruction_shard:
+        threads: 64
+        input:
+            inputsFile=f"{base_tmp}/{{sample}}/0-formatting/shards/{{shard}}.csv",
+            tree=rules.reformat_tree.output.out
+        output:
+            annotation=f"{base_tmp}/{{sample}}/1-PastML-api/shards/{{shard}}.csv"
+        params:
+            max_workers=lambda wildcards, threads: threads,
+            runtype=lambda w: len(run_dict.get(w.sample, [])),
+            pastml_flag=pastml_flag,
+            acr_mode_flag=acr_mode_flag,
+        resources:
+            mem_mb=16000
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        shell:
+            'python "{SCRIPTS_DIRECTORY}/run_ancestral_reconstruction.py" '
+            '--inputs_file "{input.inputsFile}" '
+            '--tree_file "{input.tree}" '
+            '--output_csv "{output.annotation}" '
+            '--max_workers {params.max_workers} '
+            '-r {params.runtype} '
+            '--reconstruction ' + reconstruction_mode + ' '
+            '--{prefilter} '
+            '{params.pastml_flag} {params.acr_mode_flag}'
+
+    def _acr_shard_outputs(wildcards):
+        shard_dir = checkpoints.split_traits.get(sample=wildcards.sample).output.shard_dir
+        shards = glob_wildcards(os.path.join(shard_dir, "{shard}.csv")).shard
+        return expand(
+            f"{base_tmp}/{wildcards.sample}/1-PastML-api/shards/{{shard}}.csv",
+            shard=shards,
+        )
+
+    rule merge_acr:
+        threads: 1
+        input:
+            shards=_acr_shard_outputs
+        output:
+            annotation=f"{base_tmp}/{{sample}}/1-PastML-api/pastmlout.csv"
+        conda:
+            f"{ENVIRONMENT_DIRECTORY}/simphyni.yaml"
+        run:
+            import pandas as pd
+            dfs = [pd.read_csv(f) for f in sorted(input.shards)]
+            pd.concat(dfs, ignore_index=True).to_csv(output[0], index=False)
+
+# --- Route SimPhyNI to the selected pipeline output ---------------------
+
+def _pastml_annotation(wildcards):
+    if reconstruction_method == 'legacy':
+        return f"{base_tmp}/{wildcards.sample}/2-Events/pastmlout.csv"
+    return f"{base_tmp}/{wildcards.sample}/1-PastML-api/pastmlout.csv"
+
 rule SimPhyNI:
     threads: 64
     input:
-        pastml=rules.aggregatepastml.output.annotation,
+        pastml=_pastml_annotation,
         systems=rules.reformat_csv.output.out,
         tree=rules.reformat_tree.output.out
     output:
@@ -172,4 +334,5 @@ rule SimPhyNI:
         '-r {params.runtype} '
         '-c {params.threads} '
         '--{prefilter} --{plot} '
-        '--{save_object}'
+        '--{save_object} '
+        '--{include_flagged}'

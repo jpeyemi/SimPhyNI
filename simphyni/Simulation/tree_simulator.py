@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from ete3 import Tree
@@ -11,6 +14,10 @@ from .pair_statistics import *
 import numpy as np
 from scipy.special import loggamma
 from scipy.stats import hypergeom
+
+# traits_io lives in simphyni/scripts/ — add to path for bare import
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from traits_io import get_trait_metadata, load_trait_columns_filtered, _is_parquet
 
 class TreeSimulator:
 
@@ -27,37 +34,65 @@ class TreeSimulator:
     
     def _prepare_data(self):
         """
-        Prepares necessary data for the simulation, including reading pastml and observation files,
-        and initializing various simulation parameters.
-        Accepts either file paths or pandas DataFrames directly.
-        """
+        Prepares necessary data for the simulation.
 
-        # Handle pastml input
+        pastml is always loaded immediately (small CSV).
+        obs data is loaded lazily when the input is a file path: the full matrix
+        is deferred until initialize_simulation_parameters() runs, at which point
+        the tree is available and we can row-filter to tree leaves before loading
+        any trait values (pyarrow predicate pushdown for Parquet).
+        """
+        # Load pastml (always small)
         if isinstance(self.pastmlfile, pd.DataFrame):
             self.pastml = self.pastmlfile.copy()
         else:
             self.pastml = pd.read_csv(self.pastmlfile, index_col=0)
 
-        # Handle observed data input
-        if isinstance(self.obsdatafile, pd.DataFrame):
-            self.obsdf = self.obsdatafile.copy()
-        else:
-            self.obsdf = pd.read_csv(self.obsdatafile, index_col=0)
-
-        # Run validation and preprocessing
+        # Validate pastml columns before anything else
         self._check_pastml_data()
-        self._process_obs_data()
-
-
-    def _process_obs_data(self):
-        """
-        Processes the observation data to be used in the simulation.
-        """
+        # Index pastml on 'gene' immediately
         self.pastml = self.pastml.set_index('gene')
+
+        # Handle observed data
+        if isinstance(self.obsdatafile, pd.DataFrame):
+            # DataFrame passed directly — use as-is (backward compat / tests)
+            self.obsdf = self.obsdatafile.copy()
+            self._obs_lazy = False
+            self._binarize_obs()
+        else:
+            # File path — defer full load until tree is known so we can
+            # row-filter to tree leaves before decompressing trait values.
+            self._obs_path = str(self.obsdatafile)
+            self._obs_index_col, self._obs_all_cols = get_trait_metadata(self._obs_path)
+            self._obs_lazy = True
+            self.obsdf = None   # populated in initialize_simulation_parameters
+
+    def _binarize_obs(self):
+        """Binarize and normalize self.obsdf in-place."""
         self.obsdf[self.obsdf > 0.5] = 1
         self.obsdf.fillna(0, inplace=True)
         self.obsdf = self.obsdf.astype(int)
         self.obsdf.index = self.obsdf.index.astype(str)
+
+    def _load_obs_filtered_to_leaves(self, leaf_names: set) -> pd.DataFrame:
+        """
+        Load the obs matrix with row predicate pushdown limited to tree leaves.
+
+        For Parquet: pyarrow skips row groups that contain no matching leaf rows
+        before decompressing any data — peak RAM scales with the number of
+        matching rows, not the total rows in the file.
+        For CSV: loads all rows then filters (no pushdown possible).
+
+        Returns a binarized DataFrame indexed by the obs index column.
+        """
+        leaf_ids = {str(l) for l in leaf_names}
+        df = load_trait_columns_filtered(
+            self._obs_path,
+            self._obs_all_cols,
+            self._obs_index_col,
+            row_ids=leaf_ids,
+        )
+        return df
 
         
 
@@ -99,12 +134,23 @@ class TreeSimulator:
 
         self.pair_statistic = pair_statistics._log_odds_ratio_statistic
 
+        # If obs was deferred, load now — filtered to tree leaves only
+        if getattr(self, '_obs_lazy', False) and self.obsdf is None:
+            print("Loading obs matrix (filtered to tree leaves) ...", flush=True)
+            self.obsdf = self._load_obs_filtered_to_leaves(
+                set(self.tree.get_leaf_names())
+            )
+            self._binarize_obs()
+
         self.obsdf_modified = self._collapse_tree_tips(collapse_threshold)
         if not vars: vars = self.obsdf_modified.columns
         if not targets: targets = self.obsdf_modified.columns
-        if run_traits > 0: 
+        if run_traits > 0:
             vars = vars[:run_traits]
             targets = targets[run_traits:]
+            self.run_trait_names = list(vars)
+        else:
+            self.run_trait_names = None
         self.set_pairs(vars,targets, prevalence_threshold=prevalence_threshold, pre_filter = pre_filter)
 
     def set_pairs(self, vars, targets, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = True):
@@ -132,7 +178,11 @@ class TreeSimulator:
         to_prune = set()
         while(node_queue):
             current_node: TreeNode = node_queue.pop()
-            sibling: TreeNode = current_node.get_sisters()[0]
+            sisters = current_node.get_sisters()
+            if not sisters:
+                to_prune.add(current_node)
+                continue
+            sibling: TreeNode = sisters[0]
             if not sibling.is_leaf():
                 to_prune.add(current_node)
                 continue
@@ -218,8 +268,6 @@ class TreeSimulator:
             # Get indices of significant pairs
             i_idx, j_idx = np.where(sig_mask)
 
-            print(p_two)
-
             sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
             sig_pvals = p_two[i_idx, j_idx]
 
@@ -228,7 +276,6 @@ class TreeSimulator:
         # Filter by fishers exact test if prefilter enabled
         if pre_filter:
             pairs, pvals = fisher_significant_pairs(vars[valid_vars],targets[valid_targets],valid_vars,valid_targets)
-            print(pairs)
         else:
             X, Y = np.meshgrid(valid_vars, valid_targets, indexing='ij')
             pairs = np.column_stack((X.ravel(), Y.ravel()))
@@ -312,18 +359,145 @@ class TreeSimulator:
 
         return valid_pairs, stats
 
-    def run_simulation(self, cores = -1):
+    def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
+                       gamma=False, include_flagged=False, use_clade_mask=False):
         """
         Runs the tree simulation and stores results.
+
+        :param gain_mask: Optional boolean array (n_nodes, n_traits) — per-node gain eligibility.
+                          Must be aligned to gene_order (the full ordered list of trait names used
+                          when the mask was built). Columns are sub-selected automatically for the
+                          traits actually simulated.
+        :param loss_mask: Matching loss eligibility mask.
+        :param gene_order: List of trait names corresponding to mask columns.
+        :param gamma: If True, sample each trial's rate from the Jeffreys posterior
+                      Gamma(count + 0.5, 1/subsize) instead of using the point estimate.
+                      Widens the null for traits with few events; negligible effect for
+                      large counts.  Default False.
+        :param include_flagged: If False (default), pairs involving traits with miscalibrated
+                                null distributions are excluded from simulation and assigned p=0.5
+                                in multiple-testing correction.  If True, those pairs are simulated
+                                normally but marked with null_calibrated=False in the results so
+                                downstream users can distinguish them.
         """
-        self._simulate_and_evaluate(cores)
-    
-    def _simulate_and_evaluate(self,alpha = 0.05,cores=-1):
+        self._gain_mask      = gain_mask
+        self._loss_mask      = loss_mask
+        self._gene_order     = gene_order or []
+        self._use_clade_mask = use_clade_mask and (gain_mask is None)
+        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
+
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=False):
         traits_to_simulate = np.unique(self.pairs.flatten())
+
+        # PastML skips constant traits (< 2 unique states), so they are absent
+        # from self.pastml. Drop any pairs where either trait is missing so that
+        # those pairs fall into the p=0.5 bucket in _multiple_test_correction.
+        pastml_traits = set(self.pastml.index)
+        missing = [t for t in traits_to_simulate if t not in pastml_traits]
+        if missing:
+            import warnings
+            preview = missing[:5]
+            warnings.warn(
+                f"{len(missing)} trait(s) absent from PastML output (likely constant) "
+                f"and will be skipped: {preview}{'...' if len(missing) > 5 else ''}"
+            )
+            valid_mask = (
+                np.isin(self.pairs[:, 0], list(pastml_traits)) &
+                np.isin(self.pairs[:, 1], list(pastml_traits))
+            )
+            self.pairs    = self.pairs[valid_mask]
+            self.obspairs = self.obspairs[valid_mask]
+            traits_to_simulate = np.unique(self.pairs.flatten())
+
+        if len(traits_to_simulate) == 0:
+            self.simulation_result = pd.DataFrame()
+            return
+
         traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
-        self.simulation_result = simulate_glrates_bit(tree = self.tree, trait_params = traits_to_simulate_pastml, pairs = self.pairs, obspairs=self.obspairs, cores = cores)
+
+        # ------------------------------------------------------------------
+        # Detect traits whose Poisson null distribution is systematically
+        # miscalibrated (sparse events + subsize asymmetry).
+        #
+        # include_flagged=False (default): remove their pairs from simulation
+        #   so they fall into the p=0.5 bucket in _multiple_test_correction.
+        # include_flagged=True: simulate normally but annotate results with
+        #   null_calibrated=False so downstream users can distinguish them.
+        # ------------------------------------------------------------------
+        self.flagged_traits = flag_uncalibratable_traits(traits_to_simulate_pastml)
+        if not self.flagged_traits.empty:
+            flagged_genes = set(self.flagged_traits['gene'])
+            n_flagged = len(flagged_genes)
+            if not include_flagged:
+                print(
+                    f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
+                    f"null distributions. Their pairs are excluded from simulation "
+                    f"and assigned p=0.5. Use --include-flagged to test them anyway. "
+                    f"Access via Sim.flagged_traits for details."
+                )
+                keep_pairs = (
+                    ~np.isin(self.pairs[:, 0], list(flagged_genes)) &
+                    ~np.isin(self.pairs[:, 1], list(flagged_genes))
+                )
+                self.pairs         = self.pairs[keep_pairs]
+                self.obspairs      = self.obspairs[keep_pairs]
+                traits_to_simulate = np.unique(self.pairs.flatten())
+                traits_to_simulate_pastml = self.pastml.loc[traits_to_simulate]
+            else:
+                print(
+                    f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
+                    f"null distributions. --include-flagged is set: pairs will be "
+                    f"simulated and marked null_calibrated=False in results. "
+                    f"Access via Sim.flagged_traits for details."
+                )
+        else:
+            self.flagged_traits = pd.DataFrame()  # empty but consistent
+
+        # Track which pairs involve a flagged trait so we can annotate results
+        # after simulation when include_flagged=True.
+        if include_flagged and not self.flagged_traits.empty:
+            _fg = set(self.flagged_traits['gene'])
+            self._flagged_pair_mask = (
+                np.isin(self.pairs[:, 0], list(_fg)) |
+                np.isin(self.pairs[:, 1], list(_fg))
+            )
+        else:
+            self._flagged_pair_mask = np.zeros(len(self.pairs), dtype=bool)
+
+        # Build per-trait eligibility masks for simulation
+        gm = lm = None
+        if self._use_clade_mask:
+            from .simulation import build_clade_mask
+            root_states = traits_to_simulate_pastml['root_state']
+            gm, lm, mrca_bl = build_clade_mask(
+                self.tree, self.obsdf_modified,
+                list(traits_to_simulate),
+                root_states,
+            )
+            # Recalibrate subsize to the MRCA subtree branch length so the
+            # Poisson rate (count / subsize) matches the eligible region.
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = mrca_bl
+            traits_to_simulate_pastml['loss_subsize'] = mrca_bl
+        elif getattr(self, '_gain_mask', None) is not None and self._gene_order:
+            # Legacy: explicit mask passed by the caller
+            col_idx = [self._gene_order.index(g) for g in traits_to_simulate
+                       if g in self._gene_order]
+            if col_idx:
+                gm = self._gain_mask[:, col_idx]
+                lm = self._loss_mask[:, col_idx]
+
+        self.simulation_result = simulate_glrates_bit(
+            tree=self.tree, trait_params=traits_to_simulate_pastml,
+            pairs=self.pairs, obspairs=self.obspairs, cores=cores,
+            gain_mask=gm, loss_mask=lm, gamma=gamma,
+        )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
+
+        # Annotate rows for flagged-trait pairs when include_flagged=True
+        self.simulation_result['null_calibrated'] = ~self._flagged_pair_mask
+
         self._multiple_test_correction(alpha)
     
     def _multiple_test_correction(self,alpha = 0.05):
@@ -352,13 +526,26 @@ class TreeSimulator:
         # Naive (just keep the original p-value)
         res['pval_naive'] = res.loc[:,'p-value'][:simulated_pairs]
 
-        self.result = res[['T1','T2','direction','effect size',
-                'prevalence_T1','prevalence_T2',
-                'pval_naive','pval_bh','pval_by','pval_bonf']]
+        base_cols = ['T1','T2','direction','effect size',
+                     'prevalence_T1','prevalence_T2',
+                     'pval_naive','pval_bh','pval_by','pval_bonf']
+        if 'null_calibrated' in res.columns:
+            base_cols.append('null_calibrated')
+        self.result = res[base_cols]
         
 
     def get_results(self):
         return self.get_top_results(top = len(self.result['T1']))
+
+    def get_flagged_traits(self) -> pd.DataFrame:
+        """
+        Return traits excluded from simulation due to miscalibrated null
+        distributions (subsize asymmetry or rate inflation).
+
+        Returns an empty DataFrame if no traits were flagged, or if
+        run_simulation() has not been called yet.
+        """
+        return getattr(self, 'flagged_traits', pd.DataFrame())
     
     def get_top_results(self, top = 15, direction: Literal[-1,0,1]=0, by: Literal['p-value','effect size']='effect size'):
         res = self.result
@@ -419,10 +606,15 @@ class TreeSimulator:
         np.fill_diagonal(combined_matrix.values, .5)
 
         # --- Plot ---
+        n = len(all_indices)
+        if figure_size == -1:
+            figure_size = max(10, n * 0.35)
+        # Annotation threshold loosens as n grows to reduce visual noise
+        ann_threshold = 0.001 if n > 80 else (0.01 if n > 50 else 0.05)
+
         fig, ax = plt.subplots()
-        if figure_size != -1:
-            fig.set_figwidth(figure_size)
-            fig.set_figheight(figure_size)
+        fig.set_figwidth(figure_size)
+        fig.set_figheight(figure_size)
 
         mask = np.zeros_like(combined_matrix, dtype=bool)
         mask[np.triu_indices_from(mask)] = True
@@ -448,30 +640,33 @@ class TreeSimulator:
             plt.xlabel("")
             plt.ylabel("")
 
-            # Add significance stars
-            mask_1 = combined_matrix < 0.05 
-            mask_2 = combined_matrix < 0.01
-            mask_3 = combined_matrix < 0.001
+            # Scale tick labels with number of traits
+            tick_fs = max(4, 10 - n // 15)
+            ax.tick_params(labelsize=tick_fs)
 
+            # Add significance stars (threshold loosens for large n to avoid visual noise)
+            ann_fs = max(5, 10 - n // 15)
             for i in range(combined_matrix.shape[0]):
                 for j in range(combined_matrix.shape[1]):
+                    val = combined_matrix.iloc[i, j]
                     annotation = ""
-                    if mask_3.iloc[i, j]:
+                    if val < 0.001:
                         annotation = "***"
-                    elif mask_2.iloc[i, j]:
+                    elif val < 0.01:
                         annotation = "**"
-                    elif mask_1.iloc[i, j]:
+                    elif val < ann_threshold:
                         annotation = "*"
                     if annotation:
-                        plt.text(j + 0.5, i + 0.5, annotation, 
-                                ha='center', va='center', fontsize=10, color='black')
+                        plt.text(j + 0.5, i + 0.5, annotation,
+                                ha='center', va='center', fontsize=ann_fs, color='black')
 
         plt.title("Positive (Red) and Negative (Blue) Associations")
         plt.tight_layout()
         plt.savefig(output_file, format='png')
+        plt.close(fig)
     
     def plot_effect_size(self, pval_col, prevalence_range = [0,1], output_file = 'fig.png'):
-        
+
         x = self.result
         if prevalence_range is not None:
             lo, hi = prevalence_range
@@ -485,6 +680,105 @@ class TreeSimulator:
         plt.scatter(x = ef, y = pv)
         plt.tight_layout()
         plt.savefig(output_file, format='png')
+
+    def plot_volcano(self, trait, pval_col, prevalence_range=[0, 1], output_file='volcano.png'):
+        """Volcano plot for a single trait: signed effect size vs -log10(p-value)."""
+        res = self.result.copy()
+        if prevalence_range is not None:
+            lo, hi = prevalence_range
+            res = res[
+                (res["prevalence_T1"].between(lo, hi)) &
+                (res["prevalence_T2"].between(lo, hi))
+            ]
+        res = res[(res['T1'] == trait) | (res['T2'] == trait)]
+
+        ef = res['effect size'] * res['direction']
+        pv = -np.log10(res[pval_col].clip(lower=1e-300))
+        colors = res['direction'].map({1: '#ff711f', -1: '#0a6bf2'})
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(ef, pv, c=colors, alpha=0.7, edgecolors='none')
+        ax.axhline(-np.log10(0.05), color='grey', linestyle='--', linewidth=0.8, label='p=0.05')
+        ax.set_xlabel('Effect size \u00d7 direction')
+        ax.set_ylabel('-log\u2081\u2080(p-value)')
+        ax.set_title(trait)
+        plt.tight_layout()
+        plt.savefig(output_file, format='png', dpi=150)
+        plt.close(fig)
+
+    def plot_heatmap_subset(self, run_traits, pval_col, prevalence_range=[0, 1], output_file='heatmap_subset.png'):
+        """Rectangular heatmap: run_traits (rows) vs all other traits (columns).
+
+        Cell colour encodes direction and significance via:
+            score = direction * (0.5 - pval)
+        Synergistic + significant -> positive -> red
+        Antagonistic + significant -> negative -> blue
+        Non-significant (pval~0.5) -> ~0 -> white
+        """
+        res = self.result.copy()
+        if prevalence_range is not None:
+            lo, hi = prevalence_range
+            res = res[
+                (res["prevalence_T1"].between(lo, hi)) &
+                (res["prevalence_T2"].between(lo, hi))
+            ]
+
+        run_set = set(run_traits)
+        res = res[(res['T1'].isin(run_set)) | (res['T2'].isin(run_set))]
+
+        def _assign(r):
+            if r['T1'] in run_set:
+                return r['T1'], r['T2']
+            return r['T2'], r['T1']
+
+        res[['row_trait', 'col_trait']] = res.apply(
+            lambda r: pd.Series(_assign(r)), axis=1)
+        res['score'] = res['direction'] * (0.5 - res[pval_col])
+
+        matrix = res.pivot_table(
+            index='row_trait', columns='col_trait',
+            values='score', aggfunc='first'
+        ).reindex(index=run_traits)
+
+        pval_matrix = res.pivot_table(
+            index='row_trait', columns='col_trait',
+            values=pval_col, aggfunc='first'
+        ).reindex(index=run_traits, columns=matrix.columns)
+
+        n_rows, n_cols = matrix.shape
+        fig_w = max(8, n_cols * 0.4)
+        fig_h = max(4, n_rows * 0.4)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        cmap = LinearSegmentedColormap.from_list('bwr_custom', ['#0a6bf2', '#ffffff', '#ff711f'])
+        sns.heatmap(
+            matrix.fillna(0), cmap=cmap, center=0, vmin=-0.5, vmax=0.5,
+            ax=ax, square=False,
+            cbar_kws={'label': 'direction \u00d7 (0.5 \u2212 p-value)'}
+        )
+
+        row_labels = list(matrix.index)
+        col_labels = list(matrix.columns)
+        ann_fs = max(5, 8 - n_cols // 20)
+        for i, r in enumerate(row_labels):
+            for j, c in enumerate(col_labels):
+                try:
+                    p = pval_matrix.at[r, c]
+                    ann = '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else ''))
+                    if ann:
+                        ax.text(j + 0.5, i + 0.5, ann,
+                                ha='center', va='center', fontsize=ann_fs, color='black')
+                except (KeyError, TypeError):
+                    pass
+
+        tick_fs = max(5, 8 - max(n_rows, n_cols) // 20)
+        ax.tick_params(labelsize=tick_fs)
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+        plt.title(f'Associations: run traits vs. others ({pval_col})')
+        plt.tight_layout()
+        plt.savefig(output_file, format='png', dpi=150)
+        plt.close(fig)
 
 
     

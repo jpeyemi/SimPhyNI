@@ -1,0 +1,34 @@
+# Build / packaging
+dist/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Snakemake
+.snakemake/
+
+# Output directories
+simphyni_outs/
+tmp/
+
+# Dev artifacts
+dev/__pycache__/
+dev/acr_plots/
+dev/ancestral_states_demo.csv
+dev/.DS_Store
+
+# Test artifacts
+tests/__pycache__/
+tests/panx/
+tests/.DS_Store
+
+# macOS
+.DS_Store
+
+# Logs
+*.out_err.txt
+*.out
+*.err

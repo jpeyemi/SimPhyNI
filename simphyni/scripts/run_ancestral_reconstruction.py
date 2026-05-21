@@ -1,0 +1,1191 @@
+#!/usr/bin/env python
+"""
+run_ancestral_reconstruction.py
+================================
+Replaces the two-step `pastml.py` + `GL_tab.py` pipeline.
+
+Default engine: fast_binary_acr — a Numba-accelerated F81 implementation
+that is 16,000–19,000× faster than PastML (~6 ms/trait in ML mode vs ~8 s
+for PastML).  Pass --pastml to fall back to the original PastML API path.
+
+Outputs a single CSV.  The --reconstruction flag controls which methods run
+and which columns are written.
+
+Reconstruction modes
+--------------------
+all (pipeline default — set by Snakefile.py)
+    Runs both JOINT and MPPA reconstruction per trait.  Writes the full
+    wide-format CSV: all JOINT columns plus the following marginal columns
+    derived from MPPA marginal probabilities:
+
+      gains_flow, losses_flow           — probability-flow rates (FLOW counting)
+      gains_markov, losses_markov       — Markov transition rates
+      gains_entropy, losses_entropy     — entropy-weighted flow rates
+      gain_subsize_marginal / _nofilter / _thresh   — P-weighted subsizes
+      loss_subsize_marginal / _nofilter / _thresh
+      gain_subsize_entropy  / _nofilter / _thresh   — entropy-weighted subsizes
+      loss_subsize_entropy  / _nofilter / _thresh
+      dist_marginal, loss_dist_marginal — soft emergence thresholds
+      root_prob                         — P(root state = 1)
+
+    When runSimPhyNI.py receives this CSV it detects gains_flow and selects
+    FLOW counting (the recommended, best-calibrated method).
+
+JOINT
+    Runs JOINT reconstruction only.  Writes the standard JOINT columns
+    (gains, losses, gain_subsize, loss_subsize, dist, loss_dist, root_state).
+    runSimPhyNI.py detects the absence of gains_flow and falls back to JOINT
+    counting.  Use this to reproduce pre-marginal pipeline results or for
+    faster runs where marginal calibration is not needed.
+
+MPPA
+    Runs MPPA reconstruction only.  Writes strictly marginal columns
+    (gains_flow, losses_flow, gain_subsize_marginal, dist_marginal, root_prob,
+    and related variants).  runSimPhyNI.py detects gains_flow and selects
+    FLOW counting.
+
+Short output (--short flag)
+--------------------------
+Trims the CSV to a minimal column set optimised for each mode.
+Works with both the fast ACR engine (default) and --pastml.
+
+  JOINT --short : gene, gains, losses, count, dist, loss_dist,
+                  gain_subsize, loss_subsize, root_state
+  MPPA  --short : gene, gains_flow, losses_flow, count, dist, loss_dist,
+                  gain_subsize_marginal, loss_subsize_marginal,
+                  dist_marginal, loss_dist_marginal, root_prob
+  all   --short : union of both sets above
+
+Engine selection
+----------------
+Default (no flag)   : fast_binary_acr Numba engine
+  --acr_mode ml     : jointly optimise sf and π₁ (default, ~6 ms/trait)
+  --acr_mode empirical : fix π₁ = observed frequency (~0.5 ms/trait)
+  --short           : trim output columns
+--pastml            : PastML JOINT/MPPA API (original behaviour)
+  --short           : trim output columns
+
+Counting methods (selected downstream in runSimPhyNI.py / simulation.py)
+-------------------------------------------------------------------------
+The ACR CSV is produced once.  runSimPhyNI.py selects a counting method
+automatically based on which columns are present:
+
+  CSV produced with --reconstruction all or MPPA  →  FLOW counting (default)
+  CSV produced with --reconstruction JOINT        →  JOINT counting (fallback)
+
+For development / benchmarking, all counting × subsize × masking combinations
+(JOINT/FLOW/MARKOV/ENTROPY × ORIGINAL/NO_FILTER/THRESH × DIST/NONE/PATH) are
+explored in dev/benchmark_reconstruction.py using build_sim_params() column
+selection — no re-running ACR per method combination.
+"""
+
+import argparse
+import gc
+import sys
+import traceback
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from ete3 import Tree
+from scipy.special import loggamma
+
+warnings.filterwarnings("ignore")
+
+from pastml.acr import acr
+from pastml.ml import JOINT, MPPA
+
+# Fast ACR engine (Numba).  Imported conditionally so the file can still be
+# used with --pastml in environments where numba is not installed.
+try:
+    from fast_binary_acr import (
+        build_tree_arrays,
+        build_obs_matrix,
+        fast_acr,
+        marginal_probs_df,
+    )
+    _FAST_ACR_AVAILABLE = True
+except ImportError:
+    _FAST_ACR_AVAILABLE = False
+
+# Ensure the scripts directory is on sys.path so traits_io can be imported
+# both when run as a script (Snakemake) and when imported as a package module.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent))
+from traits_io import (
+    compute_gene_sums,
+    get_trait_metadata,
+    load_trait_columns,
+    prefilter_traits_chunked,
+)
+
+# ---------------------------------------------------------------------------
+# Worker-process state (populated by _worker_init; avoids re-parsing per task)
+# ---------------------------------------------------------------------------
+_WORKER_TREE: Tree | None = None
+_WORKER_UPPER_BOUND: float | None = None
+
+
+def _worker_init(tree_newick: str, upper_bound: float) -> None:
+    """Called once per worker process to cache the parsed tree."""
+    global _WORKER_TREE, _WORKER_UPPER_BOUND
+    _WORKER_TREE = Tree(tree_newick, format=1)
+    label_internal_nodes(_WORKER_TREE)
+    _WORKER_UPPER_BOUND = upper_bound
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def prefiltering(obs: pd.DataFrame, run_traits: int = 0) -> np.ndarray:
+    """Return trait names that are significant in at least one pairwise Fisher test."""
+    valid_obs = np.array(obs.columns)
+
+    def fisher_significant_pairs(vars_df, targets_df, valid_vars, valid_targets, pval_threshold=0.05):
+        X = vars_df.to_numpy().astype(bool)
+        Y = targets_df.to_numpy().astype(bool)
+        n = X.shape[0]
+
+        a = X.T @ Y
+        sX = X.sum(axis=0)
+        sY = Y.sum(axis=0)
+        b = sX[:, None] - a
+        c = sY[None, :] - a
+        d = n - (a + b + c)
+
+        row1 = a + b
+        row2 = c + d
+        col1 = a + c
+        n_all = n
+
+        def logC(n_, k_):
+            return loggamma(n_ + 1) - loggamma(k_ + 1) - loggamma(n_ - k_ + 1)
+
+        logp_obs = logC(row1, a) + logC(row2, col1 - a) - logC(n_all, col1)
+        p_obs = np.exp(logp_obs)
+        p_two = np.minimum(1.0, 2 * p_obs)
+        p_two[np.isnan(p_two)] = 1.0
+
+        sig_mask = p_two < pval_threshold
+        i_idx, j_idx = np.where(sig_mask)
+        sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
+        return sig_pairs
+
+    if run_traits == 0:
+        pairs = fisher_significant_pairs(obs, obs, valid_obs, valid_obs)
+    else:
+        pairs = fisher_significant_pairs(
+            obs[valid_obs[:run_traits]],
+            obs[valid_obs[run_traits:]],
+            valid_obs[:run_traits],
+            valid_obs[run_traits:],
+        )
+    return np.unique(pairs.flatten())
+
+
+def label_internal_nodes(tree: Tree) -> Tree:
+    """Assign unique names to any unnamed internal nodes (in-place)."""
+    counter = 0
+    for node in tree.traverse():
+        if not node.is_leaf() and not node.name:
+            node.name = f"N{counter}"
+            counter += 1
+    return tree
+
+
+def compute_branch_upper_bound(tree: Tree) -> float:
+    """
+    Compute the upper branch-length bound used for subsize calculation.
+    Matches the logic in countgainloss_tab.py (IQR in log10 space).
+    """
+    bls = np.array([n.dist for n in tree.traverse() if not n.is_root() and n.dist > 0])
+    if len(bls) == 0:
+        return float("inf")
+    log_bl = np.log10(bls)
+    q1, q3 = np.percentile(log_bl, [25, 75])
+    iqr = q3 - q1
+    return 10 ** (q3 + 0.5 * iqr)
+
+
+def _node_dists_from_root(tree: Tree) -> dict:
+    """Return {node.name: cumulative_distance_from_root} for all nodes."""
+    nd = {}
+    for node in tree.traverse("preorder"):
+        nd[node.name] = 0.0 if node.is_root() else nd[node.up.name] + node.dist
+    return nd
+
+
+# ---------------------------------------------------------------------------
+# JOINT gain/loss counting  (mirrors countgainloss_tab.py logic)
+# ---------------------------------------------------------------------------
+
+def count_joint_stats(tree: Tree, gene: str, upper_bound: float,
+                      node_dists: dict | None = None) -> dict:
+    """
+    Count gains, losses, subsizes, root state, and emergence thresholds
+    from a JOINT-annotated ETE3 tree.
+
+    The tree must already have been annotated by pastml.acr(..., JOINT).
+    Node attribute `getattr(node, gene)` is the PastML prediction set.
+
+    node_dists : optional pre-computed {node.name: dist_from_root} dict;
+                 computed internally when not provided.
+    """
+    if node_dists is None:
+        node_dists = _node_dists_from_root(tree)
+    root_node = tree.get_tree_root()
+
+    def _state(node):
+        """Return int state (0/1) and whether the node is ambiguous."""
+        val = getattr(node, gene, None)
+        if val is None:
+            return None, False
+        if isinstance(val, (set, frozenset)):
+            ambiguous = len(val) > 1
+            try:
+                state = int(next(iter(val)))
+            except (ValueError, StopIteration):
+                return None, ambiguous
+            return state, ambiguous
+        # string or int
+        s = str(val)
+        ambiguous = "|" in s
+        try:
+            state = int(s.split("|")[0])
+        except ValueError:
+            return None, ambiguous
+        return state, ambiguous
+
+    root_state, _ = _state(root_node)
+    if root_state is None:
+        root_state = 0
+
+    dist = float("inf")        # first gain distance from root
+    loss_dist = float("inf")   # first loss distance from root
+    gain_subsize = 0.0
+    loss_subsize = 0.0
+    gain_subsize_nofilter = 0.0
+    loss_subsize_nofilter = 0.0
+    node_data = {}  # node.name -> (num_gains, num_losses)
+    pending_thresh: list = []  # (nd, s, bl) for nodes with bl < upper_bound
+
+    for node in tree.traverse("postorder"):
+        s, ambiguous = _state(node)
+        nd = node_dists[node.name]
+
+        if s == 1 and (root_state == 0 or not node.is_root()):
+            dist = min(dist, nd)
+        if s == 0 and (root_state == 1 or not node.is_root()):
+            loss_dist = min(loss_dist, nd)
+
+        if not node.is_root():
+            if node.dist < upper_bound:
+                if s == 0:
+                    gain_subsize += node.dist
+                if s == 1:
+                    loss_subsize += node.dist
+                pending_thresh.append((nd, s, node.dist))
+            if node.dist > 0:
+                if s == 0:
+                    gain_subsize_nofilter += node.dist
+                if s == 1:
+                    loss_subsize_nofilter += node.dist
+
+        if node.is_leaf():
+            node_data[node.name] = (0, 0)
+        else:
+            num_gains = 0
+            num_losses = 0
+            child_states = []
+            for child in node.children:
+                cg, cl = node_data[child.name]
+                num_gains += cg
+                num_losses += cl
+                cs, _ = _state(child)
+                child_states.append(cs)
+
+            if ambiguous:
+                num_gains += 0.5 if 1 in child_states else 0
+                num_losses += 0.5 if 0 in child_states else 0
+            else:
+                num_gains += 1 if (1 in child_states and s == 0) else 0
+                num_losses += 1 if (0 in child_states and s == 1) else 0
+
+            node_data[node.name] = (num_gains, num_losses)
+
+    gains, losses = node_data.get(root_node.name, (0, 0))
+
+    # Second pass: threshold-consistent subsizes (uses pending_thresh from first pass)
+    gain_subsize_thresh = 0.0
+    loss_subsize_thresh = 0.0
+    for nd, s, bl in pending_thresh:
+        if s == 0 and nd >= dist:
+            gain_subsize_thresh += bl
+        if s == 1 and nd >= loss_dist:
+            loss_subsize_thresh += bl
+
+    # JOINTP: parent-state subsize variants — gain eligible when parent==0 regardless of child state.
+    # This matches marginal methods (p0_p weight) where parent=0, child=1 branches contribute
+    # to gain_subsize. The original JOINT subsize (child-state based) is preserved above.
+    gain_subsize_p          = 0.0
+    loss_subsize_p          = 0.0
+    gain_subsize_nofilter_p = 0.0
+    loss_subsize_nofilter_p = 0.0
+    pending_thresh_p: list  = []
+
+    for node in tree.traverse("preorder"):
+        if node.is_root():
+            continue
+        parent_s, _ = _state(node.up)
+        nd = node_dists[node.name]
+        bl = node.dist
+        if parent_s == 0:
+            if bl < upper_bound:
+                gain_subsize_p += bl
+                pending_thresh_p.append((nd, "gain", bl))
+            if bl > 0:
+                gain_subsize_nofilter_p += bl
+        elif parent_s == 1:
+            if bl < upper_bound:
+                loss_subsize_p += bl
+                pending_thresh_p.append((nd, "loss", bl))
+            if bl > 0:
+                loss_subsize_nofilter_p += bl
+
+    gain_subsize_thresh_p = 0.0
+    loss_subsize_thresh_p = 0.0
+    for nd, kind, bl in pending_thresh_p:
+        if kind == "gain" and nd >= dist:
+            gain_subsize_thresh_p += bl
+        if kind == "loss" and nd >= loss_dist:
+            loss_subsize_thresh_p += bl
+
+    return {
+        "gains": gains,
+        "losses": losses,
+        "dist": dist,
+        "loss_dist": loss_dist,
+        "gain_subsize": gain_subsize,
+        "loss_subsize": loss_subsize,
+        "gain_subsize_nofilter": gain_subsize_nofilter,
+        "loss_subsize_nofilter": loss_subsize_nofilter,
+        "gain_subsize_thresh": gain_subsize_thresh,
+        "loss_subsize_thresh": loss_subsize_thresh,
+        # JOINTP: parent-state subsize (gain eligible when parent==0)
+        "gain_subsize_p":          gain_subsize_p,
+        "loss_subsize_p":          loss_subsize_p,
+        "gain_subsize_nofilter_p": gain_subsize_nofilter_p,
+        "loss_subsize_nofilter_p": loss_subsize_nofilter_p,
+        "gain_subsize_thresh_p":   gain_subsize_thresh_p,
+        "loss_subsize_thresh_p":   loss_subsize_thresh_p,
+        "root_state": root_state,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MARGINAL (MPPA) gain/loss counting — all counting/subsize variants
+# ---------------------------------------------------------------------------
+
+def _entropy(p1: float) -> float:
+    """Shannon entropy (base-2, normalised to [0,1]) of a Bernoulli(p1) variable."""
+    p0 = 1.0 - p1
+    eps = 1e-12
+    return -(p0 + eps) * np.log2(p0 + eps) - (p1 + eps) * np.log2(p1 + eps)
+
+
+def _entropy_vec(p1_arr: np.ndarray) -> np.ndarray:
+    """Vectorized Shannon entropy (base-2) for an array of Bernoulli probabilities."""
+    p0 = 1.0 - p1_arr
+    eps = 1e-12
+    return -(p0 + eps) * np.log2(p0 + eps) - (p1_arr + eps) * np.log2(p1_arr + eps)
+
+
+def count_all_marginal_stats(tree: Tree, gene: str, mp_df: pd.DataFrame,
+                              upper_bound: float, p_threshold: float = 0.5,
+                              node_dists: dict | None = None,
+                              gain_mask_1d: np.ndarray | None = None,
+                              loss_mask_1d: np.ndarray | None = None) -> dict:
+    """
+    Compute ALL marginal counting and subsize variants in a single pass.
+
+    node_dists  : pre-computed {node.name: dist_from_root} dict.
+                  NOTE: safe to reuse from the JOINT tree because both trees
+                  share identical topology and branch lengths (same newick source,
+                  only internal annotations differ after acr()).
+    gain_mask_1d : optional bool array of length n_nodes (tree.traverse() order).
+                   When provided, gain counts and gain subsizes are restricted to
+                   mask-eligible edges.  This aligns the denominator with the
+                   simulation's eligible branch set (PATH masking).
+    loss_mask_1d : same for losses.
+    """
+    if node_dists is None:
+        node_dists = _node_dists_from_root(tree)
+
+    mp_df = mp_df.rename(columns=str)
+
+    if "1" in mp_df.columns:
+        p1_map: dict[str, float] = mp_df["1"].astype(float).to_dict()
+    else:
+        p1_map: dict[str, float] = {}
+
+    root_node = tree.get_tree_root()
+    root_prob = p1_map.get(root_node.name, np.nan)
+    if np.isnan(root_prob):
+        root_prob = 0.0
+
+    # Pre-extract all non-root edges into arrays for vectorized computation.
+    # Use a single traversal so we can also extract per-edge mask eligibility.
+    _trav = list(tree.traverse())
+    edges = [
+        (node.name, node.up.name, node_dists[node.name], node.dist)
+        for node in _trav
+        if not node.is_root()
+    ]
+
+    if not edges:
+        return {
+            "gains_flow": 0.0, "losses_flow": 0.0,
+            "gains_markov": 0.0, "losses_markov": 0.0,
+            "gains_entropy": 0.0, "losses_entropy": 0.0,
+            "gain_subsize_marginal": 0.0, "loss_subsize_marginal": 0.0,
+            "gain_subsize_marginal_nofilter": 0.0, "loss_subsize_marginal_nofilter": 0.0,
+            "gain_subsize_marginal_thresh": 0.0, "loss_subsize_marginal_thresh": 0.0,
+            "gain_subsize_entropy": 0.0, "loss_subsize_entropy": 0.0,
+            "gain_subsize_entropy_nofilter": 0.0, "loss_subsize_entropy_nofilter": 0.0,
+            "gain_subsize_entropy_thresh": 0.0, "loss_subsize_entropy_thresh": 0.0,
+            "dist_marginal": float("inf"), "loss_dist_marginal": float("inf"),
+            "root_prob": root_prob,
+        }
+
+    # Build per-edge mask eligibility (same traversal order as _trav / build_path_mask).
+    if gain_mask_1d is not None:
+        _trav_idx = {node: i for i, node in enumerate(_trav)}
+        edge_gain_elig_raw = np.array(
+            [gain_mask_1d[_trav_idx[n]] for n in _trav if not n.is_root()], dtype=bool)
+        edge_loss_elig_raw = np.array(
+            [loss_mask_1d[_trav_idx[n]] for n in _trav if not n.is_root()], dtype=bool)
+    else:
+        edge_gain_elig_raw = edge_loss_elig_raw = None
+
+    names_child, names_parent, nd_arr_raw, bl_arr_raw = zip(*edges)
+    p1_c_raw = np.array([p1_map.get(n, np.nan) for n in names_child],  dtype=float)
+    p1_p_raw = np.array([p1_map.get(n, np.nan) for n in names_parent], dtype=float)
+    nd_arr_raw = np.array(nd_arr_raw, dtype=float)
+    bl_arr_raw = np.array(bl_arr_raw, dtype=float)
+
+    # Restrict to edges where both sides have known probabilities
+    valid = ~(np.isnan(p1_c_raw) | np.isnan(p1_p_raw))
+    p1_c = p1_c_raw[valid]
+    p1_p = p1_p_raw[valid]
+    nd_v = nd_arr_raw[valid]
+    bl_v = bl_arr_raw[valid]
+
+    # Eligible-edge masks after the valid filter
+    if edge_gain_elig_raw is not None:
+        gain_elig = edge_gain_elig_raw[valid]
+        loss_elig = edge_loss_elig_raw[valid]
+    else:
+        gain_elig = np.ones(int(valid.sum()), dtype=bool)
+        loss_elig = np.ones(int(valid.sum()), dtype=bool)
+
+    p0_p   = 1.0 - p1_p
+    eff_bl = np.minimum(bl_v, upper_bound)
+
+    # FLOW
+    gain_flow_arr = np.maximum(0.0, p1_c - p1_p) #* (1 - p1_p)
+    loss_flow_arr = np.maximum(0.0, p1_p - p1_c) #* p1_p
+    gains_flow  = float(gain_flow_arr[gain_elig].sum())
+    losses_flow = float(loss_flow_arr[loss_elig].sum())
+
+    # MARKOV
+    gains_markov  = float((p0_p[gain_elig] * p1_c[gain_elig] * bl_v[gain_elig]).sum())
+    losses_markov = float((p1_p[loss_elig] * (1.0 - p1_c[loss_elig]) * bl_v[loss_elig]).sum())
+
+    # ENTROPY
+    h_p  = _entropy_vec(p1_p)
+    cert = 1.0 - h_p
+    gains_entropy  = float((gain_flow_arr[gain_elig] * cert[gain_elig]).sum())
+    losses_entropy = float((loss_flow_arr[loss_elig] * cert[loss_elig]).sum())
+
+    # Subsize: marginal
+    gain_subsize_marginal          = float((p0_p[gain_elig] * eff_bl[gain_elig]).sum())
+    loss_subsize_marginal          = float((p1_p[loss_elig] * eff_bl[loss_elig]).sum())
+    gain_subsize_marginal_nofilter = float((p0_p[gain_elig] * bl_v[gain_elig]).sum())
+    loss_subsize_marginal_nofilter = float((p1_p[loss_elig] * bl_v[loss_elig]).sum())
+
+    # Subsize: entropy-weighted
+    gain_subsize_entropy          = float((p0_p[gain_elig] * cert[gain_elig] * eff_bl[gain_elig]).sum())
+    loss_subsize_entropy          = float((p1_p[loss_elig] * cert[loss_elig] * eff_bl[loss_elig]).sum())
+    gain_subsize_entropy_nofilter = float((p0_p[gain_elig] * cert[gain_elig] * bl_v[gain_elig]).sum())
+    loss_subsize_entropy_nofilter = float((p1_p[loss_elig] * cert[loss_elig] * bl_v[loss_elig]).sum())
+
+    # Soft emergence thresholds (unrestricted — dist_marginal not used in PATH simulation)
+    gain_nd = nd_v[p1_c >= p_threshold]
+    dist_m = float(gain_nd.min()) if len(gain_nd) else float("inf")
+
+    loss_nd = nd_v[p1_c < p_threshold]
+    loss_dist_m = float(loss_nd.min()) if len(loss_nd) else float("inf")
+
+    # Thresh subsizes: eff_bl contribution downstream of emergence threshold.
+    # eff_bl already applies the IQR cap (upper_bound). For each branch, compute
+    # the fraction of the branch that lies at or beyond dist_m and scale eff_bl
+    # by that fraction. This correctly handles partial branches (straddling the
+    # threshold) rather than including or excluding them wholesale.
+    parent_dist = nd_v - bl_v  # root-to-parent distance
+
+    gain_overlap    = np.maximum(0.0, nd_v - np.maximum(parent_dist, dist_m))
+    eff_gain_thresh = np.minimum(gain_overlap, upper_bound)  # IQR cap on downstream portion
+
+    loss_overlap    = np.maximum(0.0, nd_v - np.maximum(parent_dist, loss_dist_m))
+    eff_loss_thresh = np.minimum(loss_overlap, upper_bound)  # IQR cap on downstream portion
+
+    gain_subsize_marginal_thresh = float((p0_p[gain_elig] * eff_gain_thresh[gain_elig]).sum())
+    gain_subsize_entropy_thresh  = float((p0_p[gain_elig] * cert[gain_elig] * eff_gain_thresh[gain_elig]).sum())
+    loss_subsize_marginal_thresh = float((p1_p[loss_elig] * eff_loss_thresh[loss_elig]).sum())
+    loss_subsize_entropy_thresh  = float((p1_p[loss_elig] * cert[loss_elig] * eff_loss_thresh[loss_elig]).sum())
+
+    return {
+        "gains_flow":   gains_flow,
+        "losses_flow":  losses_flow,
+        "gains_markov": gains_markov,
+        "losses_markov": losses_markov,
+        "gains_entropy": gains_entropy,
+        "losses_entropy": losses_entropy,
+        "gain_subsize_marginal":          gain_subsize_marginal,
+        "loss_subsize_marginal":          loss_subsize_marginal,
+        "gain_subsize_marginal_nofilter": gain_subsize_marginal_nofilter,
+        "loss_subsize_marginal_nofilter": loss_subsize_marginal_nofilter,
+        "gain_subsize_marginal_thresh":   gain_subsize_marginal_thresh,
+        "loss_subsize_marginal_thresh":   loss_subsize_marginal_thresh,
+        "gain_subsize_entropy":          gain_subsize_entropy,
+        "loss_subsize_entropy":          loss_subsize_entropy,
+        "gain_subsize_entropy_nofilter": gain_subsize_entropy_nofilter,
+        "loss_subsize_entropy_nofilter": loss_subsize_entropy_nofilter,
+        "gain_subsize_entropy_thresh":   gain_subsize_entropy_thresh,
+        "loss_subsize_entropy_thresh":   loss_subsize_entropy_thresh,
+        "dist_marginal":      dist_m,
+        "loss_dist_marginal": loss_dist_m,
+        "root_prob":          root_prob,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fast ACR chunk worker (Numba engine)
+# ---------------------------------------------------------------------------
+
+def reconstruct_chunk_fast(
+    master_tree,
+    ta,
+    obs_chunk: "np.ndarray",
+    trait_names: list,
+    gene_sums_map: dict,
+    upper_bound: float,
+    reconstruction: str,
+    acr_mode: str = "ml",
+) -> list:
+    """Run fast_acr() on an obs_chunk and return a list of stats dicts.
+
+    Each dict has the same keys as reconstruct_trait() so the downstream
+    CSV-writing block in main() works identically for both engines.
+
+    Notes
+    -----
+    JOINT stats require the ETE3 tree to have node attributes written by
+    pastml.acr().  We replicate that convention here by manually annotating
+    a per-trait copy of *master_tree* with MAP states from fast_acr:
+        setattr(node, gene, {int(state)})   # one-element set — PastML format
+    This lets count_joint_stats() work unmodified via its _state() helper.
+
+    MPPA stats use marginal_probs_df() which returns a PastML-compatible
+    DataFrame (index = node names, columns = ['0', '1']), so
+    count_all_marginal_stats() also works unmodified.
+
+    The _path suffix columns (build_path_mask variants) are NOT computed
+    here — they are only produced by the --pastml path.
+
+    Parameters
+    ----------
+    master_tree   : ETE3 Tree, read-only template (topology + branch lengths)
+    ta            : TreeArrays built from master_tree
+    obs_chunk     : int8[n_traits, n_nodes] from build_obs_matrix()
+    trait_names   : column names corresponding to obs_chunk rows
+    gene_sums_map : {gene: count_of_1s} for the 'count' output column
+    upper_bound   : IQR-derived branch-length cap for subsize filtering
+    reconstruction: 'all' | 'JOINT' | 'MPPA'
+    acr_mode      : 'ml' or 'empirical'
+    """
+    # ---- Screen constant traits before entering the Numba kernel ----
+    valid_idx = []
+    for t_idx in range(len(trait_names)):
+        leaf_vals = obs_chunk[t_idx, ta.leaf_node_idx]
+        known = leaf_vals[leaf_vals >= 0]
+        if len(known) >= 2 and not (known == known[0]).all():
+            valid_idx.append(t_idx)
+
+    if not valid_idx:
+        return []
+
+    valid_names = [trait_names[i] for i in valid_idx]
+    valid_obs   = obs_chunk[valid_idx, :]
+
+    # ---- Run all valid traits in one Numba prange call ----
+    result = fast_acr(ta, valid_obs, valid_names, mode=acr_mode)
+
+    # ---- Pre-compute node distances once (shared topology) ----
+    node_dists = _node_dists_from_root(master_tree)
+
+    rows = []
+    for local_t, gene in enumerate(valid_names):
+        try:
+            stats: dict = {
+                "gene":  gene,
+                "count": int(gene_sums_map.get(gene, 0)),
+            }
+
+            # ---- JOINT block ----
+            if reconstruction in ("JOINT", "all"):
+                joint_tree = master_tree.copy()
+                joint_arr  = result.joint_states[local_t]          # int8[n_nodes]
+                name_to_state = {
+                    ta.node_names[i]: {int(joint_arr[i])}
+                    for i in range(ta.n_nodes)
+                }
+                for node in joint_tree.traverse():
+                    s = name_to_state.get(node.name)
+                    if s is not None:
+                        setattr(node, gene, s)
+                stats.update(
+                    count_joint_stats(joint_tree, gene, upper_bound,
+                                      node_dists=node_dists)
+                )
+                del joint_tree
+
+            # ---- MPPA block ----
+            if reconstruction in ("MPPA", "all"):
+                mp_df = marginal_probs_df(result, local_t)
+                stats.update(
+                    count_all_marginal_stats(master_tree, gene, mp_df,
+                                             upper_bound,
+                                             node_dists=node_dists)
+                )
+
+            rows.append(stats)
+
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"  [FAILED fast] {gene}:\n{tb}", file=sys.stderr, flush=True)
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Per-trait reconstruction worker (PastML path)
+# ---------------------------------------------------------------------------
+
+def reconstruct_trait(
+    gene: str,
+    tree_newick: str | None,
+    df_col: pd.Series,
+    upper_bound: float,
+    reconstruction: str,
+    gene_count: int,
+) -> dict | None:
+    """
+    Run PastML reconstruction for a single trait and return a stats dict.
+
+    Parameters
+    ----------
+    gene           : trait name
+    tree_newick    : Newick string
+    df_col         : Series with index = tip names, values = trait states
+    upper_bound    : branch-length upper bound for subsize calculation
+    reconstruction : 'JOINT', 'MPPA', or 'all'
+    gene_count     : number of tips with trait = 1 (for 'count' column)
+
+    When reconstruction in ('MPPA', 'all'), the returned dict also contains:
+      '_mp_df'        — MPPA marginal_probabilities DataFrame (strip before CSV)
+      '_gain_mask_1d' — bool array (n_nodes,) PATH gain eligibility mask
+      '_loss_mask_1d' — bool array (n_nodes,) PATH loss eligibility mask
+    The mask is built from the MPPA marginal probabilities and is used by
+    count_all_marginal_stats (denominator alignment) and can be forwarded to
+    sim_bit for the next stability iteration's simulation.
+    """
+    if _WORKER_TREE is not None:
+        tree = _WORKER_TREE.copy()
+    else:
+        tree = Tree(tree_newick, format=1)
+        label_internal_nodes(tree)
+
+    ann = df_col.astype(str).to_frame(name=gene)
+
+    states = sorted(ann[gene].dropna().unique().tolist())
+    if len(states) < 2:
+        return None  # can't reconstruct a constant trait
+
+    # Prune tree to leaves with known state so PastML never sees unannotated tips
+    ann_leaves = set(ann.index)
+    tree_leaves = {l.name for l in tree.get_leaves()}
+    missing = tree_leaves - ann_leaves
+    if missing:
+        keep = [l for l in tree.get_leaves() if l.name in ann_leaves]
+        tree.prune(keep, preserve_branch_length=True)
+
+    # Clamp non-positive branch lengths — negative/zero dists cause PastML to
+    # produce invalid transition matrices (non-intersecting states error).
+    for node in tree.traverse():
+        if not node.is_root() and node.dist <= 0:
+            node.dist = 1e-8
+
+    # node_dists computed once on the JOINT tree and reused for MPPA
+    # (safe: both trees share identical topology and branch lengths)
+    node_dists = _node_dists_from_root(tree)
+
+    # --- JOINT reconstruction ---
+    acr(tree, df=ann, prediction_method=JOINT, model="F81")
+
+    stats = count_joint_stats(tree, gene, upper_bound, node_dists=node_dists)
+    stats["gene"] = gene
+    stats["count"] = int(gene_count)
+
+    # --- MPPA marginal reconstruction (if requested) ---
+    if reconstruction in ("MPPA", "all"):
+        # No need to copy the tree: acr() with df=ann calls preannotate_forest()
+        # unconditionally before any ML computation, which re-annotates all tips
+        # from the DataFrame and overwrites any JOINT annotations.
+        mppa_results = acr(
+            tree,
+            df=ann,
+            prediction_method=MPPA,
+            model="F81",
+        )
+        mp_df = mppa_results[0]["marginal_probabilities"]
+
+        # First call: standard columns (no mask) — used by DIST and NONE masking.
+        standard_marginal = count_all_marginal_stats(
+            tree, gene, mp_df, upper_bound, node_dists=node_dists,
+        )
+        stats.update(standard_marginal)
+
+        # Second call: PATH-masked columns — restricted to eligible branches.
+        # Written with _path suffix so build_sim_params can select them when
+        # masking='PATH', without corrupting the standard columns.
+        _path_gm, _path_lm = build_path_mask(tree, {gene: mp_df}, [gene])
+        _gm1d = _path_gm[:, 0]
+        _lm1d = _path_lm[:, 0]
+        path_marginal = count_all_marginal_stats(
+            tree, gene, mp_df, upper_bound,
+            node_dists=node_dists,
+            gain_mask_1d=_gm1d,
+            loss_mask_1d=_lm1d,
+        )
+        _PATH_SUFFIX_COLS = [
+            "gains_flow", "losses_flow",
+            "gains_markov", "losses_markov",
+            "gains_entropy", "losses_entropy",
+            "gain_subsize_marginal", "loss_subsize_marginal",
+            "gain_subsize_marginal_nofilter", "loss_subsize_marginal_nofilter",
+            "gain_subsize_marginal_thresh", "loss_subsize_marginal_thresh",
+            "gain_subsize_entropy", "loss_subsize_entropy",
+            "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
+            "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
+        ]
+        for col in _PATH_SUFFIX_COLS:
+            if col in path_marginal:
+                stats[col + "_path"] = path_marginal[col]
+
+        stats["_mp_df"]        = mp_df
+        stats["_gain_mask_1d"] = _gm1d
+        stats["_loss_mask_1d"] = _lm1d
+
+    return stats
+
+
+def build_path_mask(
+    tree: Tree,
+    mp_dfs: dict,
+    gene_order: list,
+    p_threshold: float = 0.5,
+):
+    """
+    Build per-node × per-trait boolean eligibility masks using path-based
+    upstream presence/absence tracking (preorder traversal).
+    """
+    node_list = list(tree.traverse())
+    n_nodes   = len(node_list)
+    n_traits  = len(gene_order)
+    node_idx  = {node: i for i, node in enumerate(node_list)}
+
+    gain_mask = np.zeros((n_nodes, n_traits), dtype=bool)
+    loss_mask = np.zeros((n_nodes, n_traits), dtype=bool)
+
+    for t_idx, gene in enumerate(gene_order):
+        mp_df = mp_dfs.get(gene)
+        if mp_df is None:
+            gain_mask[:, t_idx] = True
+            loss_mask[:, t_idx] = True
+            continue
+
+        mp_df_s = mp_df.rename(columns=str)
+        _p1_map: dict[str, float] = mp_df_s["1"].astype(float).to_dict() if "1" in mp_df_s.columns else {}
+
+        def _p1(name):
+            return _p1_map.get(name, np.nan)
+
+        upstream_presence: dict = {}
+        upstream_absence:  dict = {}
+
+        for node in node_list:
+            if node.is_root():
+                p1 = _p1(node.name)
+                upstream_presence[node] = (not np.isnan(p1)) and (p1 > p_threshold)
+                upstream_absence[node]  = (not np.isnan(p1)) and ((1.0 - p1) > p_threshold)
+                continue
+
+            parent = node.up
+            p1_parent = _p1(parent.name)
+            p1_child  = _p1(node.name)
+
+            if np.isnan(p1_parent) or np.isnan(p1_child):
+                gain_mask[node_idx[node], t_idx] = True
+                loss_mask[node_idx[node], t_idx] = True
+                upstream_presence[node] = upstream_presence.get(parent, False)
+                upstream_absence[node]  = upstream_absence.get(parent, False)
+                continue
+
+            up_pres = upstream_presence.get(parent, False)
+            up_abs  = upstream_absence.get(parent, False)
+
+            if (1.0 - p1_parent) > p_threshold and (p1_child > p_threshold or up_pres):
+                gain_mask[node_idx[node], t_idx] = True
+
+            if p1_parent > p_threshold and ((1.0 - p1_child) > p_threshold or up_abs):
+                loss_mask[node_idx[node], t_idx] = True
+
+            upstream_presence[node] = up_pres or (p1_parent > p_threshold)
+            upstream_absence[node]  = up_abs  or ((1.0 - p1_parent) > p_threshold)
+
+    return gain_mask, loss_mask
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Ancestral state reconstruction + gain/loss counting. "
+            "Default engine: fast_binary_acr (Numba, ~6 ms/trait). "
+            "Use --pastml to fall back to PastML API (~8 s/trait)."
+        )
+    )
+    parser.add_argument("--inputs_file", required=True,
+                        help="Reformatted trait CSV (rows=taxa, cols=traits, index col 0)")
+    parser.add_argument("--tree_file", required=True,
+                        help="Reformatted Newick tree file")
+    parser.add_argument("--output_csv", required=True,
+                        help="Output CSV path (pastmlout.csv equivalent)")
+    parser.add_argument("--max_workers", type=int, default=8,
+                        help="Process pool size for PastML parallel reconstruction "
+                             "(ignored when --pastml is not set)")
+    parser.add_argument("--chunk-size", type=int, default=10_000, dest="chunk_size",
+                        help="Number of traits processed per memory chunk "
+                             "(lower = less peak RAM; default: 10000)")
+    parser.add_argument("--summary_file", default=None,
+                        help="Optional text summary of run status")
+    parser.add_argument(
+        "--reconstruction", choices=["all", "JOINT", "MPPA"],
+        default="all",
+        help="Reconstruction mode: 'all' runs both JOINT and MPPA (full output); "
+             "'JOINT' runs only JOINT reconstruction; 'MPPA' runs only MPPA "
+             "reconstruction. (default: all)"
+    )
+    parser.add_argument(
+        "--short", action="store_true", default=False,
+        help="Write trimmed output: core columns only, optimised for the chosen "
+             "reconstruction mode.  Works with both fast ACR (default) and --pastml."
+    )
+    parser.add_argument(
+        "--pastml", action="store_true", default=False,
+        help="Use PastML (JOINT/MPPA) for ACR instead of the fast Numba engine."
+    )
+    parser.add_argument(
+        "--acr_mode", choices=["empirical", "ml"], default="ml",
+        help="Fast ACR optimisation mode: 'ml' (default) jointly optimises sf "
+             "and π₁ (~6 ms/trait); 'empirical' fixes π₁ to observed leaf "
+             "frequency (~0.5 ms/trait, slightly less accurate for high-frequency "
+             "genes).  Ignored when --pastml is set."
+    )
+    parser.add_argument(
+        "--prefilter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-filter traits by Fisher exact test before reconstruction",
+    )
+    parser.add_argument("-r", "--run_traits", type=int, default=0,
+                        help="Number of 'query' traits for one-vs-rest mode (0 = all-vs-all)")
+
+    args = parser.parse_args()
+
+    # ---- Engine validation ----
+    if not args.pastml and not _FAST_ACR_AVAILABLE:
+        print(
+            "ERROR: fast_binary_acr (numba) is not importable.  Either "
+            "install numba/numba-dependencies or pass --pastml to use PastML.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    inputs_file = args.inputs_file
+    tree_file = args.tree_file
+    output_csv = Path(args.output_csv)
+    max_workers = args.max_workers
+    reconstruction = args.reconstruction
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- Load tree once; compute shared upper bound ----
+    master_tree = Tree(tree_file, format=1)
+    label_internal_nodes(master_tree)
+    leaves_in_tree = set(master_tree.get_leaf_names())
+    upper_bound = compute_branch_upper_bound(master_tree)
+    tree_newick = master_tree.write(format=1)
+
+    # ---- Resolve trait list and index without loading the full matrix ----
+    # get_trait_metadata reads only the file footer (Parquet) or header row
+    # (CSV) — no trait data is loaded here.
+    index_col, all_traits = get_trait_metadata(inputs_file)
+
+    # Load only the index column to intersect taxa with the tree.
+    obs_index_df = load_trait_columns(inputs_file, [], index_col)
+    valid_index: set[str] = set(obs_index_df.index) & leaves_in_tree
+
+    # ---- Pre-filter traits ----
+    if args.prefilter:
+        # Chunked Fisher test — never loads the full matrix into memory.
+        # Peak RAM = O(SCAN_CHUNK × len(valid_index)) per iteration.
+        print("Pre-filtering traits by Fisher exact test (chunked) ...", flush=True)
+        sample_ids_unfiltered = prefilter_traits_chunked(
+            inputs_file,
+            index_col,
+            valid_rows=valid_index,
+            run_traits=args.run_traits,
+        )
+        print(
+            f"  {len(sample_ids_unfiltered)} traits retained "
+            f"(of {len(all_traits)} input)", flush=True
+        )
+    else:
+        sample_ids_unfiltered = all_traits
+
+    # ---- Stream per-column sums (never loads full matrix) ----
+    # compute_gene_sums iterates in SCAN_CHUNK batches; peak RAM per batch is
+    # SCAN_CHUNK * n_rows * bytes_per_value.
+    print("Computing trait counts ...", flush=True)
+    gene_sums = compute_gene_sums(inputs_file, index_col, valid_index)
+
+    sample_ids = [g for g in sample_ids_unfiltered if g in gene_sums]
+
+    _engine = "PastML" if args.pastml else f"fast_acr[{args.acr_mode}]"
+    print(f"Running reconstruction for {len(sample_ids)} traits "
+          f"(reconstruction={reconstruction}, engine={_engine}) ...", flush=True)
+
+    # ---- Canonical column order (resolved before chunked loop) ----
+    core_cols = [
+        "gene", "gains", "losses", "count", "dist", "loss_dist",
+        "gain_subsize", "loss_subsize",
+        "gain_subsize_nofilter", "loss_subsize_nofilter",
+        "gain_subsize_thresh", "loss_subsize_thresh",
+        # JOINTP: parent-state subsize columns (gain eligible when parent==0)
+        "gain_subsize_p", "loss_subsize_p",
+        "gain_subsize_nofilter_p", "loss_subsize_nofilter_p",
+        "gain_subsize_thresh_p", "loss_subsize_thresh_p",
+        "root_state",
+    ]
+    marginal_cols = [
+        "gene",
+        "gains_flow", "losses_flow",
+        "gains_markov", "losses_markov",
+        "gains_entropy", "losses_entropy",
+        "gain_subsize_marginal", "loss_subsize_marginal",
+        "gain_subsize_marginal_nofilter", "loss_subsize_marginal_nofilter",
+        "gain_subsize_marginal_thresh", "loss_subsize_marginal_thresh",
+        "gain_subsize_entropy", "loss_subsize_entropy",
+        "gain_subsize_entropy_nofilter", "loss_subsize_entropy_nofilter",
+        "gain_subsize_entropy_thresh", "loss_subsize_entropy_thresh",
+        # PATH-masked variants (denominator restricted to eligible branches)
+        "gains_flow_path", "losses_flow_path",
+        "gains_markov_path", "losses_markov_path",
+        "gains_entropy_path", "losses_entropy_path",
+        "gain_subsize_marginal_path", "loss_subsize_marginal_path",
+        "gain_subsize_marginal_nofilter_path", "loss_subsize_marginal_nofilter_path",
+        "gain_subsize_marginal_thresh_path", "loss_subsize_marginal_thresh_path",
+        "gain_subsize_entropy_path", "loss_subsize_entropy_path",
+        "gain_subsize_entropy_nofilter_path", "loss_subsize_entropy_nofilter_path",
+        "gain_subsize_entropy_thresh_path", "loss_subsize_entropy_thresh_path",
+        "dist_marginal", "loss_dist_marginal", "root_prob",
+    ]
+
+    # Short column sets
+    _short_joint = ["gene", "gains", "losses", "count", "dist", "loss_dist",
+                    "gain_subsize", "loss_subsize", "root_state"]
+    _short_mppa  = ["gene", "gains_flow", "losses_flow", "count", "dist", "loss_dist",
+                    "gain_subsize_marginal", "loss_subsize_marginal",
+                    "dist_marginal", "loss_dist_marginal", "root_prob"]
+
+    if args.short:
+        if reconstruction == "JOINT":
+            output_cols = _short_joint
+        elif reconstruction == "MPPA":
+            output_cols = _short_mppa
+        else:  # "all"
+            seen: set = set()
+            output_cols = [c for c in _short_joint + _short_mppa
+                           if not (c in seen or seen.add(c))]
+    else:
+        if reconstruction == "JOINT":
+            output_cols = core_cols
+        elif reconstruction == "MPPA":
+            output_cols = marginal_cols
+        else:  # "all"
+            output_cols = core_cols + marginal_cols
+
+    # ---- Chunked reconstruction with streaming CSV output ----
+    # Processing traits in fixed-size chunks keeps peak memory proportional to
+    # CHUNK_SIZE rather than total trait count, enabling 400k+ trait datasets to
+    # run within the available memory budget.
+    CHUNK_SIZE = args.chunk_size
+    total = len(sample_ids)
+    done = 0
+    success = 0
+    first_chunk = True
+    first_failure_tb = None
+
+    # ---- One-time fast ACR setup (before first chunk) ----
+    if not args.pastml:
+        # Clamp zero-length branches, matching reconstruct_trait()'s per-tree fix.
+        for _n in master_tree.traverse():
+            if not _n.is_root() and _n.dist <= 0:
+                _n.dist = 1e-8
+        ta = build_tree_arrays(master_tree)
+        # Amortise Numba JIT compilation before the first chunk starts writing.
+        _d = np.zeros((1, ta.n_nodes), dtype=np.int8)
+        _n_leaves = len(ta.leaf_node_idx)
+        if _n_leaves >= 2:
+            _d[0, ta.leaf_node_idx[0]] = 0
+            _d[0, ta.leaf_node_idx[1]] = 1
+        fast_acr(ta, _d, ["_warmup_"], mode=args.acr_mode)
+        print("  Numba JIT warm-up complete.", flush=True)
+
+    for chunk_start in range(0, total, CHUNK_SIZE):
+        chunk_ids = sample_ids[chunk_start : chunk_start + CHUNK_SIZE]
+        chunk_results: dict = {}
+
+        # Load only this chunk's columns from disk.  For Parquet files PyArrow
+        # decompresses only the requested columns; for CSV pandas skips the rest
+        # via usecols.  Peak RAM for trait data = CHUNK_SIZE * n_rows.
+        obs_chunk_df = load_trait_columns(inputs_file, chunk_ids, index_col)
+        obs_chunk_df = obs_chunk_df.loc[obs_chunk_df.index.isin(valid_index)]
+
+        if args.pastml:
+            # ---- PastML path (original ProcessPoolExecutor behaviour) ----
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_worker_init,
+                initargs=(tree_newick, upper_bound),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        reconstruct_trait,
+                        gene,
+                        None,       # tree_newick not needed: worker has _WORKER_TREE
+                        obs_chunk_df[gene],
+                        upper_bound,
+                        reconstruction,
+                        gene_sums.get(gene, 0),
+                    ): gene
+                    for gene in chunk_ids
+                }
+                for future in as_completed(futures):
+                    gene = futures[future]
+                    done += 1
+                    try:
+                        res = future.result()
+                        if res is not None:
+                            chunk_results[gene] = res
+                    except Exception as exc:
+                        tb = traceback.format_exc()
+                        print(f"  [FAILED] {gene}: {exc}\n{tb}",
+                              file=sys.stderr, flush=True)
+                        if first_failure_tb is None:
+                            first_failure_tb = (gene, exc, tb)
+        else:
+            # ---- Fast ACR path (Numba, single-process) ----
+            obs_matrix = build_obs_matrix(ta, obs_chunk_df)
+            fast_rows = reconstruct_chunk_fast(
+                master_tree, ta, obs_matrix, chunk_ids,
+                gene_sums, upper_bound, reconstruction, args.acr_mode,
+            )
+            done += len(chunk_ids)
+            for row in fast_rows:
+                chunk_results[row["gene"]] = row
+
+        # Stream chunk to CSV (append after first chunk) — identical for both paths
+        rows = [
+            {k: v for k, v in chunk_results[g].items() if not k.startswith("_")}
+            for g in chunk_ids if g in chunk_results
+        ]
+        if rows:
+            df_chunk = pd.DataFrame(rows)
+            df_chunk = df_chunk[[c for c in output_cols if c in df_chunk.columns]]
+            df_chunk.to_csv(
+                output_csv,
+                index=False,
+                mode="w" if first_chunk else "a",
+                header=first_chunk,
+            )
+            success += len(rows)
+            first_chunk = False
+
+        chunk_end = min(chunk_start + CHUNK_SIZE, total)
+        print(f"  [{chunk_end}/{total}] chunk written "
+              f"({len(rows)}/{len(chunk_ids)} succeeded)", flush=True)
+
+        del chunk_results, rows, obs_chunk_df
+        if not args.pastml:
+            del obs_matrix, fast_rows
+        if "df_chunk" in dir():
+            del df_chunk
+        gc.collect()
+
+    if first_chunk:
+        print("ERROR: No traits were successfully reconstructed.", file=sys.stderr, flush=True)
+        if first_failure_tb is not None:
+            gene, exc, tb = first_failure_tb
+            print(f"\nFirst failure was trait '{gene}':\n{tb}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    print(f"\n[OK] Results written -> {output_csv}", flush=True)
+
+    # ---- Optional summary file ----
+    failed = len(sample_ids) - success
+    summary_lines = [
+        f"Output CSV: {output_csv}",
+        f"Total traits attempted : {len(sample_ids)}",
+        f"Successful             : {success}",
+        f"Failed                 : {failed}",
+        f"Reconstruction mode    : {reconstruction}",
+        f"Engine                 : {'PastML' if args.pastml else f'fast_acr[{args.acr_mode}]'}",
+        "\nJob complete.",
+    ]
+    if args.summary_file:
+        Path(args.summary_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.summary_file).write_text("\n".join(summary_lines) + "\n")
+    else:
+        print("\n".join(summary_lines))
+
+
+if __name__ == "__main__":
+    main()

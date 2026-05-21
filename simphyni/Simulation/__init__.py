@@ -1,6 +1,6 @@
 from .tree_simulator import TreeSimulator
 from .pair_statistics import pair_statistics
-from .simulation import (simulate_glrates_bit, sim_bit, compres)
+from .simulation import (simulate_glrates_bit, sim_bit, compres, build_sim_params, build_clade_mask)
 
 __all__ = [
     "TreeSimulator",
@@ -8,4 +8,6 @@ __all__ = [
     "simulate_glrates_bit",
     "sim_bit",
     "compres",
+    "build_sim_params",
+    "build_clade_mask",
 ]
