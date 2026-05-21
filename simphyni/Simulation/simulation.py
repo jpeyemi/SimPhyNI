@@ -76,7 +76,7 @@ All 36 counting × subsize × masking combinations are explored in
 selection via ``build_sim_params()`` — no re-running ACR per combination.
 """
 
-from typing import List
+from typing import List, Tuple, Set, Dict
 import math
 import numpy as np
 import pandas as pd
@@ -85,7 +85,6 @@ from joblib import Parallel, delayed
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 import seaborn as sns
-from typing import List, Tuple, Set, Dict
 from numba import njit, prange
 import os
 
@@ -293,6 +292,100 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
             out[raw_alias] = src[raw_col].values
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# build_clade_mask: MRCA-based eligibility from observed leaf distributions
+# ---------------------------------------------------------------------------
+
+def build_clade_mask(
+    tree,
+    obsdf: pd.DataFrame,
+    gene_order: list,
+    root_states,
+) -> tuple:
+    """
+    Build (n_nodes, n_traits) boolean gain/loss eligibility masks from observed
+    leaf binary data and root states.
+
+    For each trait the "minority" leaves are those whose observed state differs
+    from the root state:
+      - root_state = 0 → minority leaves carry the trait (value 1)
+      - root_state = 1 → minority leaves lack the trait (value 0)
+
+    The MRCA of the minority leaves is found and every node in that subtree is
+    marked eligible for both gains and losses.  This gives the simulation enough
+    eligible branch length to reproduce realistic prevalence while restricting
+    events to the clade where the trait is actually observed.
+
+    Also returns mrca_bl (shape n_traits,): total branch length of each MRCA
+    subtree, to be used as gain_subsize / loss_subsize so that the Poisson rate
+    (count / subsize) is calibrated to the actual eligible region.
+
+    Parameters
+    ----------
+    tree       : ETE3 Tree (same object used by sim_bit)
+    obsdf      : binary leaf × trait DataFrame (rows = leaf names, cols = genes)
+    gene_order : list of gene names; determines mask column order
+    root_states: Series or dict mapping gene → 0/1 root state
+
+    Returns
+    -------
+    gain_mask : (n_nodes, n_traits) bool array
+    loss_mask : (n_nodes, n_traits) bool array — identical to gain_mask
+    mrca_bl   : (n_traits,) float array — eligible subtree branch length
+    """
+    node_list = list(tree.traverse())
+    n_nodes   = len(node_list)
+    n_traits  = len(gene_order)
+    node_idx  = {node: i for i, node in enumerate(node_list)}
+    all_leaf_names = {n.name for n in tree.get_leaves()}
+
+    gain_mask = np.zeros((n_nodes, n_traits), dtype=bool)
+    loss_mask = np.zeros((n_nodes, n_traits), dtype=bool)
+    mrca_bl   = np.zeros(n_traits, dtype=float)
+
+    for t_idx, gene in enumerate(gene_order):
+        if hasattr(root_states, 'loc'):
+            root_state = int(root_states.loc[gene])
+        else:
+            root_state = int(root_states[gene])
+        minority_val = 1 - root_state   # state that differs from root
+
+        if gene not in obsdf.columns:
+            # No observed data → whole tree eligible (conservative fallback)
+            gain_mask[:, t_idx] = True
+            loss_mask[:, t_idx] = True
+            mrca_bl[t_idx] = sum(n.dist for n in node_list if not n.is_root())
+            continue
+
+        minority_leaves = [
+            n for n in tree.get_leaves()
+            if n.name in all_leaf_names
+            and n.name in obsdf.index
+            and int(obsdf.at[n.name, gene]) == minority_val
+        ]
+
+        if not minority_leaves:
+            # Trait matches root state everywhere → no transitions; masks stay False
+            continue
+
+        mrca = (
+            tree.get_common_ancestor(minority_leaves)
+            if len(minority_leaves) > 1
+            else minority_leaves[0]
+        )
+
+        subtree_bl = 0.0
+        for node in mrca.traverse():
+            idx = node_idx[node]
+            gain_mask[idx, t_idx] = True
+            loss_mask[idx, t_idx] = True
+            if not node.is_root():
+                subtree_bl += node.dist
+        mrca_bl[t_idx] = subtree_bl
+
+    return gain_mask, loss_mask, mrca_bl
 
 
 # ---------------------------------------------------------------------------
@@ -802,14 +895,6 @@ def compute_bitwise_cooc(tp: np.ndarray, tq: np.ndarray, total_trials: int = 64,
 
 def compute_kde_stats(observed_value: float, simulated_values: np.ndarray) -> Tuple[float, float, float, float]:
     """Compute KDE statistics for a single pair."""
-
-    # kde = gaussian_kde(simulated_values, bw_method='silverman')
-    # cdf_func_ant = lambda x: kde.integrate_box_1d(-np.inf, x)
-    # cdf_func_syn = lambda x: kde.integrate_box_1d(x,np.inf)
-    
-    # kde_pval_ant = cdf_func_ant(observed_value)  # P(X ≤ observed)
-    # kde_pval_syn = cdf_func_syn(observed_value) # P(X > observed)
-
     kde = gaussian_kde(simulated_values,bw_method='silverman')
     cdf_func_ant = lambda x: kde.integrate_box_1d(-np.inf, x)
     kde_syn = gaussian_kde(-1*simulated_values, bw_method='silverman')

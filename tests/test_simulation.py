@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 # Import your module here.
 # Assuming the file provided is named 'simulation_methods.py' inside 'simphyni' package
-from simphyni import sim_bit, simulate_glrates_bit, compres, build_sim_params
+from simphyni import sim_bit, simulate_glrates_bit, compres, build_sim_params, build_clade_mask
 from simphyni.Simulation.simulation import unpack_trait_params, multi_word_circular_shift, compute_kde_stats, sum_all_bits, compute_bitwise_cooc, process_batch
 from simphyni.scripts.run_ancestral_reconstruction import build_path_mask, label_internal_nodes
 
@@ -611,6 +611,125 @@ def test_build_sim_params_output_feeds_sim_bit(simple_tree, wide_params):
     result = sim_bit(simple_tree, out, trials=64)
     # sim_bit returns one row per leaf tip (iterating `tree` yields leaves in ETE3)
     assert result.shape[0] == len(simple_tree.get_leaves())
+
+
+# ==========================================
+# build_clade_mask tests
+# ==========================================
+
+@pytest.fixture
+def balanced_tree():
+    """4-taxon balanced tree: ((T1:1,T2:1)Int1:1,(T3:1,T4:1)Int2:1)Root:0;"""
+    return Tree("((T1:1.0,T2:1.0)Int1:1.0,(T3:1.0,T4:1.0)Int2:1.0)Root:0.0;", format=1)
+
+
+def _node_names_eligible(tree, mask, t_idx):
+    """Return set of node names where mask[:,t_idx] is True."""
+    nodes = list(tree.traverse())
+    return {nodes[i].name for i, v in enumerate(mask[:, t_idx]) if v}
+
+
+def test_clade_mask_root0_one_clade(balanced_tree):
+    """root_state=0, trait in left clade only → only Int1/T1/T2 eligible."""
+    obsdf = pd.DataFrame(
+        {"G": [1, 1, 0, 0]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    eligible = _node_names_eligible(balanced_tree, gm, 0)
+    assert "Int1" in eligible
+    assert "T1" in eligible
+    assert "T2" in eligible
+    assert "Int2" not in eligible
+    assert "T3" not in eligible
+    assert "T4" not in eligible
+    # loss mask identical to gain mask
+    assert (gm == lm).all()
+
+
+def test_clade_mask_root1_one_clade(balanced_tree):
+    """root_state=1, absences in left clade → same left-clade subtree eligible."""
+    obsdf = pd.DataFrame(
+        {"G": [0, 0, 1, 1]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 1})
+    eligible = _node_names_eligible(balanced_tree, gm, 0)
+    assert "Int1" in eligible
+    assert "T1" in eligible
+    assert "T2" in eligible
+    assert "Int2" not in eligible
+    assert "T3" not in eligible
+
+
+def test_clade_mask_universal(balanced_tree):
+    """All leaves carry trait (root_state=0) → MRCA=root → whole tree eligible."""
+    obsdf = pd.DataFrame(
+        {"G": [1, 1, 1, 1]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    assert gm[:, 0].all(), "All nodes should be eligible for a universal trait"
+
+
+def test_clade_mask_single_leaf(balanced_tree):
+    """Single minority leaf → only that leaf node is eligible."""
+    obsdf = pd.DataFrame(
+        {"G": [1, 0, 0, 0]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    eligible = _node_names_eligible(balanced_tree, gm, 0)
+    assert eligible == {"T1"}
+
+
+def test_clade_mask_no_minority(balanced_tree):
+    """No minority leaves → both masks all-False, mrca_bl=0."""
+    obsdf = pd.DataFrame(
+        {"G": [0, 0, 0, 0]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    assert not gm[:, 0].any()
+    assert not lm[:, 0].any()
+    assert mrca_bl[0] == pytest.approx(0.0)
+
+
+def test_clade_mask_mrca_bl(balanced_tree):
+    """MRCA subtree branch length equals sum of branches within the MRCA subtree."""
+    # T1=1, T2=1, T3=0, T4=0; MRCA of T1,T2 is Int1
+    # Branches inside: Root→Int1 (1.0), Int1→T1 (1.0), Int1→T2 (1.0) = 3.0
+    obsdf = pd.DataFrame(
+        {"G": [1, 1, 0, 0]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    _, _, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    assert mrca_bl[0] == pytest.approx(3.0)
+
+
+def test_clade_mask_missing_gene(balanced_tree):
+    """Gene absent from obsdf columns → whole tree eligible (fallback)."""
+    obsdf = pd.DataFrame({"OTHER": [1, 0, 1, 0]}, index=["T1", "T2", "T3", "T4"])
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G"], {"G": 0})
+    assert gm[:, 0].all()
+    assert mrca_bl[0] > 0.0
+
+
+def test_clade_mask_multiple_traits(balanced_tree):
+    """Two traits handled independently in same call."""
+    obsdf = pd.DataFrame(
+        {"G1": [1, 1, 0, 0], "G2": [0, 0, 1, 1]},
+        index=["T1", "T2", "T3", "T4"],
+    )
+    root_states = {"G1": 0, "G2": 0}
+    gm, lm, mrca_bl = build_clade_mask(balanced_tree, obsdf, ["G1", "G2"], root_states)
+    elig_g1 = _node_names_eligible(balanced_tree, gm, 0)
+    elig_g2 = _node_names_eligible(balanced_tree, gm, 1)
+    # G1: left clade eligible; G2: right clade eligible
+    assert "Int1" in elig_g1 and "Int2" not in elig_g1
+    assert "Int2" in elig_g2 and "Int1" not in elig_g2
+    assert mrca_bl[0] == pytest.approx(3.0)
+    assert mrca_bl[1] == pytest.approx(3.0)
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
+include_flagged = 'include-flagged' if str(config.get('include_flagged')).lower() == 'true' else 'no-include-flagged'
 
 samples["MinPrev"] = samples.get("MinPrev", 0.05)
 samples["MaxPrev"] = samples.get("MaxPrev", 0.95)
@@ -57,12 +58,12 @@ TRAITS_ls = TRAITS_ls_raw.apply(parse_trait_cols)
 run_dict = dict(zip(SAMPLE_ls, TRAITS_ls))
 prev_dict = dict(zip(SAMPLE_ls, list(zip(samples['MinPrev'], samples['MaxPrev']))))
 
-def copy_files_to_inputs(file_paths, name):
+def copy_files_to_inputs(file_paths, names):
     input_dir = os.path.join(outdir, "inputs")
     os.makedirs(input_dir, exist_ok=True)
-    for file_path, n in zip(file_paths,name):
+    for file_path, n in zip(file_paths, names):
         file_name = os.path.basename(file_path)
-        name, ext = os.path.splitext(file_name)
+        stem, ext = os.path.splitext(file_name)
         destination_path = os.path.join(input_dir, f"{n}{ext}")
         if not os.path.exists(destination_path):
             shutil.copy(file_path, destination_path)
@@ -333,4 +334,5 @@ rule SimPhyNI:
         '-r {params.runtype} '
         '-c {params.threads} '
         '--{prefilter} --{plot} '
-        '--{save_object}'
+        '--{save_object} '
+        '--{include_flagged}'

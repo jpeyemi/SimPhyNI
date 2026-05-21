@@ -102,7 +102,7 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged)
+    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged, use_clade_mask=False)
 
     # ----------------------
     # Save Outputs
