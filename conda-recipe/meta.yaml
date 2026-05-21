@@ -1,5 +1,5 @@
 {% set name = "simphyni" %}
-{% set version = "1.0.2" %}
+{% set version = "2.0.0" %}
 
 package:
   name: {{ name|lower }}
@@ -50,6 +50,7 @@ requirements:
         - requests>=2.32.3
         - scipy>=1.14.0
         - urllib3>=2.4.0
+        - pyarrow>=14.0.0
 
 
 test:
