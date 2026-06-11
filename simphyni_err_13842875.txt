@@ -1,0 +1,87 @@
+Assuming unrestricted shared filesystem usage.
+host: node2431
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 64
+Rules claiming more threads will be scaled down.
+Conda environments: ignored
+Job stats:
+job                         count
+------------------------  -------
+reformat_csv                    1
+reformat_tree                   1
+ancestral_reconstruction        1
+SimPhyNI                        1
+all                             1
+total                           5
+
+Select jobs to execute...
+Execute 2 jobs...
+
+[Tue May 12 16:27:13 2026]
+localrule reformat_csv:
+    input: simphyni_outs/inputs/ecoli_accessory_dedup.nwk
+    output: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet
+    jobid: 3
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet
+    wildcards: sample=ecoli_accessory_dedup
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/reformat_csv.py" "simphyni_outs/inputs/ecoli_accessory_dedup.nwk" "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet" 0.05 0.95 ""
+
+[Tue May 12 16:27:13 2026]
+localrule reformat_tree:
+    input: simphyni_outs/inputs/ecoli_accessory_dedup.nwk
+    output: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk
+    jobid: 4
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk
+    wildcards: sample=ecoli_accessory_dedup
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/reformat_tree.py" "simphyni_outs/inputs/ecoli_accessory_dedup.nwk" "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk"
+[Tue May 12 16:27:13 2026]
+Finished jobid: 4 (Rule: reformat_tree)
+1 of 5 steps (20%) done
+[Tue May 12 16:27:15 2026]
+Finished jobid: 3 (Rule: reformat_csv)
+2 of 5 steps (40%) done
+Select jobs to execute...
+Execute 1 jobs...
+
+[Tue May 12 16:27:15 2026]
+localrule ancestral_reconstruction:
+    input: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet, simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk
+    output: simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv
+    jobid: 2
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv; Input files updated by another job: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk, simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet
+    wildcards: sample=ecoli_accessory_dedup
+    threads: 64
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/run_ancestral_reconstruction.py" --inputs_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet" --tree_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk" --output_csv "simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv" --max_workers 64 -r 0 --reconstruction all --no-prefilter  --acr_mode ml
+ERROR: No traits were successfully reconstructed.
+RuleException:
+CalledProcessError in file "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Snakefile.py", line 233:
+Command 'set -euo pipefail;  python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/run_ancestral_reconstruction.py" --inputs_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet" --tree_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk" --output_csv "simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv" --max_workers 64 -r 0 --reconstruction all --no-prefilter  --acr_mode ml' returned non-zero exit status 1.
+[Tue May 12 16:27:32 2026]
+Error in rule ancestral_reconstruction:
+    message: None
+    jobid: 2
+    input: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet, simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk
+    output: simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv
+    shell:
+        python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/run_ancestral_reconstruction.py" --inputs_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet" --tree_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk" --output_csv "simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv" --max_workers 64 -r 0 --reconstruction all --no-prefilter  --acr_mode ml
+        (command exited with non-zero exit code)
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look below for error messages
+[Tue May 12 16:27:32 2026]
+Error in rule ancestral_reconstruction:
+    message: None
+    jobid: 2
+    input: simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet, simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk
+    output: simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv
+    shell:
+        python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/run_ancestral_reconstruction.py" --inputs_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.parquet" --tree_file "simphyni_outs/tmp/ecoli_accessory_dedup/0-formatting/ecoli_accessory_dedup.nwk" --output_csv "simphyni_outs/tmp/ecoli_accessory_dedup/1-PastML-api/pastmlout.csv" --max_workers 64 -r 0 --reconstruction all --no-prefilter  --acr_mode ml
+        (command exited with non-zero exit code)
+Complete log(s): /orcd/data/tami/003/projects/Ishaq/SimPhyNI/.snakemake/log/2026-05-12T162706.453174.snakemake.log
+WorkflowError:
+At least one job did not complete successfully.
+
+ SimPhyNI failed with error: Command '['snakemake', '--snakefile', '/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Snakefile.py', '--rerun-incomplete', '--printshellcmds', '--nolock', '--cores', '64', '--config', 'samples=simphyni_outs/simphyni_sample_info.csv', 'temp_dir=simphyni_outs/tmp', 'prefilter=False', 'plot=False', 'directory=simphyni_outs', 'save_object=False']' returned non-zero exit status 1.

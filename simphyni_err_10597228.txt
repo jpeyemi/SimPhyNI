@@ -1,0 +1,104 @@
+Assuming unrestricted shared filesystem usage.
+host: node2430
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 64
+Rules claiming more threads will be scaled down.
+Conda environments: ignored
+Job stats:
+job                         count
+------------------------  -------
+reformat_csv                    1
+reformat_tree                   1
+ancestral_reconstruction        1
+SimPhyNI                        1
+all                             1
+total                           5
+
+Select jobs to execute...
+Execute 2 jobs...
+
+[Mon Mar 16 19:21:12 2026]
+localrule reformat_tree:
+    input: simphyni_outs/inputs/ecoli_accessory.nwk
+    output: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    jobid: 4
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    wildcards: sample=ecoli_accessory
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/reformat_tree.py" "simphyni_outs/inputs/ecoli_accessory.nwk" "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk"
+
+[Mon Mar 16 19:21:12 2026]
+localrule reformat_csv:
+    input: simphyni_outs/inputs/ecoli_accessory.csv
+    output: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv
+    jobid: 3
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv
+    wildcards: sample=ecoli_accessory
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/reformat_csv.py" "simphyni_outs/inputs/ecoli_accessory.csv" "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" 0.05 0.95 ""
+[Mon Mar 16 19:21:13 2026]
+Finished jobid: 4 (Rule: reformat_tree)
+1 of 5 steps (20%) done
+[Mon Mar 16 19:21:15 2026]
+Finished jobid: 3 (Rule: reformat_csv)
+2 of 5 steps (40%) done
+Select jobs to execute...
+Execute 1 jobs...
+
+[Mon Mar 16 19:21:15 2026]
+localrule ancestral_reconstruction:
+    input: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    output: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv
+    jobid: 2
+    reason: Missing output files: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv; Input files updated by another job: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv
+    wildcards: sample=ecoli_accessory
+    threads: 64
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/run_ancestral_reconstruction.py" --inputs_file "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" --tree_file "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" --output_csv "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" --max_workers 64 -r 0 --uncertainty marginal --no-prefilter
+[Mon Mar 16 19:31:27 2026]
+Finished jobid: 2 (Rule: ancestral_reconstruction)
+3 of 5 steps (60%) done
+Select jobs to execute...
+Execute 1 jobs...
+
+[Mon Mar 16 19:31:27 2026]
+localrule SimPhyNI:
+    input: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    output: simphyni_outs/ecoli_accessory/simphyni_results.csv
+    jobid: 1
+    reason: Missing output files: simphyni_outs/ecoli_accessory/simphyni_results.csv; Input files updated by another job: simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv, simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv
+    wildcards: sample=ecoli_accessory
+    threads: 64
+    resources: tmpdir=/tmp
+Shell command: python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/runSimPhyNI.py" -p "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" -s "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" -t "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" -o "simphyni_outs/ecoli_accessory/" -r 0 -c 64 --no-prefilter --no-plot --no-save-object
+/usr/bin/bash: line 1: 1731436 Killed                  python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/runSimPhyNI.py" -p "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" -s "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" -t "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" -o "simphyni_outs/ecoli_accessory/" -r 0 -c 64 --no-prefilter --no-plot --no-save-object
+RuleException:
+CalledProcessError in file "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Snakefile.py", line 233:
+Command 'set -euo pipefail;  python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/runSimPhyNI.py" -p "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" -s "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" -t "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" -o "simphyni_outs/ecoli_accessory/" -r 0 -c 64 --no-prefilter --no-plot --no-save-object' returned non-zero exit status 137.
+[Mon Mar 16 19:34:18 2026]
+Error in rule SimPhyNI:
+    message: None
+    jobid: 1
+    input: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    output: simphyni_outs/ecoli_accessory/simphyni_results.csv
+    shell:
+        python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/runSimPhyNI.py" -p "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" -s "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" -t "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" -o "simphyni_outs/ecoli_accessory/" -r 0 -c 64 --no-prefilter --no-plot --no-save-object
+        (command exited with non-zero exit code)
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look below for error messages
+[Mon Mar 16 19:34:21 2026]
+Error in rule SimPhyNI:
+    message: None
+    jobid: 1
+    input: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv, simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk
+    output: simphyni_outs/ecoli_accessory/simphyni_results.csv
+    shell:
+        python "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/scripts/runSimPhyNI.py" -p "simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv" -s "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.csv" -t "simphyni_outs/tmp/ecoli_accessory/0-formatting/ecoli_accessory.nwk" -o "simphyni_outs/ecoli_accessory/" -r 0 -c 64 --no-prefilter --no-plot --no-save-object
+        (command exited with non-zero exit code)
+Complete log(s): /orcd/data/tami/003/projects/Ishaq/SimPhyNI/.snakemake/log/2026-03-16T192104.947998.snakemake.log
+WorkflowError:
+At least one job did not complete successfully.
+
+ SimPhyNI failed with error: Command '['snakemake', '--snakefile', '/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Snakefile.py', '--rerun-incomplete', '--printshellcmds', '--nolock', '--cores', 'all', '--config', 'samples=simphyni_outs/simphyni_sample_info.csv', 'temp_dir=simphyni_outs/tmp', 'prefilter=False', 'plot=False', 'directory=simphyni_outs', 'save_object=False']' returned non-zero exit status 1.
+[2026-03-16T19:35:08.078] error: Detected 1 oom_kill event in StepId=10597228.batch. Some of the step tasks have been OOM Killed.

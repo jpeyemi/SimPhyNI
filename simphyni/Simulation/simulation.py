@@ -469,7 +469,7 @@ def flag_uncalibratable_traits(
 
 ### Simulation Methods
 
-def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
+def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 128, cores = -1,
                          gain_mask=None, loss_mask=None, gamma=False):
 
     sim = sim_bit(tree=tree, trait_params=trait_params, trials=trials,

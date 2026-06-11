@@ -1,0 +1,22 @@
+Traceback (most recent call last):
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/bin/simphyni", line 3, in <module>
+    from simphyni.simphyni_cli import main
+  File "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/__init__.py", line 2, in <module>
+    from .Simulation.tree_simulator import TreeSimulator
+  File "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Simulation/__init__.py", line 1, in <module>
+    from .tree_simulator import TreeSimulator
+  File "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Simulation/tree_simulator.py", line 4, in <module>
+    from .simulation import *
+  File "/orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Simulation/simulation.py", line 85, in <module>
+    from scipy.stats import gaussian_kde
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/stats/__init__.py", line 628, in <module>
+    from ._stats_py import *
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/stats/_stats_py.py", line 40, in <module>
+    from scipy.spatial import distance_matrix
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/spatial/__init__.py", line 124, in <module>
+    from . import distance, transform
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/spatial/transform/__init__.py", line 21, in <module>
+    from ._rigid_transform import RigidTransform
+  File "/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/spatial/transform/_rigid_transform.py", line 17, in <module>
+    from scipy.spatial.transform._rotation import _promote
+ImportError: cannot import name '_promote' from 'scipy.spatial.transform._rotation' (/home/iobal/orcd/pool/miniconda3/envs/simphyni_dev/lib/python3.11/site-packages/scipy/spatial/transform/_rotation.cpython-311-x86_64-linux-gnu.so)

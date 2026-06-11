@@ -1,0 +1,37 @@
+Running reconstruction for 5904 traits (uncertainty=marginal, workers=64) ...
+  [295/5904] last completed: ybiU
+  [590/5904] last completed: yraK
+  [885/5904] last completed: group_3412
+  [1180/5904] last completed: ccdB
+  [1475/5904] last completed: group_17694
+  [1770/5904] last completed: group_9931
+  [2065/5904] last completed: group_8821
+  [2360/5904] last completed: intA
+  [2655/5904] last completed: group_17887
+  [2950/5904] last completed: group_12654
+  [3245/5904] last completed: group_20569
+  [3540/5904] last completed: group_14570
+  [3835/5904] last completed: group_22432
+  [4130/5904] last completed: group_23387
+  [4425/5904] last completed: group_11945
+  [4720/5904] last completed: group_21424
+  [5015/5904] last completed: group_23127
+  [5310/5904] last completed: group_17362
+  [5605/5904] last completed: group_8678
+  [5900/5904] last completed: group_1718
+  [5904/5904] last completed: group_2085
+
+[OK] Results written -> simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv
+Output CSV: simphyni_outs/tmp/ecoli_accessory/1-PastML-api/pastmlout.csv
+Total traits attempted : 5904
+Successful             : 5904
+Failed                 : 0
+Uncertainty mode       : marginal
+
+Job complete.
+File panx_ecoli_accessory.nwk already exists in simphyni_outs/inputs, skipping copy.
+File panx_ecoli_accessory.csv already exists in simphyni_outs/inputs, skipping copy.
+Launching SimPhyNI...
+Output directory: simphyni_outs
+Snakemake command: snakemake --snakefile /orcd/data/tami/003/projects/Ishaq/SimPhyNI/simphyni/Snakefile.py --rerun-incomplete --printshellcmds --nolock --cores all --config samples=simphyni_outs/simphyni_sample_info.csv temp_dir=simphyni_outs/tmp prefilter=False plot=False directory=simphyni_outs save_object=False 
+
