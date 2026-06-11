@@ -142,15 +142,30 @@ class pair_statistics:
 
     @staticmethod
     def _mutual_information_statistic(tp: np.ndarray, tq: np.ndarray) -> np.ndarray:
-        if len(tp.shape) == 1:
-            mutual_information_values = np.array([
-                mutual_info_score(tp, tq)
-            ])
-            return mutual_information_values
-        mutual_information_values = np.array([
-            mutual_info_score(tp[:, trial], tq[:, trial]) for trial in range(tp.shape[1])
-        ])
-        return mutual_information_values
+        # Vectorized binary MI: replaces per-column sklearn loop with numpy broadcasting.
+        # For binary X, Y: MI = sum_{a,b in {0,1}} p(a,b) * log(p(a,b) / (p(a)*p(b)))
+        if tp.ndim == 1:
+            tp = tp[:, np.newaxis]
+            tq = tq[:, np.newaxis]
+        tp = tp.astype(bool)
+        tq = tq.astype(bool)
+        n = tp.shape[0]
+        p11 = (tp &  tq).sum(axis=0) / n
+        p10 = (tp & ~tq).sum(axis=0) / n
+        p01 = (~tp &  tq).sum(axis=0) / n
+        p00 = (~tp & ~tq).sum(axis=0) / n
+        p1_ = p11 + p10   # P(tp=1)
+        p0_ = p01 + p00   # P(tp=0)
+        p_1 = p11 + p01   # P(tq=1)
+        p_0 = p10 + p00   # P(tq=0)
+
+        def _term(pab, pa, pb):
+            valid = pab > 0
+            return np.where(valid, pab * np.log(pab / np.where(valid, pa * pb, 1.0)), 0.0)
+
+        mi = (_term(p11, p1_, p_1) + _term(p10, p1_, p_0) +
+              _term(p01, p0_, p_1) + _term(p00, p0_, p_0))
+        return mi
 
     
     @staticmethod

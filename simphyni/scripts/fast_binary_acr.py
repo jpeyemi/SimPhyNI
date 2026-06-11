@@ -69,9 +69,27 @@ import platform
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
+# Redirect Numba's compiled-function cache to ~/.cache/simphyni/numba so it
+# survives across runs even when site-packages is read-only (e.g. shared conda
+# envs on a cluster).  Users/job scripts can override by setting
+# NUMBA_CACHE_DIR before invoking simphyni.  Must be set before `import numba`.
+os.environ.setdefault(
+    "NUMBA_CACHE_DIR",
+    str(Path.home() / ".cache" / "simphyni" / "numba"),
+)
+
 import numba
+import os
+try:
+    cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", 
+            os.environ.get("PBS_NUM_PPN", 
+            _get_physical_cores() or 1)))
+    numba.set_num_threads(cpus)
+except:
+    pass
 import numpy as np
 import pandas as pd
 from ete3 import Tree
@@ -344,7 +362,7 @@ def _f81_log_probs(bl: float, sf: float, pi1: float):
 # Bottom-up pass — marginal (sum-product), in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _bu_marginal_into(postorder, children_ptr, children_list, bl, obs_col,
                       sf, pi1, is_leaf, n_nodes, log_bu):
     """Fill log_bu[n_nodes, 2] in-place.
@@ -384,7 +402,7 @@ def _bu_marginal_into(postorder, children_ptr, children_list, bl, obs_col,
 # Bottom-up pass — JOINT (max-product), in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _bu_joint_into(postorder, children_ptr, children_list, bl, obs_col,
                    sf, pi1, is_leaf, n_nodes, log_bu):
     """Fill log_bu[n_nodes, 2] in-place (bottom-up JOINT, max-product, log-space)."""
@@ -422,7 +440,7 @@ def _bu_joint_into(postorder, children_ptr, children_list, bl, obs_col,
 # Top-down pass — marginal, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _td_marginal_into(preorder, parent, children_ptr, children_list, bl,
                       log_bu, sf, pi0, pi1, n_nodes, root_idx, log_td):
     """Fill log_td[n_nodes, 2] in-place (top-down marginal, log-space).
@@ -463,7 +481,7 @@ def _td_marginal_into(preorder, parent, children_ptr, children_list, bl,
 # Marginal probabilities from BU + TD, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, out_p1):
     """Write P(state=1 | data) at every node into out_p1[n_nodes].
 
@@ -483,7 +501,7 @@ def _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, out_p1):
 # JOINT traceback, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _joint_traceback_into(preorder, parent, bl, log_bu, sf, pi1,
                            n_nodes, root_idx, out_joint):
     """Write MAP state (0 or 1; -1 = unreachable) into out_joint[n_nodes] (int8)."""
@@ -547,7 +565,7 @@ def _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
     return _log_lh(log_bu_scratch[root_idx], pi0_, pi1_)
 
 
-@njit
+@njit(cache=True)
 def _golden_section_sf(
     postorder, children_ptr, children_list, bl, obs_col,
     pi0, pi1, is_leaf, n_nodes, root_idx,
@@ -586,7 +604,7 @@ def _golden_section_sf(
     return sf_opt, (fc + fd) / 2.0
 
 
-@njit
+@njit(cache=True)
 def _golden_section_pi1(
     postorder, children_ptr, children_list, bl, obs_col,
     sf, is_leaf, n_nodes, root_idx,
@@ -627,7 +645,7 @@ def _golden_section_pi1(
 # Parallel batch kernel — per-thread scratch, no heap allocation in prange
 # ---------------------------------------------------------------------------
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _batch_acr_kernel(
     postorder, preorder, parent,
     children_ptr, children_list,
