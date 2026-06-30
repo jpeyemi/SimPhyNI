@@ -363,6 +363,7 @@ def build_clade_mask(
             n for n in tree.get_leaves()
             if n.name in all_leaf_names
             and n.name in obsdf.index
+            and pd.notna(obsdf.at[n.name, gene])
             and int(obsdf.at[n.name, gene]) == minority_val
         ]
 

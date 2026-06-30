@@ -68,10 +68,11 @@ class TreeSimulator:
             self.obsdf = None   # populated in initialize_simulation_parameters
 
     def _binarize_obs(self):
-        """Binarize and normalize self.obsdf in-place."""
-        self.obsdf[self.obsdf > 0.5] = 1
-        self.obsdf.fillna(0, inplace=True)
-        self.obsdf = self.obsdf.astype(int)
+        """Binarize and normalize self.obsdf in-place. NaN values are preserved."""
+        df = self.obsdf.apply(pd.to_numeric, errors='coerce')
+        na_mask = df.isna()
+        self.obsdf = (df > 0.5).astype(float)
+        self.obsdf[na_mask] = np.nan
         self.obsdf.index = self.obsdf.index.astype(str)
 
     def _load_obs_filtered_to_leaves(self, leaf_names: set) -> pd.DataFrame:
@@ -219,8 +220,8 @@ class TreeSimulator:
         var_cols = np.array(vars.columns)
         target_cols = np.array(targets.columns)
 
-        valid_vars_mask = (vars_np.sum(axis=0) >= prevalence_threshold * vars_np.shape[0])
-        valid_targets_mask = (targets_np.sum(axis=0) >= prevalence_threshold * targets_np.shape[0])
+        valid_vars_mask = (np.nansum(vars_np, axis=0) >= prevalence_threshold * vars_np.shape[0])
+        valid_targets_mask = (np.nansum(targets_np, axis=0) >= prevalence_threshold * targets_np.shape[0])
 
         valid_vars = var_cols[valid_vars_mask]
         valid_targets = target_cols[valid_targets_mask]
@@ -229,43 +230,38 @@ class TreeSimulator:
             return np.array([]), np.array([])
 
         def fisher_significant_pairs(vars: pd.DataFrame, targets: pd.DataFrame, valid_vars, valid_targets, pval_threshold: float = 0.05):
-            X = vars.to_numpy().astype(bool)
-            Y = targets.to_numpy().astype(bool)
-            n = X.shape[0]
+            X_raw = vars.to_numpy()
+            Y_raw = targets.to_numpy()
+            X_valid = np.isfinite(X_raw)
+            Y_valid = np.isfinite(Y_raw)
+            X = np.where(X_valid, X_raw > 0, False)
+            Y = np.where(Y_valid, Y_raw > 0, False)
 
-            # Compute all pairwise contingency counts efficiently
-            a = X.T @ Y                      # (n_vars x n_targets) both=1
-            sX = X.sum(axis=0)               # (n_vars,)
-            sY = Y.sum(axis=0)               # (n_targets,)
+            # Per-pair jointly-valid tip counts
+            n = X_valid.astype(np.float64).T @ Y_valid.astype(np.float64)
+            a = X.astype(np.float64).T @ Y.astype(np.float64)
+            # Marginals restricted to jointly-valid tips
+            sX_valid = X.astype(np.float64).T @ Y_valid.astype(np.float64)
+            sY_valid = X_valid.astype(np.float64).T @ Y.astype(np.float64)
 
-            b = sX[:, None] - a              # (i=1, j=0)
-            c = sY[None, :] - a              # (i=0, j=1)
-            d = n - (a + b + c)              # both=0
+            b = sX_valid - a
+            c = sY_valid - a
 
-            # Compute marginals
             row1 = a + b
-            row2 = c + d
+            row2 = n - row1
             col1 = a + c
-            n_all = n
 
-            # Log-binomial function
             def logC(n, k):
                 return loggamma(n + 1) - loggamma(k + 1) - loggamma(n - k + 1)
 
-            # log probability of observed a under null
-            logp_obs = logC(row1, a) + logC(row2, col1 - a) - logC(n_all, col1)
+            logp_obs = logC(row1, a) + logC(row2, col1 - a) - logC(n, col1)
             p_obs = np.exp(logp_obs)
 
-            # approximate two-sided p-value as 2 * min(one-sided, 1)
             p_two = np.minimum(1.0, 2 * p_obs)
+            p_two[~np.isfinite(p_two)] = 1.0
 
-            # Mask NaNs and invalids
-            p_two[np.isnan(p_two)] = 1.0
-
-            # Apply significance threshold
             sig_mask = p_two < pval_threshold
 
-            # Get indices of significant pairs
             i_idx, j_idx = np.where(sig_mask)
 
             sig_pairs = np.column_stack((valid_vars[i_idx], valid_targets[j_idx]))
@@ -287,9 +283,11 @@ class TreeSimulator:
             seen.add((a, b))
             keep.append((a, b))
         pairs = np.array(keep)
-        
+
         self.total_tests = len(valid_vars) * len(valid_targets) - len(set(valid_vars) & set(valid_targets))
-            
+
+        if len(pairs) == 0:
+            return np.array([]), np.array([])
 
         all_stats = []
         # Process pairs in batches

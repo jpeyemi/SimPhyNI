@@ -39,23 +39,23 @@ def basic_simulator():
 # =================================
 
 def test_obs_data_processing():
-    """Test binarization (values > 0.5 become 1) and fillna."""
+    """Test binarization (values > 0.5 become 1) and NaN preservation."""
     raw_obs = pd.DataFrame({
         'T1': [0.1, 0.6, np.nan],
         'T2': [0.0, 1.0, 0.4]
     }, index=['A', 'B', 'C'])
-    
+
     # We need dummy tree/pastml to init
     dummy_pastml = pd.DataFrame({'gene':['T1','T2'], 'gains':[0,0], 'losses':[0,0], 'dist':[0,0], 'loss_dist':[0,0]})
     sim = TreeSimulator("((A:1,B:1):1,C:1);", dummy_pastml, raw_obs)
-    
+
     # Check T1 logic
-    assert sim.obsdf.loc['A', 'T1'] == 0 # 0.1 -> 0
-    assert sim.obsdf.loc['B', 'T1'] == 1 # 0.6 -> 1
-    assert sim.obsdf.loc['C', 'T1'] == 0 # NaN -> 0 (fillna)
-    
-    # Check Integer conversion
-    assert sim.obsdf['T1'].dtype == int or sim.obsdf['T1'].dtype == np.int64
+    assert sim.obsdf.loc['A', 'T1'] == 0.0   # 0.1 -> 0 (below threshold)
+    assert sim.obsdf.loc['B', 'T1'] == 1.0   # 0.6 -> 1 (above threshold)
+    assert np.isnan(sim.obsdf.loc['C', 'T1']) # NaN preserved
+
+    # Check float dtype (NaN requires float)
+    assert sim.obsdf['T1'].dtype == np.float64
 
 # ======================================
 # TESTS: Pair Selection (_get_pair_data)
