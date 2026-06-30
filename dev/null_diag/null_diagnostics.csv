@@ -1,0 +1,14 @@
+category,gene,ref_gene,gains,losses,gain_rate,null_std,null_mean,null_iqr,observed_logodds,p_value,degenerate
+gains_0_universal,betI,yagU,0,14,0.0,1.292856,-0.0975,1.753699,1.008,0.201601,False
+gains_0_universal,betA,yagU,0,14,0.0,1.213363,-0.086,1.672449,1.008,0.188494,False
+gains_0_universal,betT,yagU,0,14,0.0,1.144355,-0.067,1.565995,1.1983,0.139913,False
+gains_1_loss_0,espZ,yagU,1,0,0.1855,1.133397,-0.6584,1.357496,2.4703,0.009296,False
+gains_1_loss_0,lpfA2,yagU,1,0,0.1832,1.216482,-0.6366,1.386443,2.3316,0.02202,False
+gains_1_loss_0,yfjM,yagU,1,0,0.1813,0.958478,-0.8532,1.062191,0.8735,0.053877,False
+gains_1_inf_loss,perR,yagU,1,1,0.1813,0.733716,-0.9894,0.907821,0.8183,0.010844,False
+gains_5_10,curA,yagU,7,2,25.8446,1.081616,0.6388,1.363201,-1.0228,0.068853,False
+gains_5_10,yidK,yagU,5,10,8.4195,1.231909,-0.1408,1.668508,2.2379,0.035774,False
+gains_5_10,yegI,yagU,6,9,24.327,1.208237,0.0358,1.716189,-0.1566,0.459208,False
+normal,gatB,yagU,15,15,28.3468,1.113179,-0.0583,1.544463,1.2502,0.129272,False
+normal,yagU,yagU,16,21,14.8566,1.685635,0.086,1.411208,10.3076,0.012532,False
+normal,glcG,yagU,24,18,33.8643,1.125605,-0.1192,1.505724,0.722,0.228879,False

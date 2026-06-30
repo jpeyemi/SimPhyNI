@@ -19,7 +19,6 @@ dev/__pycache__/
 dev/acr_plots/
 dev/ancestral_states_demo.csv
 dev/.DS_Store
-dev/
 
 # Test artifacts
 tests/__pycache__/
