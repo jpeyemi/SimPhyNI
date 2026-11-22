@@ -740,28 +740,128 @@ def condition_on_prevalence(lineages, target_prev, trials, seed=None, block=256)
     return out
 
 
+def fitch_changes_packed(tree, lineages, n_trials, block=128):
+    """Parsimony change count for every (trait, replicate) of a packed simulation.
+
+    lineages : (n_tips, n_traits, n_chunks) uint64, tips in ``tree`` leaf order.
+    Returns (n_traits, n_trials) int32.  Bit-parallel Fitch: each node keeps two
+    bitsets (state 0 possible / state 1 possible) per (trait, chunk).
+    Multifurcations are resolved left to right, so counts are an upper bound
+    on the minimum for polytomies; observed traits must be scored with this
+    same function for a like-for-like comparison.
+    """
+    leaves = list(tree)
+    leaf_pos = {l: i for i, l in enumerate(leaves)}
+    n_tips, n_traits, n_chunks = lineages.shape
+    out = np.zeros((n_traits, n_trials), dtype=np.int32)
+    full = np.uint64(0xFFFFFFFFFFFFFFFF)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        L = lineages[:, s:e, :]
+        counts = np.zeros((e - s, n_chunks * 64), dtype=np.int32)
+        sets = {}
+        for node in tree.traverse("postorder"):
+            if node.is_leaf():
+                b = L[leaf_pos[node]]
+                sets[node] = (~b & full, b)
+                continue
+            kids = node.children
+            s0, s1 = sets.pop(kids[0])
+            for c in kids[1:]:
+                c0, c1 = sets.pop(c)
+                i0, i1 = s0 & c0, s1 & c1
+                empty = ~(i0 | i1) & full
+                if empty.any():
+                    counts += np.unpackbits(empty.view(np.uint8), axis=-1,
+                                            bitorder="little").reshape(e - s, -1)
+                s0 = np.where(empty, s0 | c0, i0)
+                s1 = np.where(empty, s1 | c1, i1)
+            sets[node] = (s0, s1)
+        out[s:e] = counts[:, :n_trials]
+    return out
+
+
+def condition_on_footprint(tree, lineages, obs_lineages, trials, seed=None, block=256):
+    """Keep, per trait, the ``trials`` replicates closest to the observed trait in
+    BOTH prevalence and parsimony changes.
+
+    Prevalence alone fails when the estimated rates are off: on clonal trees
+    (many zero-length branches) FLOW rates overstate change, so replicates
+    reach the observed prevalence through many small clumps instead of the
+    few large ones observed, and the null is too narrow.  Matching the number
+    of changes as well makes the null reproduce the trait's footprint
+    regardless of rate error.  Each distance is scaled by its spread across
+    the trait's replicates.
+
+    obs_lineages : (n_tips, n_traits, 1) uint64 with the observed traits in bit 0
+                   (NA tips should be 0; they are rare and only affect the score).
+    """
+    n_tips, n_traits, n_chunks_big = lineages.shape
+    big = n_chunks_big * 64
+    n_chunks, _ = _chunk_info(trials)
+    rng = np.random.default_rng(seed)
+    f_sim = fitch_changes_packed(tree, lineages, big)
+    f_obs = fitch_changes_packed(tree, obs_lineages, 1)[:, 0]
+    out = np.zeros((n_tips, n_traits, n_chunks), dtype=np.uint64)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(n_tips, e - s, -1)
+        prev = bits.mean(axis=0)
+        obs_bits = np.unpackbits(obs_lineages[:, s:e, :].view(np.uint8), axis=-1,
+                                 bitorder="little").reshape(n_tips, e - s, -1)[:, :, 0]
+        p_obs = obs_bits.mean(axis=0)[:, None]
+        lf = np.log1p(f_sim[s:e])
+        lf_obs = np.log1p(f_obs[s:e])[:, None]
+        sp = prev.std(axis=1, keepdims=True) + 1e-9
+        sf = lf.std(axis=1, keepdims=True) + 1e-9
+        dist = ((prev - p_obs) / sp) ** 2 + ((lf - lf_obs) / sf) ** 2
+        dist = dist + rng.random(dist.shape) * 1e-9
+        idx = np.argsort(dist, axis=1)[:, :trials]
+        sel = np.take_along_axis(bits, idx[None, :, :], axis=2)
+        pad = n_chunks * 64 - trials
+        if pad:
+            sel = np.pad(sel, ((0, 0), (0, 0), (0, pad)))
+        out[:, s:e, :] = np.packbits(sel, axis=-1, bitorder="little").view(np.uint64)
+    return out
+
+
+def pack_observed(obs: np.ndarray) -> np.ndarray:
+    """(n_tips, n_traits) 0/1 (NaN -> 0) -> (n_tips, n_traits, 1) uint64 with bit 0 set."""
+    o = np.nan_to_num(np.asarray(obs, dtype=float), nan=0.0) > 0.5
+    return o.astype(np.uint64)[:, :, None]
+
+
 def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
                          gain_mask=None, loss_mask=None, gamma=False, seed=None,
                          emergence='dist', emergence_scale=1.0,
-                         condition=None, oversample=8, obs_prevalence=None):
+                         condition=None, oversample=8, obs_prevalence=None, obs_traits=None,
+                         branch_cap=None):
     """Simulate the null for every trait and score all pairs.
 
-    condition : None | 'prevalence'.  With 'prevalence', ``trials * oversample``
+    condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
                 replicates are simulated per trait and the ``trials`` closest
-                to ``obs_prevalence`` (aligned to trait_params rows) are kept.
+                to the observed trait are kept: by prevalence
+                (``obs_prevalence``), or by prevalence and parsimony changes
+                (``obs_traits``: (n_tips, n_traits) in tree leaf order).
     """
-    if condition not in (None, 'none', 'prevalence'):
-        raise ValueError(f"condition must be None or 'prevalence', got {condition!r}")
-    conditioned = condition == 'prevalence' and oversample > 1
+    if condition not in (None, 'none', 'prevalence', 'footprint'):
+        raise ValueError(f"condition must be None, 'prevalence' or 'footprint', got {condition!r}")
+    conditioned = condition in ('prevalence', 'footprint') and oversample > 1
     sim = sim_bit(tree=tree, trait_params=trait_params,
                   trials=trials * oversample if conditioned else trials,
                   gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed,
-                  emergence=emergence, emergence_scale=emergence_scale)
-    if conditioned:
+                  emergence=emergence, emergence_scale=emergence_scale, branch_cap=branch_cap)
+    if conditioned and condition == 'prevalence':
         if obs_prevalence is None:
             raise ValueError("condition='prevalence' needs obs_prevalence")
         sim = condition_on_prevalence(sim, np.asarray(obs_prevalence, float), trials,
                                       seed=None if seed is None else seed + 2)
+    elif conditioned:
+        if obs_traits is None:
+            raise ValueError("condition='footprint' needs obs_traits")
+        sim = condition_on_footprint(tree, sim, pack_observed(obs_traits), trials,
+                                     seed=None if seed is None else seed + 2)
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
@@ -777,8 +877,18 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
 EMERGENCE_MODES = ('dist', 'none', 'scaled', 'soft')
 
 
+def iqr_branch_cap(tree) -> float:
+    """Branch-length cap used for rate denominators by run_ancestral_reconstruction
+    (10 ** (Q3 + 0.5 * IQR) of log10 non-zero branch lengths)."""
+    bls = np.array([n.dist for n in tree.traverse() if not n.is_root() and n.dist > 0])
+    if len(bls) == 0:
+        return float('inf')
+    q1, q3 = np.percentile(np.log10(bls), [25, 75])
+    return float(10 ** (q3 + 0.5 * (q3 - q1)))
+
+
 def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False,
-            seed=None, emergence='dist', emergence_scale=1.0):
+            seed=None, emergence='dist', emergence_scale=1.0, branch_cap=None):
     """
     Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
@@ -840,6 +950,13 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                    (For an MRCA clade mask use TreeSimulator.run_simulation(
                    emergence='mrca'), which builds gain/loss masks.)
     emergence_scale : factor for emergence='scaled'.
+    branch_cap   : None (default) or float.  Event probabilities use
+                   min(branch length, branch_cap).  Pass iqr_branch_cap(tree) to
+                   make the simulation consistent with the IQR-capped rate
+                   denominators (subsize='ORIGINAL'); otherwise rates estimated
+                   on capped lengths are applied to full lengths, which on
+                   clonal trees (where most length sits above the cap) makes
+                   long branches flip in nearly every replicate.
 
     Returns
     -------
@@ -928,6 +1045,7 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
 
         parent = sim[node_map[node.up], :, :]        # (n_traits, n_chunks)
         node_total_dist = node_dists[node]
+        bl_eff = node.dist if branch_cap is None else min(node.dist, branch_cap)
 
         if use_mask:
             # Mask mode: per-node, per-trait eligibility from entropy mask
@@ -963,8 +1081,8 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                 gr = gain_rates[applicable_traits_gains,  np.newaxis]
                 lr = loss_rates[applicable_traits_losses, np.newaxis]
 
-            g_samp = (rng.poisson(node.dist * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
-            l_samp = (rng.poisson(node.dist * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
+            g_samp = (rng.poisson(bl_eff * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
+            l_samp = (rng.poisson(bl_eff * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
 
             if chunk_trials < bits:
                 # Zero-pad to exactly 64 columns so packbits produces one uint64

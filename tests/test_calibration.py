@@ -315,3 +315,58 @@ def test_adaptive_phylogroup_excludes_only_when_absence_is_unexpected():
     ex = sim.excluded_phylogroups
     assert ex["busy"] >= 1        # absence from clade b is implausible under the null -> closed
     assert ex["sparse"] == 0      # absence is expected for a rare trait -> left open
+
+
+def test_fitch_changes_packed_matches_hand_counts():
+    from ete3 import Tree
+    from simphyni.Simulation.simulation import fitch_changes_packed, pack_observed
+    t = Tree("(((a:1,b:1):1,(c:1,d:1):1):1,((e:1,f:1):1,(g:1,h:1):1):1);", format=1)
+    order = [l.name for l in t]
+    cols = {"one_clade": "abcd", "two_tips": "ah", "none": "", "alternating": "aceg"}
+    obs = np.array([[1.0 if n in tips else 0.0 for tips in cols.values()] for n in order])
+    f = fitch_changes_packed(t, pack_observed(obs), 1)[:, 0]
+    assert f.tolist() == [1, 2, 0, 4]
+
+
+def test_footprint_conditioning_matches_changes_better_than_prevalence():
+    import random
+    from ete3 import Tree
+    from simphyni.Simulation.simulation import (sim_bit, condition_on_prevalence, condition_on_footprint,
+                                                fitch_changes_packed, pack_observed)
+    random.seed(13)
+    t = Tree()
+    t.populate(120, random_branches=True)
+    for i, n in enumerate(t.traverse()):
+        if not n.is_leaf():
+            n.name = f"n{i}"
+    leaves = [l.name for l in t]
+    # observed: one clade of ~15 tips (1 change); simulated rates are 10x too high
+    clade = next(n for n in t.traverse() if 12 <= len(n) <= 20)
+    obs = np.array([[1.0 if l in set(clade.get_leaf_names()) else 0.0] for l in leaves])
+    total = sum(n.dist for n in t.traverse())
+    tp = pd.DataFrame({"gains": [10.0], "losses": [10.0], "dist": [0.0], "loss_dist": [0.0],
+                       "gain_subsize": [total], "loss_subsize": [total], "root_state": [0]}, index=["g"])
+    L = sim_bit(t, tp, trials=64 * 16, seed=1, emergence="none")
+    f_obs = fitch_changes_packed(t, pack_observed(obs), 1)[0, 0]
+    fp = np.median(fitch_changes_packed(t, condition_on_prevalence(L, obs.mean(0), 64, seed=2), 64))
+    ff = np.median(fitch_changes_packed(t, condition_on_footprint(t, L, pack_observed(obs), 64, seed=2), 64))
+    assert abs(ff - f_obs) < abs(fp - f_obs)
+
+
+def test_branch_cap_limits_events_on_long_branches():
+    from ete3 import Tree
+    from simphyni.Simulation.simulation import sim_bit, iqr_branch_cap
+    # star tree: 40 short tips and 1 very long tip
+    t = Tree("(" + ",".join(f"s{i}:0.01" for i in range(40)) + ",L:100);", format=1)
+    cap = iqr_branch_cap(t)
+    assert cap < 100
+    tp = pd.DataFrame({"gains": [1.0], "losses": [0.0], "dist": [0.0], "loss_dist": [0.0],
+                       "gain_subsize": [10.0], "loss_subsize": [10.0], "root_state": [0]}, index=["g"])
+    order = [l.name for l in t]
+    li = order.index("L")
+    def frac_long(cap_):
+        lin = sim_bit(t, tp, trials=640, seed=0, emergence="none", branch_cap=cap_)
+        bits = np.unpackbits(lin.view(np.uint8), axis=-1, bitorder="little").reshape(len(order), 1, -1)[:, 0, :640]
+        return bits[li].mean()
+    assert frac_long(None) > 0.99                      # uncapped: the long branch always flips
+    assert frac_long(cap) < 0.5                        # capped: consistent with the denominator

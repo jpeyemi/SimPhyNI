@@ -381,7 +381,8 @@ class TreeSimulator:
                        gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
                        emergence='dist', emergence_scale=1.0, mrca_subsize='mrca',
                        condition=None, oversample=8,
-                       eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05):
+                       eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05,
+                       branch_cap=None):
         """
         Runs the tree simulation and stores results.
 
@@ -409,9 +410,10 @@ class TreeSimulator:
         :param emergence_scale: Factor used by emergence='scaled'.
         :param mrca_subsize: For emergence='mrca': 'mrca' recomputes rate denominators as the
                              MRCA subtree branch length; 'original' keeps the ACR denominators.
-        :param condition: None (default) or 'prevalence'.  With 'prevalence', each trait's
-                          null keeps the simulated replicates whose prevalence is closest
-                          to the observed one (out of trials * oversample simulated).
+        :param condition: None (default), 'prevalence' or 'footprint'.  Each trait's null keeps
+                          the simulated replicates closest to the observed trait (out of
+                          trials * oversample): by prevalence, or by prevalence and
+                          parsimony changes ('footprint', robust to rate mis-estimation).
         :param oversample: Replicates simulated per kept replicate when conditioning.
         :param eligibility: None (default) or 'phylogroup'.  With 'phylogroup', events for
                             each trait are restricted to the phylogroups (subtrees below
@@ -423,6 +425,8 @@ class TreeSimulator:
                             fewer than adapt_alpha of replicates (i.e. the absence is
                             unexpected unless the lineage is closed to the trait).
         :param adapt_alpha: Threshold for eligibility='adaptive'.
+        :param branch_cap: None (default), 'iqr' or a float.  'iqr' simulates with the same
+                           branch-length cap used for the ACR rate denominators.
         """
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
@@ -438,6 +442,7 @@ class TreeSimulator:
         self._eligibility    = eligibility
         self._phylogroup_depth = phylogroup_depth
         self._adapt_alpha    = adapt_alpha
+        self._branch_cap     = branch_cap
         self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged,
                                     seed=seed)
 
@@ -534,9 +539,10 @@ class TreeSimulator:
             traits_to_simulate_pastml['gain_subsize'] = allowed_bl
             traits_to_simulate_pastml['loss_subsize'] = allowed_bl
         elif getattr(self, '_eligibility', None) == 'adaptive':
-            from .simulation import sim_bit, condition_on_prevalence, adaptive_phylogroup_mask
+            from .simulation import (sim_bit, condition_on_prevalence, condition_on_footprint,
+                                     pack_observed, adaptive_phylogroup_mask)
             trials = 64
-            cond = getattr(self, '_condition', None) == 'prevalence' and self._oversample > 1
+            cond = getattr(self, '_condition', None) in ('prevalence', 'footprint') and self._oversample > 1
             obs_prev = self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index).mean().to_numpy()
             pass_seed = None if seed is None else seed + 3
             import contextlib, io
@@ -544,10 +550,16 @@ class TreeSimulator:
                 first = sim_bit(self.tree, traits_to_simulate_pastml,
                                 trials=trials * self._oversample if cond else trials,
                                 seed=pass_seed, emergence=getattr(self, '_emergence', 'dist'),
-                                emergence_scale=getattr(self, '_emergence_scale', 1.0))
-            if cond:
+                                emergence_scale=getattr(self, '_emergence_scale', 1.0),
+                                branch_cap=self._resolved_branch_cap())
+            if cond and self._condition == 'prevalence':
                 first = condition_on_prevalence(first, obs_prev, trials,
                                                 seed=None if seed is None else seed + 4)
+            elif cond:
+                obs_tr = self.obsdf_modified.reindex(index=[l.name for l in self.tree],
+                                                     columns=traits_to_simulate_pastml.index).to_numpy()
+                first = condition_on_footprint(self.tree, first, pack_observed(obs_tr), trials,
+                                               seed=None if seed is None else seed + 4)
             gm, lm, frac, n_excl = adaptive_phylogroup_mask(
                 self.tree, first, trials, self.obsdf_modified, list(traits_to_simulate),
                 traits_to_simulate_pastml['root_state'], self._phylogroup_depth, self._adapt_alpha,
@@ -590,6 +602,9 @@ class TreeSimulator:
             oversample=getattr(self, '_oversample', 8),
             obs_prevalence=self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index)
                                .mean().to_numpy(),
+            obs_traits=self.obsdf_modified.reindex(index=[l.name for l in self.tree],
+                                                   columns=traits_to_simulate_pastml.index).to_numpy(),
+            branch_cap=self._resolved_branch_cap(),
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
@@ -599,6 +614,15 @@ class TreeSimulator:
 
         self._multiple_test_correction(alpha)
     
+    def _resolved_branch_cap(self):
+        cap = getattr(self, '_branch_cap', None)
+        if cap is None or cap == 'none':
+            return None
+        if cap == 'iqr':
+            from .simulation import iqr_branch_cap
+            return iqr_branch_cap(self.tree)
+        return float(cap)
+
     def _multiple_test_correction(self,alpha = 0.05):
         # get uncorrected results
         res = self.simulation_result
