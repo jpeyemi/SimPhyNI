@@ -568,10 +568,12 @@ def flag_uncalibratable_traits(
 ### Simulation Methods
 
 def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
-                         gain_mask=None, loss_mask=None, gamma=False, seed=None):
+                         gain_mask=None, loss_mask=None, gamma=False, seed=None,
+                         emergence='dist', emergence_scale=1.0):
 
     sim = sim_bit(tree=tree, trait_params=trait_params, trials=trials,
-                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed)
+                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed,
+                  emergence=emergence, emergence_scale=emergence_scale)
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
@@ -584,8 +586,11 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
     return res
 
 
+EMERGENCE_MODES = ('dist', 'none', 'scaled', 'soft')
+
+
 def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False,
-            seed=None):
+            seed=None, emergence='dist', emergence_scale=1.0):
     """
     Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
@@ -637,6 +642,16 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                    ``np.random.default_rng(seed)`` and are reproducible.  With None
                    (default) the global ``np.random`` state is used, so callers can
                    still control it with ``np.random.seed``.
+    emergence    : how the emergence threshold (``dist`` / ``loss_dist``) gates
+                   events in distance mode (ignored in mask mode):
+                   'dist'   — events allowed once root distance >= threshold (default)
+                   'none'   — no threshold; every branch eligible
+                   'scaled' — threshold multiplied by ``emergence_scale``
+                   'soft'   — each trial draws its own threshold ~ U(0, threshold),
+                              so uncertainty in emergence time enters the null
+                   (For an MRCA clade mask use TreeSimulator.run_simulation(
+                   emergence='mrca'), which builds gain/loss masks.)
+    emergence_scale : factor for emergence='scaled'.
 
     Returns
     -------
@@ -649,6 +664,13 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
         unpack_trait_params(trait_params)
     rng = np.random if seed is None else np.random.default_rng(seed)
     use_mask = (gain_mask is not None) and (loss_mask is not None)
+    if emergence not in EMERGENCE_MODES:
+        raise ValueError(f"emergence must be one of {EMERGENCE_MODES}, got {emergence!r}")
+    if emergence == 'none':
+        dists = np.zeros_like(dists); loss_dists = np.zeros_like(loss_dists)
+    elif emergence == 'scaled':
+        dists = dists * emergence_scale; loss_dists = loss_dists * emergence_scale
+    soft = (emergence == 'soft') and not use_mask
 
     # Preprocess and setup
     node_map = {node: ind for ind, node in enumerate(tree.traverse())}
@@ -692,6 +714,12 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
         gain_rates[valid_gains] = gains[valid_gains] / gain_subsize[valid_gains]
         loss_rates[valid_losses] = losses[valid_losses] / loss_subsize[valid_losses]
 
+    if soft:
+        # Per-trial thresholds, shape (n_traits, trials)
+        gain_thr = dists[:, np.newaxis] * rng.random((num_traits, trials))
+        loss_thr = loss_dists[:, np.newaxis] * rng.random((num_traits, trials))
+        all_traits = np.ones(num_traits, dtype=bool)
+
     # Distance calculations
     node_dists = {}
     node_dists[tree] = tree.dist or 0
@@ -718,6 +746,10 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
             node_idx = node_map[node]
             applicable_traits_gains  = gain_mask[node_idx, :]
             applicable_traits_losses = loss_mask[node_idx, :]
+        elif soft:
+            # Soft mode: sample everywhere, gate per trial below
+            applicable_traits_gains  = all_traits
+            applicable_traits_losses = all_traits
         else:
             # Distance mode: global threshold gate
             applicable_traits_gains  = node_total_dist >= dists
@@ -750,6 +782,16 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                 # Zero-pad to exactly 64 columns so packbits produces one uint64
                 g_samp = np.pad(g_samp, ((0, 0), (0, bits - chunk_trials)), mode='constant')
                 l_samp = np.pad(l_samp, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+
+            if soft:
+                sl = slice(chunk_start, chunk_start + chunk_trials)
+                g_ok = (node_total_dist >= gain_thr[:, sl]).astype(np.uint8)
+                l_ok = (node_total_dist >= loss_thr[:, sl]).astype(np.uint8)
+                if chunk_trials < bits:
+                    g_ok = np.pad(g_ok, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+                    l_ok = np.pad(l_ok, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+                g_samp &= g_ok
+                l_samp &= l_ok
 
             gain_events[applicable_traits_gains,  c] = (
                 np.packbits(g_samp, axis=-1, bitorder='little').view(nptype).flatten())

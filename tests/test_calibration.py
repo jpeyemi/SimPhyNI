@@ -131,3 +131,58 @@ def test_seed_makes_results_reproducible():
     a, b, c = _small_sim(11), _small_sim(11, cores=1), _small_sim(12)
     pd.testing.assert_frame_equal(a, b)          # independent of worker count
     assert not np.allclose(a["pval_naive"], c["pval_naive"])
+
+
+def _deep_threshold_case():
+    import random
+    from ete3 import Tree
+    random.seed(3)
+    t = Tree()
+    t.populate(60, random_branches=True)
+    for i, n in enumerate(t.traverse()):
+        if not n.is_leaf():
+            n.name = f"n{i}"
+    depth = max(t.get_distance(l) for l in t)
+    tp = pd.DataFrame({"gains": [5.0], "losses": [5.0], "dist": [0.6 * depth],
+                       "loss_dist": [0.6 * depth], "gain_subsize": [1.0], "loss_subsize": [1.0],
+                       "root_state": [0]}, index=["g"])
+    return t, tp
+
+
+def _prevalence(lineages, trials):
+    bits = np.unpackbits(lineages.view(np.uint8), bitorder="little")
+    return bits.reshape(lineages.shape[0], -1)[:, :trials].mean()
+
+
+def test_emergence_modes_order_prevalence():
+    from simphyni.Simulation.simulation import sim_bit
+    t, tp = _deep_threshold_case()
+    prev = {m: _prevalence(sim_bit(t, tp, trials=128, emergence=m, emergence_scale=0.5, seed=1), 128)
+            for m in ("dist", "scaled", "soft", "none")}
+    assert prev["dist"] < prev["scaled"] < prev["none"]
+    assert prev["dist"] < prev["soft"] < prev["none"]
+    assert abs(prev["none"] - 0.5) < 0.1          # equal gain/loss rates -> ~50 %
+    with pytest.raises(ValueError):
+        sim_bit(t, tp, emergence="bogus")
+
+
+@pytest.mark.parametrize("emergence,kw", [("none", {}), ("soft", {}), ("scaled", {"emergence_scale": 0.5}),
+                                          ("mrca", {}), ("mrca", {"mrca_subsize": "original"})])
+def test_emergence_modes_run_end_to_end(emergence, kw):
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    import random
+    random.seed(5)
+    rng = np.random.default_rng(5)
+    t = Tree()
+    t.populate(40, random_branches=True)
+    obs = pd.DataFrame((rng.random((40, 4)) < 0.4).astype(float), index=t.get_leaf_names(),
+                       columns=list("abcd"))
+    params = pd.DataFrame({"gene": list("abcd"), "gains": 3.0, "losses": 3.0, "dist": 0.1,
+                           "loss_dist": 0.0, "gain_subsize": 1.0, "loss_subsize": 1.0,
+                           "root_state": 0})
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=1, seed=0, emergence=emergence, **kw)
+    res = sim.get_results()
+    assert len(res) == 6 and res["pval_naive"].between(0, 1).all()

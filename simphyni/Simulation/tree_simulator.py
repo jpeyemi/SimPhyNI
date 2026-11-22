@@ -371,7 +371,8 @@ class TreeSimulator:
         return valid_pairs, stats
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
-                       gamma=False, include_flagged=True, use_clade_mask=False, seed=None):
+                       gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
+                       emergence='dist', emergence_scale=1.0, mrca_subsize='mrca'):
         """
         Runs the tree simulation and stores results.
 
@@ -391,11 +392,24 @@ class TreeSimulator:
                                 pairs are excluded from the results (and counted as p=1 in
                                 multiple-testing correction).
         :param seed: Optional int.  Makes simulation and KDE jitter reproducible.
+        :param emergence: Emergence-threshold handling: 'dist' (default; global root-distance
+                          threshold from ACR), 'none', 'scaled' (threshold x emergence_scale),
+                          'soft' (per-trial threshold ~ U(0, threshold)), or 'mrca' (events
+                          restricted to the subtree under the MRCA of tips that differ from
+                          the root state; same as use_clade_mask=True).
+        :param emergence_scale: Factor used by emergence='scaled'.
+        :param mrca_subsize: For emergence='mrca': 'mrca' recomputes rate denominators as the
+                             MRCA subtree branch length; 'original' keeps the ACR denominators.
         """
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
         self._gene_order     = gene_order or []
+        if emergence == 'mrca':
+            use_clade_mask = True
         self._use_clade_mask = use_clade_mask and (gain_mask is None)
+        self._emergence      = 'dist' if emergence == 'mrca' else emergence
+        self._emergence_scale = emergence_scale
+        self._mrca_subsize   = mrca_subsize
         self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged,
                                     seed=seed)
 
@@ -491,9 +505,10 @@ class TreeSimulator:
             )
             # Recalibrate subsize to the MRCA subtree branch length so the
             # Poisson rate (count / subsize) matches the eligible region.
-            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
-            traits_to_simulate_pastml['gain_subsize'] = mrca_bl
-            traits_to_simulate_pastml['loss_subsize'] = mrca_bl
+            if getattr(self, '_mrca_subsize', 'mrca') == 'mrca':
+                traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+                traits_to_simulate_pastml['gain_subsize'] = mrca_bl
+                traits_to_simulate_pastml['loss_subsize'] = mrca_bl
         elif getattr(self, '_gain_mask', None) is not None and self._gene_order:
             # Legacy: explicit mask passed by the caller
             col_idx = [self._gene_order.index(g) for g in traits_to_simulate
@@ -506,6 +521,8 @@ class TreeSimulator:
             tree=self.tree, trait_params=traits_to_simulate_pastml,
             pairs=self.pairs, obspairs=self.obspairs, cores=cores,
             gain_mask=gm, loss_mask=lm, gamma=gamma, seed=seed,
+            emergence=getattr(self, '_emergence', 'dist'),
+            emergence_scale=getattr(self, '_emergence_scale', 1.0),
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']

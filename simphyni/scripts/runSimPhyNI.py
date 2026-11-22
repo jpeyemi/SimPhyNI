@@ -45,6 +45,10 @@ def main():
             "(Default: enabled)"
         ),
     )
+    parser.add_argument("--emergence", choices=["dist", "none", "scaled", "soft", "mrca"],
+                        default="dist", help="Emergence-threshold handling (default: dist)")
+    parser.add_argument("--emergence-scale", type=float, default=1.0,
+                        help="Threshold multiplier for --emergence scaled (default: 1.0)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
@@ -104,7 +108,8 @@ def main():
     # ----------------------
     print("Running SimPhyNI analysis...")
     Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged,
-                       use_clade_mask=False, seed=args.seed)
+                       use_clade_mask=False, seed=args.seed,
+                       emergence=args.emergence, emergence_scale=args.emergence_scale)
 
     # ----------------------
     # Save Outputs
