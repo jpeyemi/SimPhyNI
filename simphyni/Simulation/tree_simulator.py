@@ -379,7 +379,9 @@ class TreeSimulator:
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
                        gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
-                       emergence='dist', emergence_scale=1.0, mrca_subsize='mrca'):
+                       emergence='dist', emergence_scale=1.0, mrca_subsize='mrca',
+                       condition=None, oversample=8,
+                       eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05):
         """
         Runs the tree simulation and stores results.
 
@@ -407,6 +409,20 @@ class TreeSimulator:
         :param emergence_scale: Factor used by emergence='scaled'.
         :param mrca_subsize: For emergence='mrca': 'mrca' recomputes rate denominators as the
                              MRCA subtree branch length; 'original' keeps the ACR denominators.
+        :param condition: None (default) or 'prevalence'.  With 'prevalence', each trait's
+                          null keeps the simulated replicates whose prevalence is closest
+                          to the observed one (out of trials * oversample simulated).
+        :param oversample: Replicates simulated per kept replicate when conditioning.
+        :param eligibility: None (default) or 'phylogroup'.  With 'phylogroup', events for
+                            each trait are restricted to the phylogroups (subtrees below
+                            the branches crossing phylogroup_depth x tree depth) in which
+                            the trait's non-root state is observed.
+        :param phylogroup_depth: Depth fraction at which phylogroups are cut.
+                            'adaptive' excludes a phylogroup only when the trait is absent
+                            from it AND an unrestricted null simulation leaves it empty in
+                            fewer than adapt_alpha of replicates (i.e. the absence is
+                            unexpected unless the lineage is closed to the trait).
+        :param adapt_alpha: Threshold for eligibility='adaptive'.
         """
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
@@ -417,6 +433,11 @@ class TreeSimulator:
         self._emergence      = 'dist' if emergence == 'mrca' else emergence
         self._emergence_scale = emergence_scale
         self._mrca_subsize   = mrca_subsize
+        self._condition      = condition
+        self._oversample     = oversample
+        self._eligibility    = eligibility
+        self._phylogroup_depth = phylogroup_depth
+        self._adapt_alpha    = adapt_alpha
         self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged,
                                     seed=seed)
 
@@ -502,7 +523,42 @@ class TreeSimulator:
 
         # Build per-trait eligibility masks for simulation
         gm = lm = None
-        if self._use_clade_mask:
+        if getattr(self, '_eligibility', None) == 'phylogroup':
+            from .simulation import build_phylogroup_mask
+            gm, lm, allowed_bl = build_phylogroup_mask(
+                self.tree, self.obsdf_modified, list(traits_to_simulate),
+                traits_to_simulate_pastml['root_state'], self._phylogroup_depth,
+            )
+            # Rate denominator = eligible branch length (as for the MRCA mask)
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = allowed_bl
+            traits_to_simulate_pastml['loss_subsize'] = allowed_bl
+        elif getattr(self, '_eligibility', None) == 'adaptive':
+            from .simulation import sim_bit, condition_on_prevalence, adaptive_phylogroup_mask
+            trials = 64
+            cond = getattr(self, '_condition', None) == 'prevalence' and self._oversample > 1
+            obs_prev = self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index).mean().to_numpy()
+            pass_seed = None if seed is None else seed + 3
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = sim_bit(self.tree, traits_to_simulate_pastml,
+                                trials=trials * self._oversample if cond else trials,
+                                seed=pass_seed, emergence=getattr(self, '_emergence', 'dist'),
+                                emergence_scale=getattr(self, '_emergence_scale', 1.0))
+            if cond:
+                first = condition_on_prevalence(first, obs_prev, trials,
+                                                seed=None if seed is None else seed + 4)
+            gm, lm, frac, n_excl = adaptive_phylogroup_mask(
+                self.tree, first, trials, self.obsdf_modified, list(traits_to_simulate),
+                traits_to_simulate_pastml['root_state'], self._phylogroup_depth, self._adapt_alpha,
+            )
+            self.excluded_phylogroups = pd.Series(n_excl, index=list(traits_to_simulate))
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = traits_to_simulate_pastml['gain_subsize'] * frac
+            traits_to_simulate_pastml['loss_subsize'] = traits_to_simulate_pastml['loss_subsize'] * frac
+        elif getattr(self, '_eligibility', None) not in (None, 'none'):
+            raise ValueError(f"eligibility must be None, 'phylogroup' or 'adaptive', got {self._eligibility!r}")
+        elif self._use_clade_mask:
             from .simulation import build_clade_mask
             root_states = traits_to_simulate_pastml['root_state']
             gm, lm, mrca_bl = build_clade_mask(
@@ -530,6 +586,10 @@ class TreeSimulator:
             gain_mask=gm, loss_mask=lm, gamma=gamma, seed=seed,
             emergence=getattr(self, '_emergence', 'dist'),
             emergence_scale=getattr(self, '_emergence_scale', 1.0),
+            condition=getattr(self, '_condition', None),
+            oversample=getattr(self, '_oversample', 8),
+            obs_prevalence=self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index)
+                               .mean().to_numpy(),
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']

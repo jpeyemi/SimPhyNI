@@ -216,3 +216,102 @@ def test_positive_collapse_threshold_is_deterministic():
     assert len(results) == 1
     leaves = next(iter(results))[0]
     assert "n1" in leaves and "A" not in leaves      # A,B merged into n1
+
+
+def test_condition_on_prevalence_selects_closest_replicates():
+    from simphyni.Simulation.simulation import condition_on_prevalence
+    rng = np.random.default_rng(0)
+    n_tips, trials, over = 100, 64, 8
+    prev = np.linspace(0.0, 0.8, trials * over)                 # replicate j has prevalence ~prev[j]
+    bits = (rng.random((n_tips, 1, trials * over)) < prev).astype(np.uint8)
+    packed = np.packbits(bits, axis=-1, bitorder="little").view(np.uint64)
+    out = condition_on_prevalence(packed, np.array([0.3]), trials, seed=1)
+    kept = np.unpackbits(out.view(np.uint8), axis=-1, bitorder="little").reshape(n_tips, 1, -1)[:, :, :trials]
+    p = kept.mean(axis=0).ravel()
+    assert out.shape == (n_tips, 1, 1)
+    assert abs(np.median(p) - 0.3) < 0.03 and p.min() > 0.15 and p.max() < 0.45
+
+
+def test_conditioning_off_is_unchanged():
+    a = _small_sim(21)
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    import random
+    random.seed(7)
+    rng = np.random.default_rng(7)
+    t = Tree()
+    t.populate(50, random_branches=True)
+    obs = pd.DataFrame((rng.random((50, 5)) < 0.4).astype(float), index=t.get_leaf_names(), columns=list("abcde"))
+    params = pd.DataFrame({"gene": list("abcde"), "gains": 3.0, "losses": 3.0, "dist": 0.0, "loss_dist": 0.0,
+                           "gain_subsize": 1.0, "loss_subsize": 1.0, "root_state": 0})
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=2, seed=21, condition=None, eligibility=None)
+    b = sim.get_results().sort_values(["T1", "T2"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_phylogroup_mask_confines_events_to_occupied_groups():
+    from ete3 import Tree
+    from simphyni.Simulation.simulation import build_phylogroup_mask, phylogroups
+    t = Tree("((A:1,B:1)x:1,((C:1,D:1)y:0.5,E:1.5)z:1,F:0.1)root;", format=1)
+    group, n = phylogroups(t, 0.3)
+    assert n == 3 and group[t & "x"] == group[t & "A"] and group[t] == -1
+    obs = pd.DataFrame({"g": [1, 0, 0, 0, 0, 0], "all": [1, 1, 1, 1, 1, 0], "inv": [1, 1, 1, 1, 1, 0]},
+                       index=list("ABCDEF"), dtype=float)
+    gm, lm, bl = build_phylogroup_mask(t, obs, ["g", "all", "inv"],
+                                       pd.Series({"g": 0, "all": 0, "inv": 1}), 0.3)
+    names = [n.name for n in t.traverse()]
+    assert sorted(np.array(names)[gm[:, 0]]) == ["A", "B", "x"] and bl[0] == 3.0
+    assert gm[:, 1].sum() == len(names) - 2          # 'all' misses group F only -> F and root excluded
+    assert sorted(np.array(names)[gm[:, 2]]) == ["F"]  # root state 1: only F differs
+    assert (gm == lm).all()
+
+
+def test_phylogroup_eligibility_runs_end_to_end():
+    res_kw = dict(eligibility="phylogroup", phylogroup_depth=0.2, condition="prevalence", oversample=4)
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    import random
+    random.seed(9)
+    rng = np.random.default_rng(9)
+    t = Tree()
+    t.populate(60, random_branches=True)
+    obs = pd.DataFrame((rng.random((60, 4)) < 0.3).astype(float), index=t.get_leaf_names(), columns=list("abcd"))
+    params = pd.DataFrame({"gene": list("abcd"), "gains": 3.0, "losses": 3.0, "dist": 0.0, "loss_dist": 0.0,
+                           "gain_subsize": 1.0, "loss_subsize": 1.0, "root_state": 0})
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=1, seed=3, emergence="none", **res_kw)
+    res = sim.get_results()
+    assert len(res) == 6 and res["pval_naive"].between(0, 1).all()
+
+
+def test_adaptive_phylogroup_excludes_only_when_absence_is_unexpected():
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    import random
+    random.seed(11)
+    rng = np.random.default_rng(11)
+    # two deep clades of 60 tips each joined by long stems -> two phylogroups
+    a, b = Tree(), Tree()
+    a.populate(60, random_branches=True); b.populate(60, random_branches=True)
+    for sub, tag in ((a, "a"), (b, "b")):
+        for i, l in enumerate(sub.get_leaves()):
+            l.name = f"{tag}{i}"
+    root = Tree(); root.add_child(a, dist=2.0); root.add_child(b, dist=2.0)
+    leaves = root.get_leaf_names()
+    in_a = np.array([n.startswith("a") for n in leaves])
+    busy = np.where(in_a, rng.random(len(leaves)) < 0.5, 0)          # many changes, only in clade a
+    sparse = np.zeros(len(leaves)); sparse[np.where(in_a)[0][:6]] = 1  # a few tips in clade a
+    obs = pd.DataFrame({"busy": busy, "sparse": sparse}, index=leaves, dtype=float)
+    total = sum(n.dist for n in root.traverse())
+    params = pd.DataFrame({"gene": ["busy", "sparse"], "gains": [40.0, 1.0], "losses": [40.0, 0.5],
+                           "dist": 0.0, "loss_dist": 0.0, "gain_subsize": total, "loss_subsize": total,
+                           "root_state": 0})
+    sim = TreeSimulator(root.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=1, seed=5, emergence="none", eligibility="adaptive", phylogroup_depth=0.3)
+    ex = sim.excluded_phylogroups
+    assert ex["busy"] >= 1        # absence from clade b is implausible under the null -> closed
+    assert ex["sparse"] == 0      # absence is expected for a rare trait -> left open

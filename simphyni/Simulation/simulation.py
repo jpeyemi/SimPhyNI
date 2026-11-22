@@ -389,6 +389,142 @@ def build_clade_mask(
 
 
 # ---------------------------------------------------------------------------
+# build_phylogroup_mask: restrict events to phylogroups where a trait occurs
+# ---------------------------------------------------------------------------
+
+def phylogroups(tree, depth_frac: float = 0.2):
+    """Partition the tree into phylogroups by cutting at a fraction of its depth.
+
+    A phylogroup is the subtree below each branch that crosses depth
+    ``depth_frac * max_root_to_tip``.  Tips shallower than the cut form their
+    own group.  Returns (node -> group id or -1 for backbone nodes, n_groups).
+    """
+    depth = {}
+    for n in tree.traverse("preorder"):
+        depth[n] = 0.0 if n.up is None else depth[n.up] + n.dist
+    cut = depth_frac * max(depth[l] for l in tree.get_leaves())
+    group = {}
+    n_groups = 0
+    for n in tree.traverse("preorder"):
+        if n.up is None:
+            group[n] = -1
+        elif group[n.up] >= 0:
+            group[n] = group[n.up]
+        elif depth[n] >= cut or n.is_leaf():
+            group[n] = n_groups
+            n_groups += 1
+        else:
+            group[n] = -1
+    return group, n_groups
+
+
+def build_phylogroup_mask(tree, obsdf: pd.DataFrame, gene_order: list, root_states,
+                          depth_frac: float = 0.2):
+    """(n_nodes, n_traits) gain/loss eligibility restricted to occupied phylogroups.
+
+    For each trait, a phylogroup is "occupied" if any of its tips carries the
+    non-root state.  Events are allowed only on branches inside occupied
+    phylogroups (including each group's stem branch).  Backbone branches above
+    the cut are allowed only when every phylogroup is occupied, in which case
+    the trait is unrestricted.
+
+    This encodes that some traits never enter some lineages (e.g. genes
+    confined to one species or phylogroup of a multi-species tree) while
+    still letting the null move the trait anywhere within those lineages.
+
+    Returns (gain_mask, loss_mask, allowed_bl) where allowed_bl is the total
+    branch length of eligible branches, used as the rate denominator.
+    """
+    node_list = list(tree.traverse())
+    group, n_groups = phylogroups(tree, depth_frac)
+    node_group = np.array([group[n] for n in node_list])
+    bl = np.array([0.0 if n.up is None else n.dist for n in node_list])
+    leaves = [n for n in node_list if n.is_leaf()]
+    leaf_group = np.array([group[l] for l in leaves])
+    leaf_names = [l.name for l in leaves]
+    mask = np.zeros((len(node_list), len(gene_order)), dtype=bool)
+    allowed_bl = np.zeros(len(gene_order))
+    for t, gene in enumerate(gene_order):
+        rs = int(root_states.loc[gene] if hasattr(root_states, "loc") else root_states[gene])
+        if gene not in obsdf.columns:
+            mask[:, t] = True
+        else:
+            vals = obsdf[gene].reindex(leaf_names).to_numpy(dtype=float)
+            hit = np.isfinite(vals) & (vals.astype(float) != rs)
+            occupied = np.unique(leaf_group[hit])
+            if len(occupied) >= n_groups:
+                mask[:, t] = True
+            else:
+                mask[:, t] = np.isin(node_group, occupied)
+        allowed_bl[t] = bl[mask[:, t]].sum()
+    return mask, mask.copy(), allowed_bl
+
+
+def adaptive_phylogroup_mask(tree, lineages, trials, obsdf: pd.DataFrame, gene_order: list,
+                             root_states, depth_frac: float = 0.2, alpha: float = 0.05,
+                             block: int = 256):
+    """Posterior-predictive phylogroup restriction.
+
+    ``lineages`` is an *unrestricted* null simulation (n_tips, n_traits,
+    n_chunks) for ``gene_order``, tips in ``tree`` leaf order.  For each trait
+    and each phylogroup in which the trait's non-root state is NOT observed,
+    compute the fraction of simulated replicates that also leave that group
+    without the non-root state.  If that fraction is below ``alpha`` the
+    unrestricted model would almost always have put the trait there, so the
+    observed absence is evidence the lineage is closed to it: the group is
+    excluded.  Groups whose emptiness is plausible under the null (e.g. for
+    sparse traits) stay eligible, so the restriction only bites when the data
+    support it.
+
+    Returns (gain_mask, loss_mask, eligible_frac, n_excluded) where
+    eligible_frac is the share of total branch length that remains eligible
+    (used to rescale the rate denominator) and n_excluded counts excluded
+    groups per trait.
+    """
+    node_list = list(tree.traverse())
+    group, n_groups = phylogroups(tree, depth_frac)
+    node_group = np.array([group[n] for n in node_list])
+    bl = np.array([0.0 if n.up is None else n.dist for n in node_list])
+    leaves = list(tree)                                 # same order as sim_bit lineages
+    leaf_group = np.array([group[l] for l in leaves])
+    leaf_names = [l.name for l in leaves]
+    G = np.zeros((len(leaves), n_groups), dtype=np.float32)
+    G[np.arange(len(leaves)), leaf_group] = 1.0
+
+    rs = np.array([int(root_states.loc[g] if hasattr(root_states, "loc") else root_states[g])
+                   for g in gene_order])
+    n_traits = len(gene_order)
+    mask = np.ones((len(node_list), n_traits), dtype=bool)
+    eligible_frac = np.ones(n_traits)
+    n_excluded = np.zeros(n_traits, dtype=int)
+    total_bl = bl.sum()
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(len(leaves), e - s, -1)[:, :, :trials].astype(np.float32)
+        for j in range(e - s):
+            t = s + j
+            gene = gene_order[t]
+            nonroot = bits[:, j, :] if rs[t] == 0 else 1.0 - bits[:, j, :]     # tips x trials
+            per_group = G.T @ nonroot                                           # groups x trials
+            p_empty = (per_group == 0).mean(axis=1)                             # groups
+            if gene in obsdf.columns:
+                v = obsdf[gene].reindex(leaf_names).to_numpy(dtype=float)
+                hit = np.isfinite(v) & (v != rs[t])
+                occupied = np.zeros(n_groups, bool)
+                occupied[np.unique(leaf_group[hit])] = True
+            else:
+                occupied = np.ones(n_groups, bool)
+            excluded = (~occupied) & (p_empty < alpha)
+            if excluded.any():
+                allowed = ~excluded
+                mask[:, t] = (node_group >= 0) & allowed[np.maximum(node_group, 0)]
+                eligible_frac[t] = bl[mask[:, t]].sum() / total_bl if total_bl > 0 else 1.0
+                n_excluded[t] = int(excluded.sum())
+    return mask, mask.copy(), eligible_frac, n_excluded
+
+
+# ---------------------------------------------------------------------------
 # flag_uncalibratable_traits: data-driven detection of miscalibrated nulls
 # ---------------------------------------------------------------------------
 
@@ -567,13 +703,65 @@ def flag_uncalibratable_traits(
 
 ### Simulation Methods
 
+def condition_on_prevalence(lineages, target_prev, trials, seed=None, block=256):
+    """Keep, per trait, the ``trials`` simulated replicates whose tip prevalence
+    is closest to the observed prevalence.
+
+    lineages    : (n_tips, n_traits, n_chunks_big) uint64 from sim_bit run with
+                  trials_big = trials * oversample replicates
+    target_prev : (n_traits,) observed prevalence (NaN -> no conditioning)
+    Returns (n_tips, n_traits, ceil(trials/64)) uint64.
+
+    This conditions each trait's null on its observed marginal, the way
+    Fisher's exact test conditions on the table margins.  Without it, traits
+    with few events are simulated with the right number of events but the
+    wrong footprint (events land on short tip branches), so their simulated
+    copies are far rarer and less clade-like than the observed trait and the
+    null co-occurrence spread is too narrow.
+    """
+    n_tips, n_traits, _ = lineages.shape
+    n_chunks, _ = _chunk_info(trials)
+    rng = np.random.default_rng(seed)
+    out = np.zeros((n_tips, n_traits, n_chunks), dtype=np.uint64)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(n_tips, e - s, -1)                          # tips x traits x trials_big
+        prev = bits.mean(axis=0)                                         # traits x trials_big
+        tgt = np.asarray(target_prev[s:e], dtype=float)[:, None]
+        dist = np.abs(prev - np.where(np.isfinite(tgt), tgt, prev))
+        dist = dist + rng.random(dist.shape) * 1e-9                     # random tie-break
+        idx = np.argsort(dist, axis=1)[:, :trials]                       # traits x trials
+        sel = np.take_along_axis(bits, idx[None, :, :], axis=2)          # tips x traits x trials
+        pad = n_chunks * 64 - trials
+        if pad:
+            sel = np.pad(sel, ((0, 0), (0, 0), (0, pad)))
+        out[:, s:e, :] = np.packbits(sel, axis=-1, bitorder="little").view(np.uint64)
+    return out
+
+
 def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
                          gain_mask=None, loss_mask=None, gamma=False, seed=None,
-                         emergence='dist', emergence_scale=1.0):
+                         emergence='dist', emergence_scale=1.0,
+                         condition=None, oversample=8, obs_prevalence=None):
+    """Simulate the null for every trait and score all pairs.
 
-    sim = sim_bit(tree=tree, trait_params=trait_params, trials=trials,
+    condition : None | 'prevalence'.  With 'prevalence', ``trials * oversample``
+                replicates are simulated per trait and the ``trials`` closest
+                to ``obs_prevalence`` (aligned to trait_params rows) are kept.
+    """
+    if condition not in (None, 'none', 'prevalence'):
+        raise ValueError(f"condition must be None or 'prevalence', got {condition!r}")
+    conditioned = condition == 'prevalence' and oversample > 1
+    sim = sim_bit(tree=tree, trait_params=trait_params,
+                  trials=trials * oversample if conditioned else trials,
                   gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed,
                   emergence=emergence, emergence_scale=emergence_scale)
+    if conditioned:
+        if obs_prevalence is None:
+            raise ValueError("condition='prevalence' needs obs_prevalence")
+        sim = condition_on_prevalence(sim, np.asarray(obs_prevalence, float), trials,
+                                      seed=None if seed is None else seed + 2)
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
