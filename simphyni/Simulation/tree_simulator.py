@@ -162,46 +162,53 @@ class TreeSimulator:
         Combine leaves i,j of the obeserved trait dataframe, `obsdf`, for all leaves within
         a distacnce of threshold from eachother. Does not mutate original obsdf 
 
-        :param threshold: a fraction of the longest branch length from root to tip
-        :returns: new dataframe of combined leaves
+        :param threshold: a fraction of the longest branch length from root to tip.
+                          ``threshold <= 0`` (the default) disables collapsing: the tree is
+                          only pruned to the samples present in ``obsdf``.
+        :returns: new dataframe of combined leaves, rows in tree leaf order
         """
         assert(type(self.tree) == TreeNode)
-        # if threshold == 0: 
-        #     treeleaves = set(self.tree.get_leaf_names())
-        #     self.tree.prune([i for i in self.obsdf.index if i in treeleaves], preserve_branch_length=True)
-        #     return self.obsdf.copy()
-        
+        tree_leaves = set(self.tree.get_leaf_names())
+        keep = [i for i in self.obsdf.index if i in tree_leaves]
+        self.tree.prune(keep, preserve_branch_length=True)
+        if threshold <= 0:
+            # Previously `distance <= 0` still merged sister tips joined by
+            # zero-length branches (common in PanX / NJ trees), keeping one
+            # tip's traits and discarding the other's, in an order that
+            # depended on memory addresses.  Threshold 0 now means "no merge".
+            return self.obsdf.loc[self.tree.get_leaf_names()].copy()
+
         threshold = self.tree.get_distance(self.tree,self.tree.get_farthest_leaf()[0]) * threshold
         obsdf = self.obsdf.copy()
-        self.tree.prune([i for i in self.obsdf.index if i in set(self.tree.get_leaf_names())], preserve_branch_length=True)
-        node_queue = set(self.tree.get_leaves())
-        to_prune = set()
+        # Ordered queue (dict keys keep insertion order) so the result is
+        # deterministic; a set of nodes iterates in memory-address order.
+        node_queue = dict.fromkeys(self.tree.get_leaves())
+        to_prune = {}
         while(node_queue):
-            current_node: TreeNode = node_queue.pop()
+            current_node: TreeNode = next(iter(node_queue))
+            del node_queue[current_node]
             sisters = current_node.get_sisters()
             if not sisters:
-                to_prune.add(current_node)
+                to_prune[current_node] = None
                 continue
             sibling: TreeNode = sisters[0]
             if not sibling.is_leaf():
-                to_prune.add(current_node)
+                to_prune[current_node] = None
                 continue
             distance = current_node.dist + sibling.dist
             if distance <= threshold:
                 if current_node.up:
                     # Choosing first node seen as rep
                     obsdf.loc[current_node.up.name] = obsdf.loc[current_node.name]
-                    node_queue.add(current_node.up)
+                    node_queue[current_node.up] = None
             else:
-                to_prune.add(current_node)
-                to_prune.add(sibling)
-            if sibling in node_queue:
-                node_queue.remove(sibling)
-        
-        # print(obsdf.index)
-        self.tree.prune(to_prune, preserve_branch_length= True)
+                to_prune[current_node] = None
+                to_prune[sibling] = None
+            node_queue.pop(sibling, None)
+
+        self.tree.prune(list(to_prune), preserve_branch_length= True)
         obsdf[obsdf>1]=1
-        return obsdf.loc(axis = 0)[tuple(map(lambda x: x.name, to_prune))]
+        return obsdf.loc(axis = 0)[[n.name for n in self.tree.get_leaves()]]
 
     @staticmethod
     def count_unique_pairs(vars, targets) -> int:

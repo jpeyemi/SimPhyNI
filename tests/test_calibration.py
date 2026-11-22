@@ -186,3 +186,33 @@ def test_emergence_modes_run_end_to_end(emergence, kw):
     sim.run_simulation(cores=1, seed=0, emergence=emergence, **kw)
     res = sim.get_results()
     assert len(res) == 6 and res["pval_naive"].between(0, 1).all()
+
+
+def _cherry_sim(threshold):
+    from simphyni import TreeSimulator
+    nwk = "((A:0,B:0)n1:0.1,(C:0.2,D:0.3)n2:0.1,E:0.5)root;"
+    obs = pd.DataFrame({"g1": [1, 0, 1, 0, 1], "g2": [0, 1, 1, 0, 0]}, index=list("ABCDE")).astype(float)
+    pm = pd.DataFrame({"gene": ["g1", "g2"], "gains": 1.0, "losses": 1.0, "dist": 0.0, "loss_dist": 0.0,
+                       "gain_subsize": 1.0, "loss_subsize": 1.0, "root_state": 0})
+    s = TreeSimulator(nwk, pm, obs)
+    s.initialize_simulation_parameters(pre_filter=False, collapse_threshold=threshold)
+    return s
+
+
+def test_zero_length_cherries_are_not_collapsed_by_default():
+    s = _cherry_sim(0.0)
+    assert sorted(s.tree.get_leaf_names()) == list("ABCDE")
+    assert s.obsdf_modified.loc["A", "g1"] == 1 and s.obsdf_modified.loc["B", "g2"] == 1
+    assert list(s.obsdf_modified.index) == s.tree.get_leaf_names()
+
+
+def test_positive_collapse_threshold_is_deterministic():
+    results = set()
+    junk = []
+    for i in range(5):
+        junk.append([object() for _ in range(5000 * i)])   # vary memory layout
+        s = _cherry_sim(0.05)
+        results.add((tuple(s.tree.get_leaf_names()), s.obsdf_modified.to_csv()))
+    assert len(results) == 1
+    leaves = next(iter(results))[0]
+    assert "n1" in leaves and "A" not in leaves      # A,B merged into n1
