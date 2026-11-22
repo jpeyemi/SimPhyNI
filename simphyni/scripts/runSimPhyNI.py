@@ -45,6 +45,8 @@ def main():
             "(Default: enabled)"
         ),
     )
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
 
     # ----------------------
@@ -101,7 +103,8 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged, use_clade_mask=False)
+    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged,
+                       use_clade_mask=False, seed=args.seed)
 
     # ----------------------
     # Save Outputs

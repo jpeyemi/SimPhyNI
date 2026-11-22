@@ -568,22 +568,24 @@ def flag_uncalibratable_traits(
 ### Simulation Methods
 
 def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
-                         gain_mask=None, loss_mask=None, gamma=False):
+                         gain_mask=None, loss_mask=None, gamma=False, seed=None):
 
     sim = sim_bit(tree=tree, trait_params=trait_params, trials=trials,
-                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma)
+                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed)
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
 
-    res = compres(sim, pairs_index, obspairs, bits=trials)
+    res = compres(sim, pairs_index, obspairs, bits=trials, cores=cores,
+                  seed=None if seed is None else seed + 1)
 
     res['first'] = res['first'].map(mappingr)
     res['second'] = res['second'].map(mappingr)
     return res
 
 
-def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False):
+def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False,
+            seed=None):
     """
     Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
@@ -631,6 +633,10 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                    point estimate count/subsize.  This widens the null distribution
                    for traits with few events (sparse data) while having negligible
                    effect when counts are large.  Each trial receives its own rate.
+    seed         : int or None.  With an int, simulation draws come from
+                   ``np.random.default_rng(seed)`` and are reproducible.  With None
+                   (default) the global ``np.random`` state is used, so callers can
+                   still control it with ``np.random.seed``.
 
     Returns
     -------
@@ -641,6 +647,7 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
     """
     gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
         unpack_trait_params(trait_params)
+    rng = np.random if seed is None else np.random.default_rng(seed)
     use_mask = (gain_mask is not None) and (loss_mask is not None)
 
     # Preprocess and setup
@@ -669,12 +676,12 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
         # Shape: (n_traits, trials) — each trial uses an independent draw.
         gain_rates = np.zeros((num_traits, trials), dtype=float)
         loss_rates = np.zeros((num_traits, trials), dtype=float)
-        gain_rates[valid_gains] = np.random.gamma(
+        gain_rates[valid_gains] = rng.gamma(
             (gains[valid_gains] + 0.5)[:, np.newaxis],
             (1.0 / gain_subsize[valid_gains])[:, np.newaxis],
             size=(valid_gains.sum(), trials),
         )
-        loss_rates[valid_losses] = np.random.gamma(
+        loss_rates[valid_losses] = rng.gamma(
             (losses[valid_losses] + 0.5)[:, np.newaxis],
             (1.0 / loss_subsize[valid_losses])[:, np.newaxis],
             size=(valid_losses.sum(), trials),
@@ -736,8 +743,8 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                 gr = gain_rates[applicable_traits_gains,  np.newaxis]
                 lr = loss_rates[applicable_traits_losses, np.newaxis]
 
-            g_samp = (np.random.poisson(node.dist * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
-            l_samp = (np.random.poisson(node.dist * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
+            g_samp = (rng.poisson(node.dist * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
+            l_samp = (rng.poisson(node.dist * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
 
             if chunk_trials < bits:
                 # Zero-pad to exactly 64 columns so packbits produces one uint64
@@ -915,7 +922,7 @@ def compute_kde_stats(observed_value: float, simulated_values: np.ndarray) -> Tu
     return kde_pval_ant, kde_pval_syn, med, max(iqr * 1.349,1)
 
 
-def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int, total_trials: int = 64) -> Dict[str, List]:
+def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int, total_trials: int = 64, seed=None) -> Dict[str, List]:
     """
     Process a single batch of data.
     """
@@ -927,7 +934,15 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
     tq = sim_readonly[:, pair_batch[:, 1], :]
 
     batch_cooc = compute_bitwise_cooc(tp, tq, total_trials)
-    noised_batch_cooc = batch_cooc + np.random.normal(0, 1e-12, size=batch_cooc.shape)
+    # Tiny jitter keeps the KDE non-singular when all simulated scores tie.
+    # Seeded per pair (global index), so results do not depend on how pairs
+    # are split into batches or on the number of workers.
+    if seed is None:
+        noise = np.random.default_rng().normal(0, 1e-12, size=batch_cooc.shape)
+    else:
+        noise = np.stack([np.random.default_rng((seed, index + i)).normal(0, 1e-12, batch_cooc.shape[1])
+                          for i in range(batch_cooc.shape[0])])
+    noised_batch_cooc = batch_cooc + noise
 
     results = [
         compute_kde_stats(current_obspairs[i], noised_batch_cooc[i])
@@ -955,7 +970,7 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
 
     return batch_res
 
-def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000, bits: int = 64, cores: int = -1) -> pd.DataFrame:
+def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000, bits: int = 64, cores: int = -1, seed=None) -> pd.DataFrame:
     """
     Compile KDE results asynchronously using parallel batch processing.
     Optimized for time (no nested parallelism) and memory (read-only array setup).
@@ -974,13 +989,14 @@ def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size
     sim.setflags(write=False)
 
     num_pairs = len(pairs)
-    batch_size = min(int(np.ceil(num_pairs/(os.cpu_count() or 1))),batch_size)
+    n_workers = cores if cores and cores > 0 else (os.cpu_count() or 1)
+    batch_size = max(1, min(int(np.ceil(num_pairs / n_workers)), batch_size))
     batch_indices = range(0, num_pairs, batch_size)
 
     print(f"Processing Batches, Total: {num_pairs//batch_size + 1}")
 
     batch_results = Parallel(n_jobs=cores, verbose=10)(
-        delayed(process_batch)(index, sim, pairs, obspairs, batch_size, bits)
+        delayed(process_batch)(index, sim, pairs, obspairs, batch_size, bits, seed)
         for index in batch_indices
     )
 

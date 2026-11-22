@@ -106,3 +106,28 @@ def test_flagged_pairs_are_kept_and_marked_by_default(monkeypatch):
     involves_a = (res["T1"] == "a") | (res["T2"] == "a")
     assert (~res.loc[involves_a, "null_calibrated"]).all()
     assert res.loc[~involves_a, "null_calibrated"].all()
+
+
+def _small_sim(seed, cores=2):
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    import random
+    random.seed(7)                      # ete3.populate uses the stdlib RNG
+    rng = np.random.default_rng(7)
+    t = Tree()
+    t.populate(50, random_branches=True)
+    obs = pd.DataFrame((rng.random((50, 5)) < 0.4).astype(float), index=t.get_leaf_names(),
+                       columns=list("abcde"))
+    params = pd.DataFrame({"gene": list("abcde"), "gains": 3.0, "losses": 3.0, "dist": 0.0,
+                           "loss_dist": 0.0, "gain_subsize": 1.0, "loss_subsize": 1.0,
+                           "root_state": 0})
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=cores, seed=seed)
+    return sim.get_results().sort_values(["T1", "T2"]).reset_index(drop=True)
+
+
+def test_seed_makes_results_reproducible():
+    a, b, c = _small_sim(11), _small_sim(11, cores=1), _small_sim(12)
+    pd.testing.assert_frame_equal(a, b)          # independent of worker count
+    assert not np.allclose(a["pval_naive"], c["pval_naive"])

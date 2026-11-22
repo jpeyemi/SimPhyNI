@@ -30,6 +30,8 @@ base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
+_seed = str(config.get('seed', '') or '').strip()
+seed_flag = f'--seed {int(_seed)}' if _seed else ''
 include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 
 samples["MinPrev"] = samples.get("MinPrev", 0.05)
@@ -335,4 +337,5 @@ rule SimPhyNI:
         '-c {params.threads} '
         '--{prefilter} --{plot} '
         '--{save_object} '
-        '--{include_flagged}'
+        '--{include_flagged} '
+        + seed_flag

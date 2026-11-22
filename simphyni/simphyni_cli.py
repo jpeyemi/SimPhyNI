@@ -102,6 +102,7 @@ def run_simphyni(args):
         f"directory={outdir}",
         f"save_object={args.save_object}",
         f"include_flagged={args.include_flagged}",
+        f"seed={getattr(args, 'seed', None) if getattr(args, 'seed', None) is not None else ''}",
     ]
 
     # profile flag handling
@@ -177,6 +178,7 @@ def main():
     run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
     run_parser.add_argument("--include-flagged", action=argparse.BooleanOptionalAction, default=True, help="Test traits flagged as possibly miscalibrated and mark them null_calibrated=False; --no-include-flagged drops them (Default: enabled)")
+    run_parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible results (Default: unseeded)")
     run_parser.add_argument(
         "snakemake_args",
         nargs=argparse.REMAINDER,

@@ -371,7 +371,7 @@ class TreeSimulator:
         return valid_pairs, stats
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
-                       gamma=False, include_flagged=True, use_clade_mask=False):
+                       gamma=False, include_flagged=True, use_clade_mask=False, seed=None):
         """
         Runs the tree simulation and stores results.
 
@@ -390,14 +390,17 @@ class TreeSimulator:
                                 marked null_calibrated=False in the results.  If False, those
                                 pairs are excluded from the results (and counted as p=1 in
                                 multiple-testing correction).
+        :param seed: Optional int.  Makes simulation and KDE jitter reproducible.
         """
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
         self._gene_order     = gene_order or []
         self._use_clade_mask = use_clade_mask and (gain_mask is None)
-        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
+        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged,
+                                    seed=seed)
 
-    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=True):
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=True,
+                               seed=None):
         traits_to_simulate = np.unique(self.pairs.flatten())
 
         # PastML skips constant traits (< 2 unique states), so they are absent
@@ -502,7 +505,7 @@ class TreeSimulator:
         self.simulation_result = simulate_glrates_bit(
             tree=self.tree, trait_params=traits_to_simulate_pastml,
             pairs=self.pairs, obspairs=self.obspairs, cores=cores,
-            gain_mask=gm, loss_mask=lm, gamma=gamma,
+            gain_mask=gm, loss_mask=lm, gamma=gamma, seed=seed,
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
