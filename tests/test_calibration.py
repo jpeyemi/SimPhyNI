@@ -64,3 +64,45 @@ def test_total_tests_matches_enumerated_pairs_all_vs_all():
     sim = TreeSimulator(t.write(format=1), params, obs)
     sim.initialize_simulation_parameters(pre_filter=False)
     assert sim.total_tests == len(sim.pairs) == 15
+
+
+def test_flag_prevalence_gate_uses_number_of_tips():
+    from simphyni.Simulation.simulation import flag_uncalibratable_traits
+    n = 200
+    params = pd.DataFrame({
+        "gene": [f"g{i}" for i in range(n)],
+        "gains": 1.0, "losses": 0.0,
+        "gain_subsize": np.r_[np.full(n - 1, 1.0), 1e4],   # one extreme asymmetry
+        "loss_subsize": 1.0,
+        "_raw_gains": 1.0, "_raw_losses": 0.0,
+        "_raw_count": np.r_[np.full(n - 1, 45.0), 40.0],   # 40/100 tips = 40 % prevalence
+    })
+    # With 100 tips the extreme trait is at 40 % prevalence -> eligible -> flagged
+    flagged = flag_uncalibratable_traits(params, n_tips=100)
+    assert f"g{n-1}" in set(flagged["gene"])
+    # The old max-count proxy (40/45 = 89 %) wrongly exempts it
+    assert f"g{n-1}" not in set(flag_uncalibratable_traits(params)["gene"])
+
+
+def test_flagged_pairs_are_kept_and_marked_by_default(monkeypatch):
+    from ete3 import Tree
+    import simphyni.Simulation.tree_simulator as ts
+    from simphyni import TreeSimulator
+    rng = np.random.default_rng(1)
+    t = Tree()
+    t.populate(40, random_branches=True)
+    obs = pd.DataFrame((rng.random((40, 4)) < 0.4).astype(float), index=t.get_leaf_names(),
+                       columns=list("abcd"))
+    params = pd.DataFrame({"gene": list("abcd"), "gains": 2.0, "losses": 2.0, "dist": 0.0,
+                           "loss_dist": 0.0, "gain_subsize": 1.0, "loss_subsize": 1.0,
+                           "root_state": 0})
+    monkeypatch.setattr(ts, "flag_uncalibratable_traits",
+                        lambda p, **kw: pd.DataFrame({"gene": ["a"]}))
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.run_simulation(cores=1)
+    res = sim.get_results()
+    assert len(res) == 6
+    involves_a = (res["T1"] == "a") | (res["T2"] == "a")
+    assert (~res.loc[involves_a, "null_calibrated"]).all()
+    assert res.loc[~involves_a, "null_calibrated"].all()

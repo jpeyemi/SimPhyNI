@@ -398,6 +398,7 @@ def flag_uncalibratable_traits(
     rate_iqr_multiplier: float = 3.0,
     max_sparse_events: int = 5,
     max_prevalence_fraction: float = 0.80,
+    n_tips: int | None = None,
 ) -> pd.DataFrame:
     """
     Identify traits whose Poisson null distribution will be systematically
@@ -462,6 +463,10 @@ def flag_uncalibratable_traits(
         their null distributions are well-calibrated even with asymmetric rates.
         Requires ``_raw_count`` in params; if absent, no prevalence gate is
         applied.
+    n_tips : int, optional
+        Number of tips, used as the prevalence denominator.  Falls back to
+        the largest trait count in ``params`` when not given (which
+        overestimates prevalence when no trait is near fixation).
 
     Returns
     -------
@@ -505,7 +510,7 @@ def flag_uncalibratable_traits(
     sparse = (raw_gains + raw_losses) <= max_sparse_events
 
     if '_raw_count' in df.columns:
-        n_tips_est   = df['_raw_count'].max()
+        n_tips_est   = n_tips if n_tips else df['_raw_count'].max()
         prevalence   = df['_raw_count'] / n_tips_est
         low_prev     = prevalence < max_prevalence_fraction
     else:

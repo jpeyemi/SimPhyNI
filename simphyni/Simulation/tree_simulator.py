@@ -371,7 +371,7 @@ class TreeSimulator:
         return valid_pairs, stats
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
-                       gamma=False, include_flagged=False, use_clade_mask=False):
+                       gamma=False, include_flagged=True, use_clade_mask=False):
         """
         Runs the tree simulation and stores results.
 
@@ -385,11 +385,11 @@ class TreeSimulator:
                       Gamma(count + 0.5, 1/subsize) instead of using the point estimate.
                       Widens the null for traits with few events; negligible effect for
                       large counts.  Default False.
-        :param include_flagged: If False (default), pairs involving traits with miscalibrated
-                                null distributions are excluded from simulation and assigned p=0.5
-                                in multiple-testing correction.  If True, those pairs are simulated
-                                normally but marked with null_calibrated=False in the results so
-                                downstream users can distinguish them.
+        :param include_flagged: If True (default), pairs involving traits whose null
+                                distribution may be miscalibrated are simulated normally and
+                                marked null_calibrated=False in the results.  If False, those
+                                pairs are excluded from the results (and counted as p=1 in
+                                multiple-testing correction).
         """
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
@@ -397,12 +397,12 @@ class TreeSimulator:
         self._use_clade_mask = use_clade_mask and (gain_mask is None)
         self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
 
-    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=False):
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=True):
         traits_to_simulate = np.unique(self.pairs.flatten())
 
         # PastML skips constant traits (< 2 unique states), so they are absent
         # from self.pastml. Drop any pairs where either trait is missing so that
-        # those pairs fall into the p=0.5 bucket in _multiple_test_correction.
+        # those pairs fall into the p=1 bucket in _multiple_test_correction.
         pastml_traits = set(self.pastml.index)
         missing = [t for t in traits_to_simulate if t not in pastml_traits]
         if missing:
@@ -430,20 +430,21 @@ class TreeSimulator:
         # Detect traits whose Poisson null distribution is systematically
         # miscalibrated (sparse events + subsize asymmetry).
         #
-        # include_flagged=False (default): remove their pairs from simulation
-        #   so they fall into the p=0.5 bucket in _multiple_test_correction.
-        # include_flagged=True: simulate normally but annotate results with
-        #   null_calibrated=False so downstream users can distinguish them.
+        # include_flagged=True (default): simulate normally but annotate
+        #   results with null_calibrated=False so users can distinguish them.
+        # include_flagged=False: remove their pairs from the results; they
+        #   fall into the p=1 bucket in _multiple_test_correction.
         # ------------------------------------------------------------------
-        self.flagged_traits = flag_uncalibratable_traits(traits_to_simulate_pastml)
+        self.flagged_traits = flag_uncalibratable_traits(
+            traits_to_simulate_pastml, n_tips=len(self.obsdf_modified))
         if not self.flagged_traits.empty:
             flagged_genes = set(self.flagged_traits['gene'])
             n_flagged = len(flagged_genes)
             if not include_flagged:
                 print(
                     f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
-                    f"null distributions. Their pairs are excluded from simulation "
-                    f"and assigned p=0.5. Use --include-flagged to test them anyway. "
+                    f"null distributions. --no-include-flagged is set: their pairs are "
+                    f"excluded from the results (p=1 in correction). "
                     f"Access via Sim.flagged_traits for details."
                 )
                 keep_pairs = (
@@ -457,8 +458,8 @@ class TreeSimulator:
             else:
                 print(
                     f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
-                    f"null distributions. --include-flagged is set: pairs will be "
-                    f"simulated and marked null_calibrated=False in results. "
+                    f"null distributions. Their pairs are simulated and marked "
+                    f"null_calibrated=False in the results. "
                     f"Access via Sim.flagged_traits for details."
                 )
         else:

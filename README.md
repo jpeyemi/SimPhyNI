@@ -111,7 +111,7 @@ simphyni run \
 **Key flags:**
 
 * `--run-traits` — Comma-separated list of N values (e.g. `0,1,2`) to designate the first N traits in the file as query traits for a one-vs-rest comparison. Use `ALL` (default) for all-against-all. For example, `--run-traits 0,1,2` tests the first 3 traits against all others.
-* `--include-flagged` — By default, traits whose Poisson null distributions are detected as miscalibrated (sparse events combined with highly asymmetric eligible regions) are excluded from testing and assigned p=0.5. Pass `--include-flagged` to simulate these traits anyway; their results will be marked with `null_calibrated=False` in the output so you can assess them separately. Access the list of flagged traits via `Sim.get_flagged_traits()` when using the Python API.
+* `--include-flagged` / `--no-include-flagged` — Some traits are flagged as having a possibly miscalibrated null distribution (sparse events combined with highly asymmetric eligible regions). By default their pairs are tested normally and marked `null_calibrated=False` in the output so you can assess them separately. `--no-include-flagged` drops them from the results instead. Access the list of flagged traits via `Sim.get_flagged_traits()` when using the Python API.
 * `--min_prev` / `--max_prev` — Minimum and maximum tip prevalence thresholds for traits to be included (default: 0.05 / 0.95).
 * `--plot` — Generate heatmap summaries of results.
 * `--save-object` — Save the full analysis object as a `.pkl` file (not recommended for analyses > 1,000,000 trait pairs).
@@ -192,7 +192,7 @@ Contains the statistical results for all tested trait pairs.
 | `pval_bh` | Benjamini-Hochberg FDR correction (recommended for phenotype-genotype tests). |
 | `pval_by` | Benjamini-Yekutieli FDR correction (recommended for genotype-genotype tests; accounts for correlated hypotheses, which is the typical case for phylogenetically structured data). |
 | `pval_bonf` | Bonferroni correction (strictest; use when a small number of specific hypotheses are tested). |
-| `null_calibrated` | `True` for standard results. `False` for pairs involving traits whose null distributions were detected as miscalibrated (only present when `--include-flagged` is used). |
+| `null_calibrated` | `True` for standard results. `False` for pairs involving traits whose null distributions were detected as miscalibrated (see `--include-flagged`). |
 
 ### Additional Outputs
 

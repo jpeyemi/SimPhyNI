@@ -176,7 +176,7 @@ def main():
     run_parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without executing")
     run_parser.add_argument("--profile", help="Path to cluster profile folder for HPC usage")
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
-    run_parser.add_argument("--include-flagged", action=argparse.BooleanOptionalAction, default=False, help="Include traits with miscalibrated null distributions in significance testing (Default: disabled)")
+    run_parser.add_argument("--include-flagged", action=argparse.BooleanOptionalAction, default=True, help="Test traits flagged as possibly miscalibrated and mark them null_calibrated=False; --no-include-flagged drops them (Default: enabled)")
     run_parser.add_argument(
         "snakemake_args",
         nargs=argparse.REMAINDER,

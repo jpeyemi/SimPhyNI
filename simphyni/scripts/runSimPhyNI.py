@@ -36,14 +36,13 @@ def main():
     parser.add_argument(
         "--include-flagged",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Include traits with miscalibrated null distributions in significance "
-            "testing. By default these traits are excluded and their pairs assigned "
-            "p=0.5. With --include-flagged they are simulated normally and results "
-            "are annotated with a null_calibrated=False column. "
-            "Use Sim.get_flagged_traits() or check null_calibrated in the output CSV "
-            "to identify which pairs are affected. (Default: disabled)"
+            "Test traits whose null distribution may be miscalibrated (sparse events "
+            "with highly asymmetric eligible regions). Their pairs are simulated "
+            "normally and marked null_calibrated=False in the output. "
+            "--no-include-flagged drops them from the results instead. "
+            "(Default: enabled)"
         ),
     )
     args = parser.parse_args()

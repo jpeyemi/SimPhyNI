@@ -30,7 +30,7 @@ base_tmp = config.get('temp_dir', './tmp')
 prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else 'no-prefilter'
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
-include_flagged = 'include-flagged' if str(config.get('include_flagged')).lower() == 'true' else 'no-include-flagged'
+include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 
 samples["MinPrev"] = samples.get("MinPrev", 0.05)
 samples["MaxPrev"] = samples.get("MaxPrev", 0.95)
