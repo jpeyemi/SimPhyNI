@@ -512,7 +512,7 @@ class TreeSimulator:
         pvals = res['p-value'].values 
         simulated_pairs = len(pvals)
         filtered_pairs = self.total_tests - len(pvals)
-        pvals = np.concatenate((np.array(pvals),np.full(filtered_pairs,0.5)))
+        pvals = np.concatenate((np.array(pvals),np.full(filtered_pairs, 1.0)))
 
         # Benjamini-Hochberg
         res['pval_bh'] = sm.multipletests(pvals, alpha=alpha, method='fdr_bh')[1][:simulated_pairs]
@@ -710,10 +710,10 @@ class TreeSimulator:
         """Rectangular heatmap: run_traits (rows) vs all other traits (columns).
 
         Cell colour encodes direction and significance via:
-            score = direction * (0.5 - pval)
+            score = direction * (1 - pval) / 2
         Synergistic + significant -> positive -> red
         Antagonistic + significant -> negative -> blue
-        Non-significant (pval~0.5) -> ~0 -> white
+        Non-significant (pval~1) -> ~0 -> white
         """
         res = self.result.copy()
         if prevalence_range is not None:
@@ -733,7 +733,7 @@ class TreeSimulator:
 
         res[['row_trait', 'col_trait']] = res.apply(
             lambda r: pd.Series(_assign(r)), axis=1)
-        res['score'] = res['direction'] * (0.5 - res[pval_col])
+        res['score'] = res['direction'] * (1.0 - res[pval_col]) / 2.0
 
         matrix = res.pivot_table(
             index='row_trait', columns='col_trait',
@@ -754,7 +754,7 @@ class TreeSimulator:
         sns.heatmap(
             matrix.fillna(0), cmap=cmap, center=0, vmin=-0.5, vmax=0.5,
             ax=ax, square=False,
-            cbar_kws={'label': 'direction \u00d7 (0.5 \u2212 p-value)'}
+            cbar_kws={'label': 'direction \u00d7 (1 \u2212 p-value) / 2'}
         )
 
         row_labels = list(matrix.index)

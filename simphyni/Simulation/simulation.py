@@ -931,8 +931,11 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
 
     kde_pvals_ant, kde_pvals_syn, medians, normalization_factors = map(np.array, zip(*results))
 
-    # Vectorized calculation of final results
-    min_pvals = np.minimum(kde_pvals_syn, kde_pvals_ant)
+    # Vectorized calculation of final results.
+    # The direction is chosen after looking at the data, so the p-value is the
+    # two-sided  2 * min(left tail, right tail), capped at 1.  Using the bare
+    # minimum would reject at twice the nominal rate under the null.
+    min_pvals = np.minimum(1.0, 2.0 * np.minimum(kde_pvals_syn, kde_pvals_ant))
     directions = np.where(kde_pvals_ant < kde_pvals_syn, -1, 1)
     effect_sizes = (current_obspairs - medians) / normalization_factors
 
