@@ -35,3 +35,32 @@ def test_pvalues_are_two_sided_and_calibrated():
     # nominal 0.05: binomial sd ~0.011 at n=400; allow generous MC/KDE slack
     assert np.mean(p < 0.05) < 0.085
     assert np.mean(p < 0.20) < 0.27
+
+
+@pytest.mark.parametrize("vars_,targets,expected", [
+    (list("abcd"), list("abcd"), 6),          # all-vs-all: n(n-1)/2
+    (list("ab"), list("cde"), 6),             # one-vs-rest, disjoint
+    (list("abc"), list("bcde"), 3 * 4 - 2 - 1),  # overlap {b, c}: {b,c} counted once
+])
+def test_count_unique_pairs(vars_, targets, expected):
+    from simphyni import TreeSimulator
+    assert TreeSimulator.count_unique_pairs(vars_, targets) == expected
+    brute = {frozenset((a, b)) for a in vars_ for b in targets if a != b}
+    assert len(brute) == expected
+
+
+def test_total_tests_matches_enumerated_pairs_all_vs_all():
+    from ete3 import Tree
+    from simphyni import TreeSimulator
+    rng = np.random.default_rng(0)
+    t = Tree()
+    t.populate(30, random_branches=True)
+    leaves = t.get_leaf_names()
+    obs = pd.DataFrame((rng.random((30, 6)) < 0.4).astype(float), index=leaves,
+                       columns=[f"g{i}" for i in range(6)])
+    params = pd.DataFrame({"gene": obs.columns, "gains": 1.0, "losses": 1.0, "dist": 0.0,
+                           "loss_dist": 0.0, "gain_subsize": 1.0, "loss_subsize": 1.0,
+                           "root_state": 0})
+    sim = TreeSimulator(t.write(format=1), params, obs)
+    sim.initialize_simulation_parameters(pre_filter=False)
+    assert sim.total_tests == len(sim.pairs) == 15

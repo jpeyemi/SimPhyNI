@@ -202,7 +202,18 @@ class TreeSimulator:
         self.tree.prune(to_prune, preserve_branch_length= True)
         obsdf[obsdf>1]=1
         return obsdf.loc(axis = 0)[tuple(map(lambda x: x.name, to_prune))]
-    
+
+    @staticmethod
+    def count_unique_pairs(vars, targets) -> int:
+        """Number of distinct unordered pairs {a, b}, a != b, with a in vars and b in targets.
+
+        Ordered pairs with a != b number |V||T| - |I| (I = V & T); those with
+        both members in I appear twice, so subtract |I|(|I|-1)/2 once more.
+        All-vs-all (V == T, n traits) gives n(n-1)/2; disjoint sets give |V||T|.
+        """
+        n_shared = len(set(vars) & set(targets))
+        return len(vars) * len(targets) - n_shared - n_shared * (n_shared - 1) // 2
+
     def _get_pair_data(self, vars: pd.DataFrame, targets: pd.DataFrame, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Returns a list of trait pairs and a NumPy array of their test statistic results 
@@ -288,7 +299,7 @@ class TreeSimulator:
             keep.append((a, b))
         pairs = np.array(keep)
         
-        self.total_tests = len(valid_vars) * len(valid_targets) - len(set(valid_vars) & set(valid_targets))
+        self.total_tests = self.count_unique_pairs(valid_vars, valid_targets)
             
 
         all_stats = []
