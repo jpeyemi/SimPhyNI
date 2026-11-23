@@ -115,6 +115,16 @@ simphyni run \
 * `--min_prev` / `--max_prev` — Minimum and maximum tip prevalence thresholds for traits to be included (default: 0.05 / 0.95).
 * `--plot` — Generate heatmap summaries of results.
 * `--save-object` — Save the full analysis object as a `.pkl` file (not recommended for analyses > 1,000,000 trait pairs).
+* `--seed` — Make results reproducible (independent of `--cores`).
+
+#### Null model options
+
+The defaults below were chosen by benchmarking calibration and power on 11 PanX species trees (103–500 strains), with synthetic, real-gene, late-emerging and lineage-restricted traits (`benchmarks/panx/` on the `panx-benchmark` branch).
+
+* `--condition prevalence|footprint|none` (default `prevalence`) and `--oversample K` (default 8) — Each trait's null is conditioned on the observed trait. `K × 64` replicates are simulated and the 64 closest to the observed trait are kept, by prevalence or (`footprint`) by prevalence and number of parsimony changes. Without this, traits that changed only once or twice are simulated with their events on short tip branches, so their null copies are scattered fragments rather than the observed clade, and their null co-occurrence is far too narrow. `footprint` has more power and is close to nominal on most trees, but is less robust on very clonal trees.
+* `--branch-cap iqr|none` (default `iqr`) — Simulate with the same long-branch cap used for the rate estimate. Rates are estimated on capped branch lengths. Applying them to uncapped lengths makes long deep branches flip in almost every replicate on clonal trees, where most tree length can lie above the cap.
+* `--emergence none|dist|scaled|soft|mrca` (default `none`) — The time-to-first-event threshold (`dist`, the previous default) made the null too narrow, even for traits that really do emerge late. `mrca` restricts events to the subtree of the trait's minority-state tips and is conservative but loses most power.
+* `--eligibility none|phylogroup|adaptive` (default `none`) — Restrict each trait's null to lineages it can enter. `phylogroup` cuts the tree at `--phylogroup-depth` (default 0.2 of tree depth) and allows events only in phylogroups where the trait is observed. `adaptive` excludes a phylogroup only when the trait is absent there *and* the unrestricted null would almost never leave it empty (`--adapt-alpha`, default 0.05), so sparse traits are not restricted. Useful for trees spanning several species, where some genes can never enter some lineages.
 
 
 ### Run mode (batch)

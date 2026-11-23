@@ -46,11 +46,11 @@ def main():
         ),
     )
     parser.add_argument("--emergence", choices=["dist", "none", "scaled", "soft", "mrca"],
-                        default="dist", help="Emergence-threshold handling (default: dist)")
+                        default="none", help="Emergence-threshold handling (default: none)")
     parser.add_argument("--emergence-scale", type=float, default=1.0,
                         help="Threshold multiplier for --emergence scaled (default: 1.0)")
-    parser.add_argument("--condition", choices=["none", "prevalence", "footprint"], default="none",
-                        help="Condition each trait's null on its observed prevalence (default: none)")
+    parser.add_argument("--condition", choices=["none", "prevalence", "footprint"], default="prevalence",
+                        help="Condition each trait's null on the observed trait: prevalence (default) or footprint (prevalence + parsimony changes)")
     parser.add_argument("--oversample", type=int, default=8,
                         help="Replicates simulated per kept replicate with --condition prevalence")
     parser.add_argument("--eligibility", choices=["none", "phylogroup", "adaptive"], default="none",
@@ -59,8 +59,8 @@ def main():
                         help="Tree-depth fraction at which phylogroups are cut (default: 0.2)")
     parser.add_argument("--adapt-alpha", type=float, default=0.05,
                         help="Exclusion threshold for --eligibility adaptive (default: 0.05)")
-    parser.add_argument("--branch-cap", choices=["none", "iqr"], default="none",
-                        help="Cap branch lengths in simulation as in the rate denominators (default: none)")
+    parser.add_argument("--branch-cap", choices=["none", "iqr"], default="iqr",
+                        help="Cap branch lengths in simulation as in the rate denominators (default: iqr)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()

@@ -103,6 +103,11 @@ def run_simphyni(args):
         f"save_object={args.save_object}",
         f"include_flagged={args.include_flagged}",
         f"seed={getattr(args, 'seed', None) if getattr(args, 'seed', None) is not None else ''}",
+        f"emergence={getattr(args, 'emergence', 'none')}",
+        f"condition={getattr(args, 'condition', 'prevalence')}",
+        f"oversample={getattr(args, 'oversample', 8)}",
+        f"branch_cap={getattr(args, 'branch_cap', 'iqr')}",
+        f"eligibility={getattr(args, 'eligibility', 'none')}",
     ]
 
     # profile flag handling
@@ -179,6 +184,11 @@ def main():
     run_parser.add_argument("--save-object", action=argparse.BooleanOptionalAction, default=False, help="Saves parsable python object containing the complete analysis of each sample (Default: disabled)")
     run_parser.add_argument("--include-flagged", action=argparse.BooleanOptionalAction, default=True, help="Test traits flagged as possibly miscalibrated and mark them null_calibrated=False; --no-include-flagged drops them (Default: enabled)")
     run_parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible results (Default: unseeded)")
+    run_parser.add_argument("--emergence", choices=["none", "dist", "scaled", "soft", "mrca"], default="none", help="Emergence-threshold handling (Default: none)")
+    run_parser.add_argument("--condition", choices=["prevalence", "footprint", "none"], default="prevalence", help="Condition each trait's null on the observed trait (Default: prevalence)")
+    run_parser.add_argument("--oversample", type=int, default=8, help="Replicates simulated per kept replicate when conditioning (Default: 8)")
+    run_parser.add_argument("--branch-cap", choices=["iqr", "none"], default="iqr", help="Cap branch lengths in simulation as in the rate estimate (Default: iqr)")
+    run_parser.add_argument("--eligibility", choices=["none", "phylogroup", "adaptive"], default="none", help="Restrict each trait's null to lineages it can enter (Default: none)")
     run_parser.add_argument(
         "snakemake_args",
         nargs=argparse.REMAINDER,

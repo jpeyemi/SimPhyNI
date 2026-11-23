@@ -207,7 +207,11 @@ def test_full_computational_pipeline_verification():
     
 
     sim.initialize_simulation_parameters(pre_filter=False)
-    sim.run_simulation()
+    # Legacy (unconditioned) null: this test checks data hand-off and the
+    # direction / significance logic.  Under the default conditioned null a
+    # single shared 2-tip clade is (correctly) not significant on a 4-tip
+    # tree - see test_calibration.test_single_shared_clade_is_not_significant.
+    sim.run_simulation(condition=None, branch_cap=None, emergence='dist')
     
     res = sim.result
 

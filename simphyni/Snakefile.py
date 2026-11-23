@@ -31,6 +31,14 @@ prefilter = 'prefilter' if str(config.get('prefilter')).lower() == 'true' else '
 plot = 'plot' if str(config.get('plot')).lower() == 'true' else 'no-plot'
 save_object = 'save-object' if str(config.get('save_object')).lower() == 'true' else 'no-save-object'
 _seed = str(config.get('seed', '') or '').strip()
+def _opt(key, default):
+    v = str(config.get(key, default) or default).strip()
+    return v if v else default
+null_flags = (f"--emergence {_opt('emergence', 'none')} "
+              f"--condition {_opt('condition', 'prevalence')} "
+              f"--oversample {int(_opt('oversample', '8'))} "
+              f"--branch-cap {_opt('branch_cap', 'iqr')} "
+              f"--eligibility {_opt('eligibility', 'none')} ")
 seed_flag = f'--seed {int(_seed)}' if _seed else ''
 include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 
@@ -338,4 +346,4 @@ rule SimPhyNI:
         '--{prefilter} --{plot} '
         '--{save_object} '
         '--{include_flagged} '
-        + seed_flag
+        + null_flags + seed_flag

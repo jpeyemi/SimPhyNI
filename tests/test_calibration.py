@@ -108,7 +108,7 @@ def test_flagged_pairs_are_kept_and_marked_by_default(monkeypatch):
     assert res.loc[~involves_a, "null_calibrated"].all()
 
 
-def _small_sim(seed, cores=2):
+def _small_sim(seed, cores=2, **kw):
     from ete3 import Tree
     from simphyni import TreeSimulator
     import random
@@ -123,7 +123,7 @@ def _small_sim(seed, cores=2):
                            "root_state": 0})
     sim = TreeSimulator(t.write(format=1), params, obs)
     sim.initialize_simulation_parameters(pre_filter=False)
-    sim.run_simulation(cores=cores, seed=seed)
+    sim.run_simulation(cores=cores, seed=seed, **kw)
     return sim.get_results().sort_values(["T1", "T2"]).reset_index(drop=True)
 
 
@@ -233,7 +233,8 @@ def test_condition_on_prevalence_selects_closest_replicates():
 
 
 def test_conditioning_off_is_unchanged():
-    a = _small_sim(21)
+    # Explicitly unconditioned run vs. the same run through _small_sim's path
+    a = _small_sim(21, condition=None, eligibility=None)
     from ete3 import Tree
     from simphyni import TreeSimulator
     import random
@@ -370,3 +371,22 @@ def test_branch_cap_limits_events_on_long_branches():
         return bits[li].mean()
     assert frac_long(None) > 0.99                      # uncapped: the long branch always flips
     assert frac_long(cap) < 0.5                        # capped: consistent with the denominator
+
+
+def test_single_shared_clade_is_not_significant():
+    """Two traits that each arose once, in the same clade, are weak evidence of
+    association (paper Fig. 1a): the default conditioned null must not call
+    them significant, whereas the legacy unconditioned null did."""
+    from simphyni import TreeSimulator
+    obs = pd.DataFrame({"x": [1, 1, 0, 0, 0, 0, 0, 0], "y": [1, 1, 0, 0, 0, 0, 0, 0]},
+                       index=list("ABCDEFGH"), dtype=float)
+    nwk = "((((A:1,B:1):1,(C:1,D:1):1):1,((E:1,F:1):1,(G:1,H:1):1):1));"
+    pml = pd.DataFrame({"gene": ["x", "y"], "gains": 1.0, "losses": 0.0, "dist": 0.0, "loss_dist": 0.0,
+                        "root_state": 0, "gain_subsize": 14.0, "loss_subsize": 14.0})
+    def p(**kw):
+        sim = TreeSimulator(nwk, pml, obs)
+        sim.initialize_simulation_parameters(pre_filter=False)
+        sim.run_simulation(cores=1, seed=4, **kw)
+        return float(sim.get_results()["pval_naive"].iloc[0])
+    assert p() > 0.05
+    assert p(condition=None, branch_cap=None) < p()

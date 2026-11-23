@@ -379,10 +379,10 @@ class TreeSimulator:
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
                        gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
-                       emergence='dist', emergence_scale=1.0, mrca_subsize='mrca',
-                       condition=None, oversample=8,
+                       emergence='none', emergence_scale=1.0, mrca_subsize='mrca',
+                       condition='prevalence', oversample=8,
                        eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05,
-                       branch_cap=None):
+                       branch_cap='iqr'):
         """
         Runs the tree simulation and stores results.
 
@@ -402,15 +402,15 @@ class TreeSimulator:
                                 pairs are excluded from the results (and counted as p=1 in
                                 multiple-testing correction).
         :param seed: Optional int.  Makes simulation and KDE jitter reproducible.
-        :param emergence: Emergence-threshold handling: 'dist' (default; global root-distance
-                          threshold from ACR), 'none', 'scaled' (threshold x emergence_scale),
+        :param emergence: Emergence-threshold handling: 'none' (default; no threshold), 'dist' (global root-distance
+                          threshold from ACR, the pre-2.1 default), 'scaled' (threshold x emergence_scale),
                           'soft' (per-trial threshold ~ U(0, threshold)), or 'mrca' (events
                           restricted to the subtree under the MRCA of tips that differ from
                           the root state; same as use_clade_mask=True).
         :param emergence_scale: Factor used by emergence='scaled'.
         :param mrca_subsize: For emergence='mrca': 'mrca' recomputes rate denominators as the
                              MRCA subtree branch length; 'original' keeps the ACR denominators.
-        :param condition: None (default), 'prevalence' or 'footprint'.  Each trait's null keeps
+        :param condition: 'prevalence' (default), 'footprint' or None.  Each trait's null keeps
                           the simulated replicates closest to the observed trait (out of
                           trials * oversample): by prevalence, or by prevalence and
                           parsimony changes ('footprint', robust to rate mis-estimation).
@@ -425,7 +425,7 @@ class TreeSimulator:
                             fewer than adapt_alpha of replicates (i.e. the absence is
                             unexpected unless the lineage is closed to the trait).
         :param adapt_alpha: Threshold for eligibility='adaptive'.
-        :param branch_cap: None (default), 'iqr' or a float.  'iqr' simulates with the same
+        :param branch_cap: 'iqr' (default), None or a float.  'iqr' simulates with the same
                            branch-length cap used for the ACR rate denominators.
         """
         self._gain_mask      = gain_mask
