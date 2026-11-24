@@ -278,6 +278,7 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     # Root state: for marginal counting methods use root_prob thresholded at 0.5
     if counting not in ('JOINT', 'JOINTP') and 'root_prob' in src.columns:
         out['root_state'] = (src['root_prob'].values >= 0.5).astype(int)
+        out['root_prob'] = src['root_prob'].values
     else:
         out['root_state'] = src['root_state'].values.astype(int)
 
@@ -836,7 +837,10 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                          gain_mask=None, loss_mask=None, gamma=False, seed=None,
                          emergence='dist', emergence_scale=1.0,
                          condition=None, oversample=8, obs_prevalence=None, obs_traits=None,
-                         branch_cap=None):
+                         branch_cap=None, rate_model='point', pi_source='acr', rate_draws=True,
+                         prior_by_prevalence=False, root='threshold', simulator='poisson',
+                         fixed_k_max=None, statistic='logor', pvalue='kde',
+                         testable_filter=None):
     """Simulate the null for every trait and score all pairs.
 
     condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
@@ -844,14 +848,66 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                 to the observed trait are kept: by prevalence
                 (``obs_prevalence``), or by prevalence and parsimony changes
                 (``obs_traits``: (n_tips, n_traits) in tree leaf order).
+
+    Prototype options (see uncertainty.py): rate_model, pi_source, rate_draws,
+    prior_by_prevalence, root, simulator, fixed_k_max, statistic, pvalue,
+    testable_filter.
     """
+    from . import uncertainty as unc
     if condition not in (None, 'none', 'prevalence', 'footprint'):
         raise ValueError(f"condition must be None, 'prevalence' or 'footprint', got {condition!r}")
+    mappingr = dict(enumerate(trait_params.index))
+    mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
+    pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
+    urng = np.random.default_rng(None if seed is None else seed + 11)
+
+    if pvalue == 'analytic':
+        gr, lr, info = unc.eb_rates(trait_params, obs_prevalence, 1, pi_source=pi_source,
+                                    draws=False, prior_by_prevalence=prior_by_prevalence, rng=urng)
+        mu = info['mu_mean'] if rate_model == 'eb' else info['mu_point']
+        res = unc.analytic_pairs(tree, mu, pairs_index, obs_traits, branch_cap=branch_cap)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
     conditioned = condition in ('prevalence', 'footprint') and oversample > 1
-    sim = sim_bit(tree=tree, trait_params=trait_params,
-                  trials=trials * oversample if conditioned else trials,
+    n_sim = trials * oversample if conditioned else trials
+
+    rates = None
+    if rate_model == 'eb':
+        gr, lr, _ = unc.eb_rates(trait_params, obs_prevalence, n_sim, pi_source=pi_source,
+                                 draws=rate_draws, prior_by_prevalence=prior_by_prevalence,
+                                 rng=urng)
+        rates = (gr, lr)
+    elif rate_model not in (None, 'point'):
+        raise ValueError(f"rate_model must be 'point' or 'eb', got {rate_model!r}")
+
+    root_bits = None
+    if root == 'sample' and 'root_prob' in trait_params.columns:
+        rp = np.nan_to_num(trait_params['root_prob'].to_numpy(dtype=float), nan=0.5)
+        root_bits = (urng.random((len(rp), n_sim)) < rp[:, None]).astype(np.uint8)
+
+    sim = sim_bit(tree=tree, trait_params=trait_params, trials=n_sim,
                   gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed,
-                  emergence=emergence, emergence_scale=emergence_scale, branch_cap=branch_cap)
+                  emergence=emergence, emergence_scale=emergence_scale, branch_cap=branch_cap,
+                  rates=rates, root_bits=root_bits)
+
+    if simulator == 'fixed_k':
+        if '_raw_gains' in trait_params.columns:
+            k = (trait_params['_raw_gains'] + trait_params['_raw_losses']).to_numpy(dtype=float)
+        else:
+            k = (trait_params['gains'] + trait_params['losses']).to_numpy(dtype=float)
+        k = np.rint(np.nan_to_num(k)).astype(int)
+        sel = np.ones(len(k), bool) if fixed_k_max is None else (k <= fixed_k_max)
+        if sel.any():
+            rs = trait_params['root_state'].to_numpy()[sel]
+            fk = unc.sim_fixed_k(tree, k[sel], rs, n_sim, branch_cap=branch_cap, rng=urng,
+                                 root_bits=None if root_bits is None else root_bits[sel])
+            sim[:, sel, :] = fk
+    elif simulator not in (None, 'poisson'):
+        raise ValueError(f"simulator must be 'poisson' or 'fixed_k', got {simulator!r}")
+
     if conditioned and condition == 'prevalence':
         if obs_prevalence is None:
             raise ValueError("condition='prevalence' needs obs_prevalence")
@@ -862,12 +918,16 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
             raise ValueError("condition='footprint' needs obs_traits")
         sim = condition_on_footprint(tree, sim, pack_observed(obs_traits), trials,
                                      seed=None if seed is None else seed + 2)
-    mappingr = dict(enumerate(trait_params.index))
-    mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
-    pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
 
-    res = compres(sim, pairs_index, obspairs, bits=trials, cores=cores,
-                  seed=None if seed is None else seed + 1)
+    dense = statistic != 'logor' or pvalue != 'kde' or testable_filter is not None
+    if dense:
+        w = unc.gsc_weights(tree, branch_cap) if statistic == 'weighted' else None
+        res = unc.score_pairs_dense(sim, pairs_index, obs_traits, trials, weights=w,
+                                    pvalue=pvalue, want_pmin=testable_filter is not None)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+    else:
+        res = compres(sim, pairs_index, obspairs, bits=trials, cores=cores,
+                      seed=None if seed is None else seed + 1)
 
     res['first'] = res['first'].map(mappingr)
     res['second'] = res['second'].map(mappingr)
@@ -888,7 +948,8 @@ def iqr_branch_cap(tree) -> float:
 
 
 def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False,
-            seed=None, emergence='dist', emergence_scale=1.0, branch_cap=None):
+            seed=None, emergence='dist', emergence_scale=1.0, branch_cap=None,
+            rates=None, root_bits=None):
     """
     Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
@@ -997,7 +1058,11 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
     last_mask = FULL_MASK if last_chunk_bits == 64 \
         else (np.uint64(1) << np.uint64(last_chunk_bits)) - np.uint64(1)
 
-    if gamma:
+    if rates is not None:
+        # Caller-supplied (n_traits, trials) gain and loss rates (rate_model='eb').
+        gain_rates, loss_rates = (np.asarray(r, dtype=float) for r in rates)
+        gamma = True
+    elif gamma:
         # Sample one rate per trait per trial from the Jeffreys posterior:
         #   rate | data ~ Gamma(count + 0.5, scale=1/subsize)
         # Shape: (n_traits, trials) — each trial uses an independent draw.
@@ -1037,6 +1102,15 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
 
         if node.up is None:
             # Root state: hard 0/1 (build_sim_params thresholds root_prob at 0.5)
+            if root_bits is not None:
+                # Per-replicate root states (root='sample'), (n_traits, trials) 0/1
+                rb = np.asarray(root_bits, dtype=np.uint8)
+                pad = n_chunks * bits - trials
+                if pad:
+                    rb = np.pad(rb, ((0, 0), (0, pad)))
+                sim[node_map[node], :, :] = np.packbits(
+                    rb, axis=-1, bitorder='little').view(nptype).reshape(num_traits, n_chunks)
+                continue
             root = root_values > 0
             for c in range(n_chunks):
                 chunk_val = FULL_MASK if c < n_chunks - 1 else last_mask

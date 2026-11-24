@@ -382,7 +382,7 @@ class TreeSimulator:
                        emergence='none', emergence_scale=1.0, mrca_subsize='mrca',
                        condition='prevalence', oversample=8,
                        eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05,
-                       branch_cap='iqr'):
+                       branch_cap='iqr', **proto):
         """
         Runs the tree simulation and stores results.
 
@@ -427,7 +427,12 @@ class TreeSimulator:
         :param adapt_alpha: Threshold for eligibility='adaptive'.
         :param branch_cap: 'iqr' (default), None or a float.  'iqr' simulates with the same
                            branch-length cap used for the ACR rate denominators.
+        :param proto: prototype null-model options passed to simulate_glrates_bit
+                      (rate_model, pi_source, rate_draws, prior_by_prevalence, root,
+                      simulator, fixed_k_max, statistic, pvalue, testable_filter);
+                      see Simulation/uncertainty.py.
         """
+        self._proto          = proto
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
         self._gene_order     = gene_order or []
@@ -605,6 +610,7 @@ class TreeSimulator:
             obs_traits=self.obsdf_modified.reindex(index=[l.name for l in self.tree],
                                                    columns=traits_to_simulate_pastml.index).to_numpy(),
             branch_cap=self._resolved_branch_cap(),
+            **getattr(self, '_proto', {}),
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
@@ -635,6 +641,26 @@ class TreeSimulator:
         pvals = res['p-value'].values 
         simulated_pairs = len(pvals)
         filtered_pairs = self.total_tests - len(pvals)
+        tf = getattr(self, '_proto', {}).get('testable_filter')
+        if tf is not None and 'p_min' in res.columns:
+            # Tarone-style filtering: pairs that cannot reach p <= tf given their
+            # margins are left out of the correction (adjusted p = 1), as are
+            # pairs never simulated.
+            testable = res['p_min'].to_numpy() <= tf
+            for name, method in (('pval_bh', 'fdr_bh'), ('pval_by', 'fdr_by'),
+                                 ('pval_bonf', 'bonferroni')):
+                adj = np.ones(simulated_pairs)
+                if testable.any():
+                    adj[testable] = sm.multipletests(pvals[testable], alpha=alpha, method=method)[1]
+                res[name] = adj
+            res['pval_naive'] = res.loc[:, 'p-value']
+            res['testable'] = testable
+            base_cols = ['T1','T2','direction','effect size','prevalence_T1','prevalence_T2',
+                         'pval_naive','pval_bh','pval_by','pval_bonf','testable']
+            if 'null_calibrated' in res.columns:
+                base_cols.append('null_calibrated')
+            self.result = res[base_cols]
+            return
         pvals = np.concatenate((np.array(pvals),np.full(filtered_pairs, 1.0)))
 
         # Benjamini-Hochberg
