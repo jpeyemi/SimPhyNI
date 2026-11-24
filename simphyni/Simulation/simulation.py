@@ -840,7 +840,8 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                          branch_cap=None, rate_model='point', pi_source='acr', rate_draws=True,
                          prior_by_prevalence=False, root='threshold', simulator='poisson',
                          fixed_k_max=None, statistic='logor', pvalue='kde',
-                         testable_filter=None):
+                         testable_filter=None, adaptive_stages=(4096, 32768), adaptive_h=10,
+                         anchor_combine='max'):
     """Simulate the null for every trait and score all pairs.
 
     condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
@@ -866,6 +867,32 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                                     draws=False, prior_by_prevalence=prior_by_prevalence, rng=urng)
         mu = info['mu_mean'] if rate_model == 'eb' else info['mu_point']
         res = unc.analytic_pairs(tree, mu, pairs_index, obs_traits, branch_cap=branch_cap)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
+    if pvalue == 'anchored_mc':
+        # No conditioning: anchored counts against fresh, unselected replicates.
+        stage_ctr = [0]
+        def _simulate(tidx, N):
+            stage_ctr[0] += 1
+            sub = trait_params.iloc[tidx]
+            sd = None if seed is None else seed + 101 * stage_ctr[0]
+            gm = None if gain_mask is None else gain_mask[:, tidx]
+            lm = None if loss_mask is None else loss_mask[:, tidx]
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                L = sim_bit(tree=tree, trait_params=sub, trials=N, gain_mask=gm, loss_mask=lm,
+                            gamma=gamma, seed=sd, emergence=emergence,
+                            emergence_scale=emergence_scale, branch_cap=branch_cap)
+            n_tips_, n_tr_, _ = L.shape
+            bits = np.unpackbits(L.view(np.uint8), axis=-1, bitorder='little')
+            return bits.reshape(n_tips_, n_tr_, -1)[:, :, :N]
+        w = unc.gsc_weights(tree, branch_cap) if statistic == 'weighted' else None
+        res = unc.anchored_mc_pairs(_simulate, pairs_index, obs_traits, trials, weights=w,
+                                    stages=tuple(adaptive_stages), h=adaptive_h,
+                                    combine=anchor_combine)
         res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
         res['first'] = res['first'].map(mappingr)
         res['second'] = res['second'].map(mappingr)
@@ -919,7 +946,7 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
         sim = condition_on_footprint(tree, sim, pack_observed(obs_traits), trials,
                                      seed=None if seed is None else seed + 2)
 
-    dense = statistic != 'logor' or pvalue != 'kde' or testable_filter is not None
+    dense = statistic != "logor" or pvalue != "kde" or testable_filter is not None
     if dense:
         w = unc.gsc_weights(tree, branch_cap) if statistic == 'weighted' else None
         res = unc.score_pairs_dense(sim, pairs_index, obs_traits, trials, weights=w,

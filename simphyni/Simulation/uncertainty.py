@@ -200,7 +200,7 @@ def sim_fixed_k(tree, k, root_states, trials, branch_cap=None, rng=None, root_bi
 def _unpack(lineages, trials):
     n_tips, n_traits, _ = lineages.shape
     bits = np.unpackbits(lineages.view(np.uint8), axis=-1, bitorder="little")
-    return bits.reshape(n_tips, n_traits, -1)[:, :, :trials].astype(np.float64)
+    return bits.reshape(n_tips, n_traits, -1)[:, :, :trials].astype(np.float32)
 
 
 def _lor(a, s1, s2, W, eps=1.0):
@@ -242,12 +242,34 @@ def score_pairs_dense(lineages, pairs_index, obs_traits, trials, weights=None,
     out = {"p-value": [], "direction": [], "effect size": [], "obs_stat": [], "p_min": []}
     Uw = U * w[:, None, None]
     sums = Uw.sum(axis=0)                                                   # traits x trials
+    anchored = pvalue.startswith("anchored")
     for i, j in pairs_index:
         X, Y = U[:, i, :], U[:, j, :]
-        a = X.T @ (w[:, None] * Y)                                          # trials x trials
-        null = _lor(a, sums[i][:, None], sums[j][None, :], W).ravel()
         xo, yo = obs[:, i].astype(float), obs[:, j].astype(float)
         stat = _lor((w * xo * yo).sum(), (w * xo).sum(), (w * yo).sum(), W)
+        if anchored:
+            # Observed trait against the other trait's null replicates, in both
+            # directions.  Each is an exact conditional test given one observed
+            # trait and needs only the other trait's model; 'max' is valid if
+            # either model is right, 'mean' is valid at twice the level.
+            sx, sy = (w * xo).sum(), (w * yo).sum()
+            row = _lor((w * xo) @ Y, sx, sums[j], W)                         # (x_obs, Y_j)
+            col = _lor((w * yo) @ X, sums[i], sy, W)                         # (X_i, y_obs)
+            pl1, pr1 = _tails(row, np.array([stat]), "kde")
+            pl2, pr2 = _tails(col, np.array([stat]), "kde")
+            p1 = min(1.0, 2 * min(pl1[0], pr1[0]))
+            p2 = min(1.0, 2 * min(pl2[0], pr2[0]))
+            pv = max(p1, p2) if pvalue == "anchored_max" else min(1.0, (p1 + p2) / 2)
+            null = np.concatenate([row, col])
+            out["p-value"].append(float(pv))
+            out["direction"].append(1 if stat >= np.median(null) else -1)
+            q75, q25 = np.percentile(null, [75, 25])
+            out["effect size"].append((stat - np.median(null)) / max((q75 - q25) * 1.349, 1))
+            out["obs_stat"].append(stat)
+            out["p_min"].append(np.nan)
+            continue
+        a = X.T @ (w[:, None] * Y)                                          # trials x trials
+        null = _lor(a, sums[i][:, None], sums[j][None, :], W).ravel()
         pl, pr = _tails(null, np.array([stat]), pvalue)
         pl, pr = float(pl[0]), float(pr[0])
         out["p-value"].append(min(1.0, 2 * min(pl, pr)))
@@ -306,3 +328,69 @@ def analytic_pairs(tree, mu, pairs_index, obs_traits, branch_cap=None):
         out["obs_stat"].append(S)
         out["p_min"].append(np.nan)
     return pd.DataFrame(out)
+
+
+# ---------------------------------------------------------------------------
+# Anchored Monte-Carlo p-values with adaptive refinement
+# ---------------------------------------------------------------------------
+
+def _anchored_counts(X, Y, xo, yo, w):
+    """Tail counts of the (weighted) log odds ratio of the observed pair against
+    (x_obs, Y_j) and (X_i, y_obs).  Ties count against the pair.
+    Returns (stat, le_row, ge_row, le_col, ge_col, N)."""
+    W = w.sum()
+    sx, sy = (w * xo).sum(), (w * yo).sum()
+    stat = _lor((w * xo * yo).sum(), sx, sy, W)
+    row = _lor((w * xo) @ Y, sx, (w[:, None] * Y).sum(0), W)
+    col = _lor((w * yo) @ X, (w[:, None] * X).sum(0), sy, W)
+    tol = 1e-9
+    return (stat, int((row <= stat + tol).sum()), int((row >= stat - tol).sum()),
+            int((col <= stat + tol).sum()), int((col >= stat - tol).sum()), Y.shape[1])
+
+
+def _mc_p(le, ge, N):
+    """Two-sided Monte-Carlo p from counts over N exchangeable null values."""
+    return np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
+
+
+def anchored_mc_pairs(simulate, pairs_index, obs_traits, n0, weights=None,
+                      stages=(4096, 32768), h=10, combine="max"):
+    """Anchored Monte-Carlo p-values with sequential refinement (Besag-Clifford).
+
+    simulate(trait_idx, N) -> (n_tips, len(trait_idx), N) 0/1 replicates.
+    Stage 0 uses n0 replicates for every trait; a pair continues while the
+    smaller tail count of either direction is below h, and each stage uses
+    fresh replicates, so the reported counts are not biased by selection.
+    Each direction's p is exact under its partner trait's model; 'max' is valid
+    if either model is right.
+    """
+    obs = (np.nan_to_num(np.asarray(obs_traits, float)) > 0.5).astype(np.float32)
+    n_tips = obs.shape[0]
+    w = np.ones(n_tips, np.float32) if weights is None else np.asarray(weights, np.float32)
+    P = len(pairs_index)
+    cnt = np.zeros((P, 4), np.int64)
+    Ns = np.zeros(P, np.int64)
+    stat = np.zeros(P)
+    stage = np.zeros(P, np.int16)
+    active = np.arange(P)
+    for s, N in enumerate((n0,) + tuple(stages)):
+        if active.size == 0:
+            break
+        traits = np.unique(pairs_index[active].ravel())
+        R = simulate(traits, N)                                          # uint8
+        col = {t: k for k, t in enumerate(traits)}
+        for p in active:
+            i, j = pairs_index[p]
+            st, a, b, c, d, n = _anchored_counts(R[:, col[i], :].astype(np.float32),
+                                                 R[:, col[j], :].astype(np.float32),
+                                                 obs[:, i], obs[:, j], w)
+            stat[p], cnt[p], Ns[p], stage[p] = st, (a, b, c, d), n, s
+        tail = np.minimum(np.minimum(cnt[:, 0], cnt[:, 1]), np.minimum(cnt[:, 2], cnt[:, 3]))
+        active = np.flatnonzero(tail < h)
+    p1 = _mc_p(cnt[:, 0], cnt[:, 1], Ns)
+    p2 = _mc_p(cnt[:, 2], cnt[:, 3], Ns)
+    pv = np.maximum(p1, p2) if combine == "max" else np.minimum(1.0, (p1 + p2) / 2)
+    direction = np.where(cnt[:, 1] <= cnt[:, 0], 1, -1)      # fewer values >= obs -> positive
+    eff = -np.log10(pv) * direction
+    return pd.DataFrame({"p-value": pv, "direction": direction, "effect size": eff,
+                         "obs_stat": stat, "p_min": np.nan, "n_null": Ns, "stage": stage})
