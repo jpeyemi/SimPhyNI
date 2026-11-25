@@ -439,6 +439,11 @@ class TreeSimulator:
         proto.setdefault('statistic', 'weighted')
         proto.setdefault('pvalue', 'anchored_fast')
         proto.setdefault('trials', 512)
+        if proto.get('pvalue') == 'anchored_fast':
+            # Calibrated tails: GPD beyond the 512-replicate null, and pairs with
+            # p < 0.01 (at most 5,000 per run) re-tested with 32,768 fresh replicates.
+            proto.setdefault('refine_p', 0.01)
+            proto.setdefault('refine_max_pairs', 5000)
         self._proto          = proto
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask

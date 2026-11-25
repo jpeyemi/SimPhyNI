@@ -43,7 +43,7 @@ null_flags = (f"--emergence {_opt('emergence', 'none')} "
               f"--gate-p {float(_opt('gate_p', '0.05'))} --combine {_opt('combine', 'max')} "
               f"--lineage {_opt('lineage', 'none')} "
               + ("--composite " if str(config.get('composite', False)).lower() == 'true' else "")
-              + (f"--refine-p {float(_opt('refine_p', ''))} " if _opt('refine_p', '') else ""))
+              + f"--refine-p {float(_opt('refine_p', '0.01'))} ")
 seed_flag = f'--seed {int(_seed)}' if _seed else ''
 include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 

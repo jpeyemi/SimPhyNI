@@ -114,7 +114,7 @@ def run_simphyni(args):
         f"combine={getattr(args, 'combine', 'max')}",
         f"lineage={getattr(args, 'lineage', 'none')}",
         f"composite={getattr(args, 'composite', False)}",
-        f"refine_p={getattr(args, 'refine_p', None) or ''}",
+        f"refine_p={getattr(args, 'refine_p', 0.01)}",
     ]
 
     # profile flag handling
@@ -200,7 +200,7 @@ def main():
     run_parser.add_argument("--lineage", choices=["none", "soft_auto", "soft", "mrca"], default="none", help="Per-trait lineage accessibility in the null (Default: none)")
     run_parser.add_argument("--composite", action=argparse.BooleanOptionalAction, default=False, help="Composite whole-tree / pair-region null, max p (Default: off)")
     run_parser.add_argument("--gate-p", type=float, default=0.05, help="p threshold for the lineage-overlap check (Default: 0.05)")
-    run_parser.add_argument("--refine-p", type=float, default=None, help="Re-test pairs below this p with exact Monte-Carlo counts (Default: off)")
+    run_parser.add_argument("--refine-p", type=float, default=0.01, help="Re-test pairs below this p with 32,768 fresh replicates and a GPD tail (Default: 0.01; 0 disables)")
     run_parser.add_argument("--branch-cap", choices=["iqr", "none"], default="iqr", help="Cap branch lengths in simulation as in the rate estimate (Default: iqr)")
     run_parser.add_argument("--eligibility", choices=["none", "phylogroup", "adaptive"], default="none", help="Restrict each trait's null to lineages it can enter (Default: none)")
     run_parser.add_argument(

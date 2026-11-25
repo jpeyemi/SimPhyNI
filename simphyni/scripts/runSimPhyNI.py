@@ -80,11 +80,13 @@ def main():
                         help="Composite null: report max(p_whole-tree, p_pair-region) (valid if either null holds)")
     parser.add_argument("--gate-p", type=float, default=0.05,
                         help="Pairs with p below this get the lineage-overlap check (default: 0.05)")
-    parser.add_argument("--refine-p", type=float, default=None,
-                        help="Re-test pairs with p below this by exact Monte-Carlo counts on fresh "
-                             "replicates (adaptive up to --refine-max replicates). Default: off")
-    parser.add_argument("--refine-max", type=int, default=131072,
-                        help="Largest refinement stage (default: 131072 replicates)")
+    parser.add_argument("--refine-p", type=float, default=0.01,
+                        help="Re-test pairs with p below this with --refine-n fresh replicates and a "
+                             "GPD tail fitted to the top 1%% (default: 0.01; 0 disables)")
+    parser.add_argument("--refine-max-pairs", type=int, default=5000,
+                        help="At most this many smallest-p pairs are refined (default: 5000)")
+    parser.add_argument("--refine-n", type=int, default=32768,
+                        help="Replicates per trait in the refinement stage (default: 32768)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
@@ -145,13 +147,13 @@ def main():
     print("Running SimPhyNI analysis...")
     extra = dict(statistic="logor", pvalue="kde", trials=64)
     if args.null != "legacy":
-        stages = [s for s in (4096, 32768, 131072, 524288) if s <= args.refine_max] or [args.refine_max]
         extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
                      anchor_combine=args.combine,
                      lineage=None if args.lineage == "none" else args.lineage, tau=args.tau,
                      composite=args.composite, sup_p=max(args.gate_p, 0.05),
                      gate=("overlap" if args.null == "anchored" else None), gate_p=args.gate_p,
-                     refine_p=args.refine_p, adaptive_stages=stages)
+                     refine_p=args.refine_p or None, refine_max_pairs=args.refine_max_pairs,
+                     refine_n=args.refine_n)
         args.condition = "none"
     Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged,
                        use_clade_mask=False, seed=args.seed,
