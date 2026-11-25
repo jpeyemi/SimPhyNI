@@ -111,6 +111,7 @@ def run_simphyni(args):
         f"null={getattr(args, 'null', 'legacy')}",
         f"trials={getattr(args, 'trials', 512)}",
         f"gate_p={getattr(args, 'gate_p', 0.05)}",
+        f"combine={getattr(args, 'combine', 'max')}",
         f"refine_p={getattr(args, 'refine_p', None) or ''}",
     ]
 
@@ -193,6 +194,7 @@ def main():
     run_parser.add_argument("--oversample", type=int, default=8, help="Replicates simulated per kept replicate when conditioning (Default: 8)")
     run_parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="legacy", help="Null model (Default: legacy). anchored = weighted anchored test with lineage-overlap gate; anchored-screen = without the gate")
     run_parser.add_argument("--trials", type=int, default=512, help="Null replicates per trait for anchored nulls (Default: 512)")
+    run_parser.add_argument("--combine", choices=["max", "mean"], default="max", help="Combine the two anchored directions (Default: max)")
     run_parser.add_argument("--gate-p", type=float, default=0.05, help="p threshold for the lineage-overlap check (Default: 0.05)")
     run_parser.add_argument("--refine-p", type=float, default=None, help="Re-test pairs below this p with exact Monte-Carlo counts (Default: off)")
     run_parser.add_argument("--branch-cap", choices=["iqr", "none"], default="iqr", help="Cap branch lengths in simulation as in the rate estimate (Default: iqr)")

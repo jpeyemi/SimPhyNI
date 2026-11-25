@@ -69,6 +69,9 @@ def main():
                              "the gate (fastest, highest recall, not robust to co-restriction).")
     parser.add_argument("--trials", type=int, default=512,
                         help="Null replicates per trait for --null anchored* (default: 512)")
+    parser.add_argument("--combine", choices=["max", "mean"], default="max",
+                        help="Combine the two anchored directions: max (default; valid if either "
+                             "trait's null model is right) or mean (more recall, valid at 2x the level)")
     parser.add_argument("--gate-p", type=float, default=0.05,
                         help="Pairs with p below this get the lineage-overlap check (default: 0.05)")
     parser.add_argument("--refine-p", type=float, default=None,
@@ -138,6 +141,7 @@ def main():
     if args.null != "legacy":
         stages = [s for s in (4096, 32768, 131072, 524288) if s <= args.refine_max] or [args.refine_max]
         extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
+                     anchor_combine=args.combine,
                      gate=("overlap" if args.null == "anchored" else None), gate_p=args.gate_p,
                      refine_p=args.refine_p, adaptive_stages=stages)
         args.condition = "none"
