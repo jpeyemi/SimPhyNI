@@ -504,7 +504,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
                  lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1,
                  chunk=2000, refine_mode="gpd", refine_n=32768, refine_frac=0.01, xi_min=0.0,
-                 refine_tiers=None):
+                 refine_tiers=None, refine_max_pairs=None):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
@@ -557,7 +557,10 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
         # uses fresh replicates for the pairs still below its threshold
         tiers = refine_tiers or [(refine_p, refine_n, refine_frac)]
         for ti, (tp, tn, tf) in enumerate(tiers):
-            cand = np.flatnonzero(res["p-value"].to_numpy() < tp)
+            pv_ = res["p-value"].to_numpy()
+            cand = np.flatnonzero(pv_ < tp)
+            if refine_max_pairs and cand.size > refine_max_pairs:
+                cand = np.sort(cand[np.argsort(pv_[cand], kind="stable")[:refine_max_pairs]])
             if cand.size:
                 pr = refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=int(tn),
                                 frac=tf, combine=combine, rng=rng, mult=mult)
@@ -629,7 +632,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
             Ur = unpack_u8(sim_bit_fast(tree, P2, trials, branch_cap, int(rng.integers(2**31)), ta, el), trials)
             k = np.arange(len(gp))
             rres = anchored_scores(Ur, obs[:, src], w, np.stack([2 * k, 2 * k + 1], axis=1), combine)
-            pr = rres["p-value"].to_numpy()
+            pr = rres["p-value"].to_numpy().copy()
             if refine_p is not None and refine_mode == "gpd":
                 rc = np.flatnonzero(pr < refine_p)
                 if rc.size:
