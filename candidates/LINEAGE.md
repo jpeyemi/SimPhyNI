@@ -119,3 +119,41 @@ associated beyond what shared confinement explains.
   trait alone. That would carry uncertainty about restriction into the null instead of fixing a
   decay shape. A genome-wide lineage-flux model (branch turnover multipliers shared by all genes)
   is the complementary refinement for clades that turn genes over faster.
+
+## Update: exact simulator, calibrated tails and the hidden-accessibility model
+
+After the exact branch transitions and GPD tails became the default, every lineage figure above
+rose. The old one-change-per-branch simulator had made null traits more clustered, which partly
+masked shared restriction.
+
+We then tested a per-trait hidden-accessibility model (`lineage='hidden'`, `simphyni/Simulation/hidden.py`):
+
+- **Model.** A 4-state covarion chain: accessibility × trait, with the trait changing only while
+  open.
+- **Fit.** The likelihood is computed on a grid of switching rate, open fraction and open-region
+  rate, with prior P(unrestricted) = 0.5.
+- **Null.** Each 64-replicate chunk draws its parameters from the grid posterior and samples the
+  accessibility map from the joint posterior before re-simulating the trait.
+
+Quick tier (6 species), BH q < 0.05:
+
+| configuration | restricted recall / FDP | same-clade ratio @0.01 | synthetic recall / FDP |
+|---|---|---|---|
+| default | 0.27 / 0.61 | 23.2 | 0.25 / 0.022 |
+| hidden | 0.26 / 0.60 | 21.5 | 0.26 / 0.021 |
+| hidden + composite | 0.12 / 0.49 | 14.3 | 0.21 / 0.026 |
+| soft auto | 0.22 / 0.59 | 14.8 | 0.24 / 0.022 |
+| **soft auto + composite** | 0.13 / **0.50** | **9.7** | 0.20 / 0.027 |
+
+The posterior P(restricted) was about 0.33 for restricted and unrestricted traits alike (0.36 vs
+0.33). A rarely changing trait confined to one clade is explained equally well by a single
+ancestral gain, so restriction is not identifiable from one trait. An honest per-trait model
+therefore barely changes the null.
+
+- The point-fit variant (`hidden_ml`) recognised 97 % of unrestricted traits as unrestricted, but
+  only 13 % of restricted ones as restricted.
+- The emission approximation (`hidden_emission`) over-restricted every clumped trait.
+
+Lineage confounding needs pair-level information. `soft_auto + composite` remains the recommended
+control. The next step on the model side would be genome-wide information: shared clade-level
+accessibility estimated across many genes, which single-trait models cannot see.
