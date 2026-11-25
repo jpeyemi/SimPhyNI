@@ -38,7 +38,10 @@ null_flags = (f"--emergence {_opt('emergence', 'none')} "
               f"--condition {_opt('condition', 'prevalence')} "
               f"--oversample {int(_opt('oversample', '8'))} "
               f"--branch-cap {_opt('branch_cap', 'iqr')} "
-              f"--eligibility {_opt('eligibility', 'none')} ")
+              f"--eligibility {_opt('eligibility', 'none')} "
+              f"--null {_opt('null', 'legacy')} --trials {int(_opt('trials', '512'))} "
+              f"--gate-p {float(_opt('gate_p', '0.05'))} "
+              + (f"--refine-p {float(_opt('refine_p', ''))} " if _opt('refine_p', '') else ""))
 seed_flag = f'--seed {int(_seed)}' if _seed else ''
 include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 

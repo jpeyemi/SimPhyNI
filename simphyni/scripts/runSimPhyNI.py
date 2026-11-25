@@ -61,6 +61,21 @@ def main():
                         help="Exclusion threshold for --eligibility adaptive (default: 0.05)")
     parser.add_argument("--branch-cap", choices=["none", "iqr"], default="iqr",
                         help="Cap branch lengths in simulation as in the rate denominators (default: iqr)")
+    parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="legacy",
+                        help="Null model. legacy: simulated-vs-simulated pairs with --condition "
+                             "(default). anchored: GSC-weighted statistic, observed trait vs the "
+                             "partner's null replicates in both directions (max p), lineage-"
+                             "overlap gate on candidate pairs. anchored-screen: anchored without "
+                             "the gate (fastest, highest recall, not robust to co-restriction).")
+    parser.add_argument("--trials", type=int, default=512,
+                        help="Null replicates per trait for --null anchored* (default: 512)")
+    parser.add_argument("--gate-p", type=float, default=0.05,
+                        help="Pairs with p below this get the lineage-overlap check (default: 0.05)")
+    parser.add_argument("--refine-p", type=float, default=None,
+                        help="Re-test pairs with p below this by exact Monte-Carlo counts on fresh "
+                             "replicates (adaptive up to --refine-max replicates). Default: off")
+    parser.add_argument("--refine-max", type=int, default=131072,
+                        help="Largest refinement stage (default: 131072 replicates)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
@@ -119,6 +134,13 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
+    extra = {}
+    if args.null != "legacy":
+        stages = [s for s in (4096, 32768, 131072, 524288) if s <= args.refine_max] or [args.refine_max]
+        extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
+                     gate=("overlap" if args.null == "anchored" else None), gate_p=args.gate_p,
+                     refine_p=args.refine_p, adaptive_stages=stages)
+        args.condition = "none"
     Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged,
                        use_clade_mask=False, seed=args.seed,
                        emergence=args.emergence, emergence_scale=args.emergence_scale,
@@ -127,7 +149,8 @@ def main():
                        eligibility=None if args.eligibility == 'none' else args.eligibility,
                        phylogroup_depth=args.phylogroup_depth,
                        adapt_alpha=args.adapt_alpha,
-                       branch_cap=None if args.branch_cap == 'none' else args.branch_cap)
+                       branch_cap=None if args.branch_cap == 'none' else args.branch_cap,
+                       **extra)
 
     # ----------------------
     # Save Outputs

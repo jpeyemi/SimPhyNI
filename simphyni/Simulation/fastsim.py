@@ -145,11 +145,27 @@ def _kde_tails(null, stat):
     return ndtr(z).mean(axis=1), ndtr(-z).mean(axis=1)
 
 
-def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20):
+def _score_cells(co, so_a, sr_b, st, W, kde_below):
+    null = _lor(co, so_a[:, None], sr_b, W)
+    tol = 1e-9
+    le = (null <= st[:, None] + tol).sum(1); ge = (null >= st[:, None] - tol).sum(1)
+    N = null.shape[1]
+    pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
+    small = np.minimum(le, ge) < kde_below
+    if small.any():
+        pl, pr = _kde_tails(null[small], st[small])
+        pe[small] = np.minimum(1.0, 2.0 * np.minimum(pl, pr))
+    return pe, null.mean(1), null.std(1)
+
+
+def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
+                     dense_min=20000, pblock=256, ablock=32):
     """For each (anchor a, partner b): the observed anchor against b's replicates.
 
     U   : (n_tips, n_traits, N) uint8 replicates
     obs : (n_tips, n_traits) 0/1 observed
+    Small requests gather per batch; large ones (all-vs-all screens) use blocked
+    float32 matrix products, observed anchors x partner-replicate blocks.
     Returns stat, two-sided p, mean and sd of the null, per entry.
     """
     n, T, N = U.shape
@@ -158,22 +174,34 @@ def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20):
     so = Ow.sum(0)                                              # T
     sr = np.einsum("t,tjk->jk", w.astype(np.float32), U, dtype=np.float32)  # T x N replicate sums
     E = len(anchors)
-    stat = np.empty(E); p = np.empty(E); mu = np.empty(E); sd = np.empty(E)
-    for s in range(0, E, batch):
-        e = slice(s, min(E, s + batch))
-        a, b = anchors[e], partners[e]
-        Ub = U[:, b, :].astype(np.float32)                       # n x Eb x N
-        co = np.einsum("te,tek->ek", Ow[:, a], Ub)               # Eb x N
-        null = _lor(co, so[a][:, None], sr[b], W)
-        st = _lor((Ow[:, a] * obs[:, b]).sum(0), so[a], (obs[:, b] * w[:, None]).sum(0), W)
-        tol = 1e-9
-        le = (null <= st[:, None] + tol).sum(1); ge = (null >= st[:, None] - tol).sum(1)
-        pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
-        small = np.minimum(le, ge) < kde_below
-        if small.any():
-            pl, pr = _kde_tails(null[small], st[small])
-            pe[small] = np.minimum(1.0, 2.0 * np.minimum(pl, pr))
-        stat[e], p[e], mu[e], sd[e] = st, pe, null.mean(1), null.std(1)
+    stat = _lor(np.einsum("te,te->e", Ow[:, anchors], obs[:, partners].astype(np.float32)),
+                so[anchors], (obs * w[:, None])[:, partners].sum(0), W)
+    p = np.empty(E); mu = np.empty(E); sd = np.empty(E)
+    if E < dense_min:
+        for s in range(0, E, batch):
+            e = slice(s, min(E, s + batch))
+            a, b = anchors[e], partners[e]
+            co = np.einsum("te,tek->ek", Ow[:, a], U[:, b, :].astype(np.float32))
+            p[e], mu[e], sd[e] = _score_cells(co, so[a], sr[b], stat[e], W, kde_below)
+        return stat, p, mu, sd
+    pb_of = partners // pblock
+    order = np.argsort(pb_of, kind="stable")
+    bounds = np.searchsorted(pb_of[order], np.arange(0, T // pblock + 2))
+    for k in range(len(bounds) - 1):
+        idx = order[bounds[k]:bounds[k + 1]]
+        if idx.size == 0:
+            continue
+        p0 = k * pblock; p1 = min(T, p0 + pblock)
+        Uf = U[:, p0:p1, :].reshape(n, -1).astype(np.float32)   # n x (pb*N)
+        ab = anchors[idx] // ablock
+        o2 = np.argsort(ab, kind="stable"); idx = idx[o2]; ab = ab[o2]
+        cuts = np.flatnonzero(np.diff(ab)) + 1
+        for grp in np.split(idx, cuts):
+            a0 = (anchors[grp[0]] // ablock) * ablock; a1 = min(T, a0 + ablock)
+            C = (Ow[:, a0:a1].T @ Uf).reshape(a1 - a0, p1 - p0, N)
+            co = C[anchors[grp] - a0, partners[grp] - p0, :]
+            p[grp], mu[grp], sd[grp] = _score_cells(co, so[anchors[grp]], sr[partners[grp]],
+                                                    stat[grp], W, kde_below)
     return stat, p, mu, sd
 
 
@@ -299,7 +327,7 @@ def region_eligibility(ta, obs, root_states, pairs_index, tips_names=None):
 # ---------------------------------------------------------------------------
 
 def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch_cap=None,
-                 seed=None, weighted=True, combine="max", gate=None, gate_q=0.95,
+                 seed=None, weighted=True, combine="max", gate=None, gate_q=0.95, gate_p=None,
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
@@ -318,8 +346,15 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
 
     if gate == "overlap":
         D = tip_distance_matrix(ta)
-        flag, nn_obs, thr = overlap_gate(D, obs, U, pairs_index, q=gate_q)
-        res["overlap"] = nn_obs
+        # Only pairs that could be called need the check (gate_p=None: all pairs).
+        cand = np.arange(len(pairs_index)) if gate_p is None else \
+            np.flatnonzero(res["p-value"].to_numpy() < gate_p)
+        flag = np.zeros(len(pairs_index), bool)
+        res["overlap"] = np.nan
+        if cand.size:
+            f_c, nn_obs, thr = overlap_gate(D, obs, U, pairs_index[cand], q=gate_q)
+            flag[cand] = f_c
+            res.loc[cand, "overlap"] = nn_obs
         if flag.any():
             gp = pairs_index[flag]
             root = trait_params["root_state"].to_numpy().astype(int)
