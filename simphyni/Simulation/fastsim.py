@@ -14,6 +14,7 @@ anchored_scores    : vectorised anchored scoring.  Every pair gets the observed
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 import pandas as pd
@@ -88,6 +89,9 @@ def _sim_kernel(preorder, parent, bl, leaf_idx, gain_rate, loss_rate, root, n_ch
     return out
 
 
+TIMINGS: dict = {}       # stage -> seconds for the last run_anchored call
+
+
 class _TreeArr:
     pass
 
@@ -147,21 +151,110 @@ def _kde_tails(null, stat):
     return ndtr(z).mean(axis=1), ndtr(-z).mean(axis=1)
 
 
-def _score_cells(co, so_a, sr_b, st, W, kde_below):
-    null = _lor(co, so_a[:, None], sr_b, W)
-    tol = 1e-9
-    le = (null <= st[:, None] + tol).sum(1); ge = (null >= st[:, None] - tol).sum(1)
-    N = null.shape[1]
+@njit(parallel=True, cache=True, fastmath=True)
+def _tail_kernel(co, so_a, sr_b, stat, W, eps):
+    """Per entry: counts of null LOR <= / >= stat, and the null mean and variance.
+    co, sr_b : (E, N) float32 co-occurrence and partner-replicate sums."""
+    E, N = co.shape
+    le = np.zeros(E, np.int64); ge = np.zeros(E, np.int64)
+    mu = np.zeros(E); var = np.zeros(E)
+    for e in prange(E):
+        s1 = so_a[e]; st = stat[e]
+        l = 0; g = 0; sm = 0.0; sq = 0.0
+        for k in range(N):
+            a = co[e, k]; s2 = sr_b[e, k]
+            v = math.log(((a + eps) * (W - s1 - s2 + a + eps)) / ((s1 - a + eps) * (s2 - a + eps)))
+            if v <= st + 1e-9:
+                l += 1
+            if v >= st - 1e-9:
+                g += 1
+            sm += v; sq += v * v
+        le[e] = l; ge[e] = g
+        m = sm / N
+        mu[e] = m; var[e] = max(sq / N - m * m, 0.0)
+    return le, ge, mu, var
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _kde_kernel(co, so_a, sr_b, stat, W, eps, h):
+    """Gaussian-KDE left/right tails of stat under each entry's null (bandwidth h)."""
+    E, N = co.shape
+    pl = np.zeros(E); pr = np.zeros(E)
+    r2 = math.sqrt(2.0)
+    for e in prange(E):
+        s1 = so_a[e]; st = stat[e]; hh = h[e]
+        acc = 0.0
+        for k in range(N):
+            a = co[e, k]; s2 = sr_b[e, k]
+            v = math.log(((a + eps) * (W - s1 - s2 + a + eps)) / ((s1 - a + eps) * (s2 - a + eps)))
+            acc += 0.5 * math.erfc(-(st - v) / (hh * r2))
+        pl[e] = acc / N
+        pr[e] = 1.0 - pl[e]
+    return pl, pr
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _tail_kernel_idx(C, ai, pj, so_a, srblk, stat, W, eps, h, want_kde):
+    """As _tail_kernel/_kde_kernel but reading C[ai[e], pj[e], :] and srblk[pj[e], :]
+    in place.  With want_kde, entries with h[e] > 0 also get KDE tails."""
+    E = ai.shape[0]; N = C.shape[2]
+    le = np.zeros(E, np.int64); ge = np.zeros(E, np.int64)
+    mu = np.zeros(E); var = np.zeros(E); pl = np.full(E, np.nan)
+    r2 = math.sqrt(2.0)
+    for e in prange(E):
+        s1 = so_a[e]; st = stat[e]; x = ai[e]; y = pj[e]
+        l = 0; g = 0; sm = 0.0; sq = 0.0; acc = 0.0; hh = h[e]
+        for k in range(N):
+            a = C[x, y, k]; s2 = srblk[y, k]
+            v = math.log(((a + eps) * (W - s1 - s2 + a + eps)) / ((s1 - a + eps) * (s2 - a + eps)))
+            if v <= st + 1e-9:
+                l += 1
+            if v >= st - 1e-9:
+                g += 1
+            sm += v; sq += v * v
+            if want_kde and hh > 0:
+                acc += 0.5 * math.erfc(-(st - v) / (hh * r2))
+        le[e] = l; ge[e] = g
+        m = sm / N
+        mu[e] = m; var[e] = max(sq / N - m * m, 0.0)
+        if want_kde and hh > 0:
+            pl[e] = acc / N
+    return le, ge, mu, var, pl
+
+
+def _score_block(C, ai, pj, so_a, srblk, st, W, kde_below):
+    N = C.shape[2]
+    z = np.zeros(len(ai))
+    le, ge, mu, var, _ = _tail_kernel_idx(C, ai, pj, so_a, srblk, st, float(W), 1.0, z, False)
     pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
     small = np.minimum(le, ge) < kde_below
     if small.any():
-        pl, pr = _kde_tails(null[small], st[small])
+        sd1 = np.sqrt(var[small] * N / max(N - 1, 1))
+        h = np.maximum((N * 3.0 / 4.0) ** (-0.2) * sd1, 1e-6)
+        _, _, _, _, pl = _tail_kernel_idx(C, ai[small], pj[small], so_a[small], srblk, st[small],
+                                          float(W), 1.0, h, True)
+        pe[small] = np.minimum(1.0, 2.0 * np.minimum(pl, 1.0 - pl))
+    return pe, mu, np.sqrt(var)
+
+
+def _score_cells(co, so_a, sr_b, st, W, kde_below):
+    co = np.ascontiguousarray(co, dtype=np.float32)
+    sr_b = np.ascontiguousarray(sr_b, dtype=np.float32)
+    so_a = np.ascontiguousarray(so_a, dtype=np.float64); st = np.ascontiguousarray(st, dtype=np.float64)
+    N = co.shape[1]
+    le, ge, mu, var = _tail_kernel(co, so_a, sr_b, st, float(W), 1.0)
+    pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
+    small = np.minimum(le, ge) < kde_below
+    if small.any():
+        sd1 = np.sqrt(var[small] * N / max(N - 1, 1))                       # ddof=1
+        h = np.maximum((N * 3.0 / 4.0) ** (-0.2) * sd1, 1e-6)
+        pl, pr = _kde_kernel(co[small], so_a[small], sr_b[small], st[small], float(W), 1.0, h)
         pe[small] = np.minimum(1.0, 2.0 * np.minimum(pl, pr))
-    return pe, null.mean(1), null.std(1)
+    return pe, mu, np.sqrt(var)
 
 
 def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
-                     dense_min=20000, pblock=256, ablock=32):
+                     dense_min=20000, pblock=256, ablock=256):
     """For each (anchor a, partner b): the observed anchor against b's replicates.
 
     U   : (n_tips, n_traits, N) uint8 replicates
@@ -176,8 +269,8 @@ def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
     so = Ow.sum(0)                                              # T
     sr = np.einsum("t,tjk->jk", w.astype(np.float32), U, dtype=np.float32)  # T x N replicate sums
     E = len(anchors)
-    stat = _lor(np.einsum("te,te->e", Ow[:, anchors], obs[:, partners].astype(np.float32)),
-                so[anchors], (obs * w[:, None])[:, partners].sum(0), W)
+    OO = Ow.T @ obs.astype(np.float32)                           # T x T weighted co-occurrence
+    stat = _lor(OO[anchors, partners].astype(np.float64), so[anchors], so[partners], W)
     p = np.empty(E); mu = np.empty(E); sd = np.empty(E)
     if E < dense_min:
         for s in range(0, E, batch):
@@ -198,12 +291,13 @@ def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
         ab = anchors[idx] // ablock
         o2 = np.argsort(ab, kind="stable"); idx = idx[o2]; ab = ab[o2]
         cuts = np.flatnonzero(np.diff(ab)) + 1
+        srblk = np.ascontiguousarray(sr[p0:p1])
         for grp in np.split(idx, cuts):
             a0 = (anchors[grp[0]] // ablock) * ablock; a1 = min(T, a0 + ablock)
             C = (Ow[:, a0:a1].T @ Uf).reshape(a1 - a0, p1 - p0, N)
-            co = C[anchors[grp] - a0, partners[grp] - p0, :]
-            p[grp], mu[grp], sd[grp] = _score_cells(co, so[anchors[grp]], sr[partners[grp]],
-                                                    stat[grp], W, kde_below)
+            p[grp], mu[grp], sd[grp] = _score_block(
+                C, (anchors[grp] - a0).astype(np.int64), (partners[grp] - p0).astype(np.int64),
+                so[anchors[grp]].astype(np.float64), srblk, stat[grp].astype(np.float64), W, kde_below)
     return stat, p, mu, sd
 
 
@@ -331,13 +425,18 @@ def region_eligibility(ta, obs, root_states, pairs_index, tips_names=None):
 def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch_cap=None,
                  seed=None, weighted=True, combine="max", gate=None, gate_q=0.95, gate_p=None,
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
-                 lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1):
+                 lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1,
+                 chunk=2000):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
     Returns a DataFrame aligned to pairs_index.
     """
     from .uncertainty import gsc_weights
+    TIMINGS.clear()
+    _t = [time.perf_counter()]
+    def lap(name):
+        now = time.perf_counter(); TIMINGS[name] = TIMINGS.get(name, 0.0) + now - _t[0]; _t[0] = now
     ta = tree_arrays(tree, branch_cap)
     obs = (np.nan_to_num(np.asarray(obs_traits, float)) > 0.5).astype(np.float32)
     w = gsc_weights(tree, branch_cap).astype(np.float32) if weighted else np.ones(obs.shape[0], np.float32)
@@ -366,9 +465,12 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
         mult = lineage_multipliers(tree, ta, obs, trait_params, lineage, tau=tau, U_packed=Up,
                                    trials=trials, gene_names=list(trait_params.index))
         trait_params = scale_subsizes(trait_params, ta, mult)
+    lap("setup+lineage_model")
     U = unpack_u8(sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta,
                                mult), trials)
+    lap("simulate")
     res = anchored_scores(U, obs, w, pairs_index, combine)
+    lap("score")
     res["gated"] = False
     res["refined"] = False
 
@@ -406,16 +508,26 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                 res.loc[idx, c] = rres[c].to_numpy()
             res.loc[idx, "gated"] = True
 
+    if gate == "overlap":
+        lap("gate")
     if lineage == "sup" or composite:
         # Composite null: independence under the whole-tree model OR under the
-        # pair-region model; report the supremum p.  Computed only where it can
-        # matter (p < sup_p >= the significance level), which leaves BH/BY
-        # rejections at levels <= sup_p unchanged.
-        cand = np.flatnonzero(res["p-value"].to_numpy() < sup_p)
+        # pair-region model; report the supremum p.  BH/BY are monotone (larger
+        # p-values never add rejections), so the region null is only needed for
+        # pairs BH rejects at level sup_p on the whole-tree p (m = number of
+        # pairs, a superset of any rejection set at levels <= sup_p).  Decisions
+        # at those levels are exactly those of the full composite test.
+        pt = res["p-value"].to_numpy()
+        m = len(pt)
+        order = np.argsort(pt)
+        ok = pt[order] <= sup_p * np.arange(1, m + 1) / m
+        kmax = (np.flatnonzero(ok).max() + 1) if ok.any() else 0
+        cand = np.sort(order[:kmax])
         res["p_region"] = np.nan
-        if cand.size:
-            gp = pairs_index[cand]
-            root = trait_params["root_state"].to_numpy().astype(int)
+        root = trait_params["root_state"].to_numpy().astype(int)
+        for c0 in range(0, cand.size, chunk):
+            cc = cand[c0:c0 + chunk]
+            gp = pairs_index[cc]
             E, rbl = region_eligibility(ta, obs, root, gp)
             src = gp.reshape(-1)
             P2 = trait_params.iloc[src].copy()
@@ -426,9 +538,11 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
             k = np.arange(len(gp))
             rres = anchored_scores(Ur, obs[:, src], w, np.stack([2 * k, 2 * k + 1], axis=1), combine)
             pr = rres["p-value"].to_numpy()
-            res.loc[cand, "p_region"] = pr
-            res.loc[cand, "p-value"] = np.maximum(res.loc[cand, "p-value"].to_numpy(), pr)
-            res.loc[cand, "gated"] = pr > res.loc[cand, "p-value"].to_numpy() - 1e-15
+            res.loc[cc, "p_region"] = pr
+            res.loc[cc, "gated"] = pr > res.loc[cc, "p-value"].to_numpy()
+            res.loc[cc, "p-value"] = np.maximum(res.loc[cc, "p-value"].to_numpy(), pr)
+        TIMINGS["composite_pairs"] = int(cand.size)
+        lap("composite")
 
     if refine_p is not None:
         cand = np.flatnonzero((res["p-value"].to_numpy() < refine_p) & ~res["gated"].to_numpy())
@@ -443,6 +557,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
             res.loc[cand, "p-value"] = mc["p-value"].to_numpy()
             res.loc[cand, "refined"] = True
             res.loc[cand, "n_null"] = mc["n_null"].to_numpy()
+        lap("refine")
     return res
 
 
