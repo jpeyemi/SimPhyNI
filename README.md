@@ -119,13 +119,45 @@ simphyni run \
 
 #### Null model options
 
-The defaults below were chosen by benchmarking calibration and power on 11 PanX species trees (103–500 strains), with synthetic, real-gene, late-emerging and lineage-restricted traits (`benchmarks/panx/` on the `panx-benchmark` branch).
+The defaults were chosen by benchmarking calibration, power and speed on 11 PanX species trees
+(103–500 strains) with synthetic, real-gene, late-emerging and lineage-restricted traits, and on
+*E. coli* at genome scale (4,501 genes, 10.1 M pairs; 8.4 M known-truth pairs). Details:
+`candidates/README.md` and `benchmarks_large/REPORT.md`.
 
-* `--condition prevalence|footprint|none` (default `prevalence`) and `--oversample K` (default 8) — Each trait's null is conditioned on the observed trait. `K × 64` replicates are simulated and the 64 closest to the observed trait are kept, by prevalence or (`footprint`) by prevalence and number of parsimony changes. Without this, traits that changed only once or twice are simulated with their events on short tip branches, so their null copies are scattered fragments rather than the observed clade, and their null co-occurrence is far too narrow. `footprint` has more power and is close to nominal on most trees, but is less robust on very clonal trees.
-* `--branch-cap iqr|none` (default `iqr`) — Simulate with the same long-branch cap used for the rate estimate. Rates are estimated on capped branch lengths. Applying them to uncapped lengths makes long deep branches flip in almost every replicate on clonal trees, where most tree length can lie above the cap.
-* `--emergence none|dist|scaled|soft|mrca` (default `none`) — The time-to-first-event threshold (`dist`, the previous default) made the null too narrow, even for traits that really do emerge late. `mrca` restricts events to the subtree of the trait's minority-state tips and is conservative but loses most power.
-* `--eligibility none|phylogroup|adaptive` (default `none`) — Restrict each trait's null to lineages it can enter. `phylogroup` cuts the tree at `--phylogroup-depth` (default 0.2 of tree depth) and allows events only in phylogroups where the trait is observed. `adaptive` excludes a phylogroup only when the trait is absent there *and* the unrestricted null would almost never leave it empty (`--adapt-alpha`, default 0.05), so sparse traits are not restricted. Useful for trees spanning several species, where some genes can never enter some lineages.
+**Default null.** No flags are needed.
 
+- **Weighted statistic.** The log odds ratio is computed on phylogenetic tip weights
+  (Gerstein–Sonnhammer–Chothia), so a clade inherited from one gain counts once rather than once per
+  tip.
+- **Anchored null.** Each trait is simulated 512 times from its fitted gain/loss process; the
+  per-branch transitions are exact. Each observed trait is then scored against its partner's
+  replicates, in both directions, and the larger p is reported. That p is valid if either trait's
+  model is right. No replicates are discarded.
+- **Calibrated tails.**
+  - Below the resolution of the replicates, p-values come from a generalized-Pareto tail (shape ≥ 0),
+    so they are never extrapolated to 0.
+  - Pairs with p < 0.01 are re-tested with 32,768 fresh replicates.
+
+**Flags.**
+
+- `--refine-p P` (default 0.01, `0` disables), `--refine-max-pairs N` (default 5000),
+  `--refine-n N` (default 32768): the refinement stage.
+- `--lineage none|soft_auto` and `--composite`: control for genes confined to the same lineages
+  (plasmid-, phage- or phylogroup-specific).
+  - `soft_auto` lowers each trait's rate with distance from its own clade, on a scale fitted to the
+    data.
+  - `--composite` reports max(p whole-tree, p pair-region), which is valid if either null holds.
+  - Use both for pangenomes with lineage-restricted genes, and read significant pairs as
+    "association beyond shared confinement".
+- `--trials N` (default 512): replicates per trait.
+- `--branch-cap iqr|none` (default `iqr`): simulate with the same long-branch cap used for the rate
+  estimate.
+- `--null legacy`: the previous null. It is unweighted, simulates replicate-vs-replicate pairs with
+  prevalence conditioning (`--condition`, `--oversample`) and uses KDE tails. It is about 50× slower
+  at genome scale and anticonservative below 1e-5.
+
+**Reading results.** Select pairs with `pval_bh < 0.05`, then order them by `effect_shrunk`.
+`pval_by` is the strict alternative.
 
 ### Run mode (batch)
 
@@ -195,14 +227,19 @@ Contains the statistical results for all tested trait pairs.
 | Column | Description |
 | --- | --- |
 | `T1` / `T2` | Identifiers for the two traits being compared. |
-| `direction` | Direction of association: `1` = Positive, `-1` = Negative. |
-| `effect size` | Variance-adjusted magnitude of the association. |
+| `direction` | Direction of association: `1` = positive (co-occurrence), `-1` = negative (avoidance). |
+| `effect size` | Standardised association: \|observed − null mean\| / null SD of the weighted log odds ratio. |
+| `effect_lor`, `effect_se` | Observed weighted log odds ratio minus the null mean, and the null SD. |
+| `effect_shrunk` | Empirical-Bayes posterior mean of `effect_lor` (adaptive shrinkage over all pairs); recommended for ordering. |
+| `lfsr` | Local false sign rate of the association. |
 | `prevalence_T1` / `prevalence_T2` | Fraction of samples containing each trait (0.0 to 1.0). |
-| `pval_naive` | Raw empirical P-value from the simulation. |
-| `pval_bh` | Benjamini-Hochberg FDR correction (recommended for phenotype-genotype tests). |
-| `pval_by` | Benjamini-Yekutieli FDR correction (recommended for genotype-genotype tests; accounts for correlated hypotheses, which is the typical case for phylogenetically structured data). |
-| `pval_bonf` | Bonferroni correction (strictest; use when a small number of specific hypotheses are tested). |
-| `null_calibrated` | `True` for standard results. `False` for pairs involving traits whose null distributions were detected as miscalibrated (see `--include-flagged`). |
+| `pval_naive` | Raw p-value (anchored null, generalized-Pareto tail). |
+| `pval_bh` | Benjamini-Hochberg FDR correction (recommended). |
+| `pval_by` | Benjamini-Yekutieli FDR correction (strict; valid under arbitrary dependence). |
+| `pval_bonf` | Bonferroni correction. |
+| `refined` | The p-value comes from the 32,768-replicate refinement stage. |
+| `gated` | With `--composite`: the pair-region null gave the larger p-value. |
+| `null_calibrated` | `False` for pairs involving traits flagged as possibly miscalibrated (see `--include-flagged`). |
 
 ### Additional Outputs
 

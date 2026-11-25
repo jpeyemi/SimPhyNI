@@ -645,27 +645,36 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
         cand = np.sort(order[:kmax])
         res["p_region"] = np.nan
         root = trait_params["root_state"].to_numpy().astype(int)
-        for c0 in range(0, cand.size, chunk):
-            cc = cand[c0:c0 + chunk]
-            gp = pairs_index[cc]
+
+        def _region_setup(gp):
             E, rbl = region_eligibility(ta, obs, root, gp)
             src = gp.reshape(-1)
             P2 = trait_params.iloc[src].copy()
             rb = np.repeat(rbl, 2)
             P2["gain_subsize"] = rb; P2["loss_subsize"] = rb
-            el = np.repeat(E, 2, axis=0)
-            Ur = unpack_u8(sim_bit_fast(tree, P2, trials, branch_cap, int(rng.integers(2**31)), ta, el), trials)
             k = np.arange(len(gp))
-            rres = anchored_scores(Ur, obs[:, src], w, np.stack([2 * k, 2 * k + 1], axis=1), combine)
-            pr = rres["p-value"].to_numpy().copy()
-            if refine_p is not None and refine_mode == "gpd":
-                rc = np.flatnonzero(pr < refine_p)
-                if rc.size:
-                    pr[rc] = refine_gpd(tree, ta, P2, np.stack([2 * k, 2 * k + 1], axis=1), obs[:, src], w,
-                                        rc, N=refine_n, frac=refine_frac, combine=combine, rng=rng, mult=el)
-            res.loc[cc, "p_region"] = pr
-            res.loc[cc, "gated"] = pr > res.loc[cc, "p-value"].to_numpy()
-            res.loc[cc, "p-value"] = np.maximum(res.loc[cc, "p-value"].to_numpy(), pr)
+            return src, P2, np.repeat(E, 2, axis=0), np.stack([2 * k, 2 * k + 1], axis=1)
+
+        pr_all = np.empty(cand.size)
+        for c0 in range(0, cand.size, chunk):
+            gp = pairs_index[cand[c0:c0 + chunk]]
+            src, P2, el, kp = _region_setup(gp)
+            Ur = unpack_u8(sim_bit_fast(tree, P2, trials, branch_cap, int(rng.integers(2**31)), ta, el), trials)
+            pr_all[c0:c0 + len(gp)] = anchored_scores(Ur, obs[:, src], w, kp, combine)["p-value"].to_numpy()
+        if refine_p is not None and refine_mode == "gpd":
+            # refine the region p of at most refine_max_pairs candidates overall
+            rc = np.flatnonzero(pr_all < refine_p)
+            if refine_max_pairs and rc.size > refine_max_pairs:
+                rc = np.sort(rc[np.argsort(pr_all[rc], kind="stable")[:refine_max_pairs]])
+            for c0 in range(0, rc.size, chunk):
+                sel = rc[c0:c0 + chunk]
+                src, P2, el, kp = _region_setup(pairs_index[cand[sel]])
+                pr_all[sel] = refine_gpd(tree, ta, P2, kp, obs[:, src], w, np.arange(len(sel)), N=refine_n,
+                                         frac=refine_frac, combine=combine, rng=rng, mult=el)
+            TIMINGS["composite_refined"] = int(rc.size)
+        res.loc[cand, "p_region"] = pr_all
+        res.loc[cand, "gated"] = pr_all > res.loc[cand, "p-value"].to_numpy()
+        res.loc[cand, "p-value"] = np.maximum(res.loc[cand, "p-value"].to_numpy(), pr_all)
         TIMINGS["composite_pairs"] = int(cand.size)
         lap("composite")
 

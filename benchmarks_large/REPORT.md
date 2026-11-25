@@ -1,229 +1,141 @@
-# Large-scale evaluation: E. coli, ~10 M pairs
+# Large-scale evaluation (current defaults)
 
-**Data.** PanX *E. coli* tree, 500 tips (`make_data.py`).
+**Default null.** GSC-weighted anchored null, 512 replicates per trait, exact branch transitions, GPD
+tails, and refinement of pairs with p < 0.01 (at most 5,000, 32,768 replicates). Lineage control is
+`--lineage soft_auto --composite`.
 
-- **real:** the 4,501 accessory genes with 5–95 % prevalence, all-vs-all = **10,127,250 pairs**.
-- **syn:** 4,100 traits with known truth on the same tree, **8,402,950 pairs**. They are generated
-  without SimPhyNI code:
-  - 3,000 null traits: exact F81 paths, with parameters drawn from the real genes, and true change
+**Data.** PanX *E. coli* tree, 500 tips (`make_data.py`):
+
+- **real:** 4,501 accessory genes with 5–95 % prevalence, all-vs-all = **10,127,250 pairs**.
+- **syn:** 4,100 traits with known truth, **8,402,950 pairs**. They are generated without SimPhyNI code:
+  - 3,000 null traits: exact F81 paths with parameters drawn from the real genes; true change
     counts and internal states recorded.
   - 300 planted interacting pairs: exact 4-state CTMC, I = ±1 and ±0.5.
-  - 100 groups of 4 independent traits confined to the same clade, giving 600 co-restricted null pairs.
+  - 600 co-restricted null pairs.
   - 50 interacting pairs inside restricted clades.
 
-All runs used 8 cores on a shared laptop, so absolute times are indicative.
+Runs used 8 cores on a shared laptop.
 
-## 1. Ancestral state reconstruction (`eval_acr_sim.py`)
+## 1. Ancestral state reconstruction
 
 | | value |
 |---|---|
-| fast ACR speed | 4.2 ms / trait (3,000 traits in 12.5 s); real set 17.9 s for 4,501 genes, 0.9 GB peak |
-| PastML speed | 593 ms / trait (140× slower) |
-| fast vs PastML JOINT change counts | Spearman 1.000 |
-| internal-node state accuracy (joint) | 0.966; marginal Brier 0.026 |
-| root state accuracy | 0.85 |
+| speed | 4.2 ms / trait; 4,501 genes in 18 s, 0.9 GB peak (PastML: 593 ms / trait) |
+| agreement with PastML | JOINT change counts identical (Spearman 1.000) |
+| internal-node states | 96.6 % correct (joint); marginal Brier 0.026 |
+| root state | 85 % correct |
 
-The vectorised statistics (identical output to the per-gene loop) and Numba caching cut the
-per-run ACR time from 13 s to 6 s at 1,930 traits.
+**FLOW change counts relative to the true number:**
 
-**Change counts by true number of changes:**
+| true changes | ≤2 | 3–5 | 6–10 | 11–20 | 21–50 | >50 |
+|---|---|---|---|---|---|---|
+| FLOW / true | 1.05 | 1.02 | 1.01 | 0.96 | 0.84 | 0.17 |
 
-| true changes | n | JOINT / true | FLOW / true |
-|---|---|---|---|
-| ≤2 | 53 | 1.00 | 1.05 |
-| 3–5 | 172 | 0.95 | 1.02 |
-| 6–10 | 345 | 0.93 | 1.01 |
-| 11–20 | 542 | 0.86 | 0.96 |
-| 21–50 | 565 | 0.72 | 0.84 |
-| >50 | 1,323 | 0.12 | 0.17 |
-
-FLOW counts are accurate up to about 20 changes per trait and saturate beyond that, because
-repeated changes on a branch are invisible from the tips. Any tip-based reconstruction has this
-limit. The rates for fast-evolving traits are therefore underestimated, so their null copies are
-more clumped than the truth, which errs conservative.
+Counts are accurate up to about 20 changes per trait and saturate beyond that. Repeated changes on
+a branch are invisible from the tips, a limit of any tip-based reconstruction. The underestimated
+rates make null copies of fast-evolving traits more clumped than the truth, which errs
+conservative.
 
 ## 2. Null simulation
 
-**Accuracy.** `sim_bit_fast` was run at the *true* rates with the true root, against exact F81
-paths (1,024 replicates, 300 traits). Values are median |relative difference| of per-trait statistics.
+**Accuracy.** At the true rates, against exact F81 paths (300 traits × 1,024 replicates), the median
+relative difference is:
 
-| simulator | mean prevalence | prevalence spread | parsimony changes | fast-evolving traits: changes |
-|---|---|---|---|---|
-| at most one change per branch (original `sim_bit` model) | 8.4 % | 5.6 % | 6.9 % | 21 % |
-| **exact two-state transition per branch (now)** | **1.0 %** | **2.4 %** | **0.7 %** | **0.6 %** |
+- 1.0 % in mean prevalence;
+- 2.4 % in prevalence spread;
+- 0.7 % in parsimony changes, including fast-evolving traits.
 
-The original model drew one Bernoulli(1 − e^(−rate·t)) event per branch. It saturates at 1
-instead of at the stationary frequency. The kernel now uses P(0→1) = π(1 − e^(−μt)) and
-P(1→0) = (1 − π)(1 − e^(−μt)).
+Each branch uses the exact two-state transition, P(0→1) = π(1 − e^(−μt)). The earlier model allowed at
+most one change per branch and was 7–21 % off.
 
-**Speed.** 4,501 traits × 512 replicates take 0.8–2.0 s.
+**Speed.** 4,501 traits × 512 replicates take about 1 s.
 
 ## 3. Statistics
 
-### Tail estimation was the problem at genome scale
+### Tail calibration
 
 BY at 8.4 M tests needs p ≈ 10⁻⁸–10⁻¹⁰. With 512 replicates, anything below about 2×10⁻³ is
-extrapolated.
+extrapolated. A Gaussian-KDE tail decays like a normal density with a tiny bandwidth just past the
+sample, and returned p of 10⁻¹⁵–10⁻³⁸ for null pairs whose exact Monte-Carlo p was 10⁻⁴–10⁻³
+(`diag_tail.py`). The default therefore fits a generalized Pareto distribution to the top of each null,
+by probability-weighted moments with shape ≥ 0, so it never returns p = 0.
 
-On the synthetic set, with the default (weighted + anchored) and the earlier Gaussian-KDE tail:
+**Common pair sample** (all planted pairs + 625,000 random null pairs; Bonferroni for 8.4 M = 6×10⁻⁹):
 
-| threshold | 1e-2 | 1e-3 | 1e-4 | 1e-5 | 1e-6 |
-|---|---|---|---|---|---|
-| null ratio (observed ÷ nominal) | 0.26 | 0.22 | 0.70 | **3.0** | **15** |
+| | null ratio @1e-4 / 1e-5 / 1e-6 | null pairs < Bonferroni | ranking AP + / − |
+|---|---|---|---|
+| **default** | 0.02 / 0 / 0 | **0** | **0.37 / 0.30** |
+| same null with a KDE tail | 0.8 / 3.7 / 19 | 3 | 0.38 / 0.31 |
+| legacy null (unweighted, prevalence ×8, KDE) | 1.8 / 12.6 / **82** | **33** | 0.22 / 0.09 |
 
-That gave 150 calls at BY 0.05, of which 69 were true nulls (**51 % false discoveries**).
+Over all 8.4 M pairs, the default made no false calls at BH or BY 0.05. With a KDE tail, 66 % of BH
+calls were false.
 
-`diag_tail.py` re-tested the 80 worst null pairs with exact Monte-Carlo counts (262,144
-replicates):
+### Detectability at genome scale
 
-- KDE p-values of 10⁻¹⁵–10⁻³⁸ had exact p of 10⁻⁴–10⁻³.
-- A Gaussian kernel past the edge of a 512-value sample decays like a normal density with a tiny
-  bandwidth.
-
-**Fix: generalized Pareto tail.** It is fitted by probability-weighted moments to the top 10 % of
-each null (Knijnenburg et al. 2009), with shape ≥ 0, i.e. exponential or heavier. The constraint is
-conservative, and the estimate can never return 0. Letting the shape go negative (a bounded tail)
-returns p = 0 beyond the fitted endpoint, which is the KDE failure again.
-
-On the same 80 pairs:
-
-| tail | median p / exact MC p | share > 10× too small |
-|---|---|---|
-| KDE | 10^−1.5 | 56 % |
-| **GPD** | 10^+0.33 (≈2× conservative) | **0 %** |
-
-### Genome-wide comparison on a common pair sample
-
-`eval_thresholds.py` uses all planted pairs plus 625,000 random null pairs, so the old default
-could run too. Bonferroni for 8.4 M pairs is 6×10⁻⁹.
-
-| method | null ratio @1e-4 / 1e-5 / 1e-6 | null pairs < Bonferroni | strong + / − pairs with p < Bonferroni | ranking AP + / − | s for 8.4 M pairs |
-|---|---|---|---|---|---|
-| old default (unweighted, prevalence ×8, KDE over 64×64 pairings) | 1.8 / 12.6 / **82** | **33** | 0.27 / 0.08 | 0.22 / 0.09 | ≈2,900 (extrapolated) |
-| anchored, KDE tail | 0.8 / 3.7 / 19 | 3 | 0.37 / 0.19 | 0.38 / 0.31 | 95 |
-| **anchored, GPD tail (default)** | 0 / 0 / 0 | **0** | 0.04 / 0.01 | 0.37 / 0.31 | 84 |
-| anchored, GPD + refinement (p < 1e-3 → 32,768 replicates) | 0.02 / 0 / 0 | 0 | 0.09 / 0 | 0.37 / 0.30 | 110 |
-| soft auto + composite, GPD | 0 / 0 / 0 | 0 | 0.03 / 0 | 0.37 / 0.29 | 109 |
-
-### Is the planted signal detectable at genome-wide thresholds?
-
-`truth_mc.py` ran exact anchored Monte-Carlo with **4.2 million replicates per direction** for 20
-planted strong positive pairs (OR = 100):
+`truth_mc.py` ran exact anchored Monte-Carlo with 4.2 M replicates per direction for 20 planted strong
+pairs:
 
 - 14 have true p between 10⁻² and 10⁻⁵.
 - 5 are below the Monte-Carlo floor (4.8×10⁻⁷).
 
-The calibrated pipeline's p-values track these (e.g. 3.9e-5 vs 5.9e-5; 1.1e-3 vs 2.9e-4; 2.7e-6
-vs < 4.8e-7), and are conservative where they differ.
+The default's p-values track these, conservative where they differ. Most planted interactions are
+therefore **not genome-wide significant under the correct null**. Genome-wide runs are best used to
+rank candidates, followed by focused tests on smaller trait sets.
 
-So most planted interactions are **not genome-wide significant under the correct null**. The
-KDE-based "recall" at Bonferroni came from p ≈ 0 for pairs whose true p was 10⁻³–10⁻⁵. The low
-Bonferroni recall of the calibrated configurations is mostly real. Ranking is unaffected
-(AP 0.37 / 0.31, against 0.22 / 0.09 for the old default).
+### FDR-based reporting (PanX full tier: 11 species, ≤250 tips, 3 replicates)
 
-More replicates did not change this. A two-tier refinement (p < 1e-2 → 32,768; p < 1e-5 →
-262,144) gave the same Bonferroni recall in 16 minutes.
+Cells are recall / observed FDP at BH q < 0.05 (`report_panx.py`; full table in
+`report_full_tier.md`):
 
-## 4. Lineage control at scale
+| configuration | synthetic | late-emerging | restricted | BY synthetic recall |
+|---|---|---|---|---|
+| **default** | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 0.22 |
+| default + lineage control | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 0.19 |
+| legacy null | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 0.15 |
+| FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 0.19 |
+| Fisher | 0.77 / 0.65 | 0.81 / 0.52 | 0.52 / 0.81 | 0.69 |
 
-On the synthetic set, with the GPD tail, at p < 0.01 (BY calls were 0 everywhere):
+- BH controls the FDR everywhere except lineage restriction. That case is covered in
+  `candidates/LINEAGE.md`.
+- BY costs about 40 % of recall relative to BH.
 
-| | co-restricted ratio @0.01 | separately restricted ratio @0.01 |
+**Ordering on synthetic pairs:**
+
+| rank by | AP | recall at precision ≥ 0.95 |
 |---|---|---|
-| default | 11.5 | 1.6 |
-| soft auto + composite | 7.2 | 3.4 |
+| p-value | 0.841 | 0.57 |
+| \|effect\| | 0.851 | 0.59 |
+| **effect_shrunk** | **0.857** | **0.60** |
 
-On real *E. coli* (10.1 M pairs), BY < 0.05 hits:
+## 4. Real E. coli (10.1 M pairs): speed and calls
 
-| configuration | hits | genes involved |
+| stage | default | lineage control |
 |---|---|---|
-| default | 22,646 (98 % positive associations) | 2,736 |
-| soft auto + composite | 18,970 (92 % of them also default hits) | 2,458 |
-| earlier KDE tail | 68,225 | — |
+| ACR (once per tree) | 18 s | 18 s |
+| pairs + observed statistics | 28 s | 28 s |
+| τ selection | — | 27 s |
+| simulation (4,501 × 512) | 1 s | 1 s |
+| scoring (anchored, GPD tails) | 71 s | 71 s |
+| refinement (5,000 pairs) | 175 s | 179 s |
+| composite (37,645 candidates; 5,000 refined) | — | 331 s |
+| **total (excluding ACR)** | **299 s** | **663 s** |
+| peak memory | 4.7 GB | 4.4 GB |
+| BH / BY < 0.05 calls | 38,174 / 22,629 | 31,618 / 18,851 |
 
-Of the default's GPD hits, 99.7 % were also KDE hits; the KDE added 45,000 more.
-
-Soft auto + composite still reduces same-clade false positives at moderate thresholds. At genome
-scale, co-restricted pairs did not reach BY significance under either configuration, because the
-deep tail now controls them. Lineage-control performance therefore does **not** fall off with scale
-on these data. Separately restricted pairs get worse under soft restriction, about 2× at p < 0.01,
-which is worth watching. The hidden-accessibility model is the right next step if real analyses
-show co-restriction driving calls, but these data do not show that yet.
-
-## 5. Speed, real data (10,127,250 pairs, 4,501 genes)
-
-| stage | default | soft auto + composite |
-|---|---|---|
-| ACR (once per tree, cached) | 17.9 s | 17.9 s |
-| pair enumeration + observed statistics | 28.8 s | 28.4 s |
-| τ selection | — | 27.1 s |
-| simulation (4,501 × 512) | 0.9 s | 0.8 s |
-| scoring (anchored, GPD tails) | 69.3 s | 70.7 s |
-| composite (37,998 candidate pairs) | — | 37.9 s |
-| results + write | 4 s | 4 s |
-| **total** | **≈2.2 min** (116 s + ACR) | **≈3.3 min** |
-| peak memory | 5.9 GB | 6.1 GB |
-
-Scoring went from 184 s to 46 s (KDE) by fusing the null-statistic, tail-count and moment
-computations into Numba kernels that read each BLAS block in place, and by using larger blocks.
-The GPD tail adds about 23 s.
-
-The old default would need about 50 minutes for the same pairs (626,000 pairs in 218 s) and is
-not calibrated at these thresholds.
+Lineage control removes 8,032 of the default's BH calls (21 %), which shared confinement explains or
+which lose significance, and adds 1,476. The legacy null would need about 50 minutes for these pairs
+and is anticonservative below 10⁻⁵.
 
 ## Reproduce
 
 ```bash
 python benchmarks_large/make_data.py <panx-benchmark>/benchmarks/panx <out>
-python benchmarks_large/run_pipeline.py <out>/real <out>/runs/real default
-python benchmarks_large/run_pipeline.py <out>/syn  <out>/runs/syn  soft_auto_composite
-python benchmarks_large/eval_stats.py <out>/syn <out>/runs/syn/results_*.parquet
+python benchmarks_large/run_pipeline.py <out>/real <out>/runs/real default             # or soft_auto_composite
+python benchmarks_large/run_pipeline.py <out>/syn  <out>/runs/syn  default
+python benchmarks_large/eval_stats.py <out>/syn <out>/runs/syn/results_default.parquet
 python benchmarks_large/eval_acr_sim.py <out>/syn 300 --pastml 150
 python benchmarks_large/eval_thresholds.py <out>/syn <out>/syn/pairs_sample.csv <results...>
 python benchmarks_large/truth_mc.py <out>/syn <out>/runs/syn <results.parquet> pos1 20 16
+python benchmarks_large/report_panx.py <runs/full> <datasets/full> <variants...> --md report.md
 ```
-
-## 6. FDR-based reporting (PanX full tier, 11 species, 3 replicates)
-
-**Method.** Selection uses BH at q < 0.05, with BY as the strict option. Each recall is shown next to
-the observed false discovery proportion (FDP) of the calls, per scenario. Ordering quality is
-reported for three rankings: by p, by |effect|, and by the empirical-Bayes shrunken effect
-(`effect_shrunk`, adaptive-shrinkage prior over all pairs). Generated with `report_panx.py`; the
-full table is in `report_full_tier.md`.
-
-| configuration | BH synthetic recall / FDP | BH late-emerging recall / FDP | BH restricted recall / FDP | BY synthetic recall | null ratio @1e-4 |
-|---|---|---|---|---|---|
-| old default (prevalence ×8) | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 0.15 | 1.9 |
-| anchored, KDE tail, approx. simulator | 0.34 / 0.001 | 0.49 / 0.018 | 0.31 / 0.58 | 0.25 | 3.2 |
-| anchored, KDE tail, exact simulator | 0.32 / 0 | 0.47 / 0.011 | 0.29 / 0.57 | 0.22 | 1.8 |
-| anchored, GPD tail, exact simulator | 0.28 / 0.002 | 0.44 / 0.016 | 0.42 / 0.63 | 0.09 | 0.13 |
-| **anchored, GPD + refinement** (p < 0.01, ≤ 5,000 pairs, 32,768 replicates) | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 0.22 | 3.9 |
-| soft auto + composite (KDE, approx. simulator) | 0.26 / 0 | 0.42 / 0.007 | 0.12 / **0.37** | 0.18 | 0.27 |
-| soft auto + composite, GPD + refinement | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 0.19 | 4.6 |
-| FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 0.19 | 143 |
-| Fisher | 0.77 / 0.65 | 0.81 / 0.52 | 0.52 / 0.81 | 0.69 | 1,243 |
-
-Ordering on synthetic pairs (pairs of anchored configurations):
-
-| rank by | AP | recall at precision ≥ 0.95 |
-|---|---|---|
-| p-value | 0.841 | 0.57 |
-| abs(effect) (z-like) | 0.851 | 0.59 |
-| **shrunken effect** | **0.857** | **0.60** |
-
-**What this shows.**
-
-1. **BY, not the tail estimator, caused the apparent small-study loss.** With BY, the GPD tail
-   cuts synthetic recall from 0.22 to 0.09. With BH it costs little (0.28 vs 0.32), and with
-   refinement the calibrated tail has the highest recall of any configuration (0.37 synthetic,
-   0.51 late-emerging) at FDP 0–1.4 %. Pair tests share traits and are plausibly positively
-   dependent (PRDS), the condition under which BH controls the FDR.
-2. **Lineage restriction causes the remaining false discoveries, for every method.** In the
-   restricted scenario, BH calls are 37–63 % false for SimPhyNI configurations, 54 % for the old
-   default, 65 % for FaST-LMM and 81 % for Fisher. Soft auto + composite is the lowest, but no
-   configuration controls it. This is the case for the hidden-accessibility model.
-3. **The null ratio at 1e-4 rises with refinement.** The refined p-values resolve the separately
-   restricted nulls (a misspecified model) more precisely. That is a model problem, not an
-   estimator problem: the same configuration has 0 false calls among 8.3 M unrestricted nulls
-   (section 3).
-4. **The shrunken effect is the best ordering**, slightly ahead of |effect| and p.

@@ -50,7 +50,7 @@ Generated with `benchmarks_large/report_panx.py`; the full table is in
 
 ## Genome scale (`benchmarks_large/REPORT.md`)
 
-- **Speed:** *E. coli*, 500 tips, 4,501 genes, **10.1 M pairs**: about 2.2 min end to end (5.9 GB peak).
+- **Speed:** *E. coli*, 500 tips, 4,501 genes, **10.1 M pairs**: about 5 min end to end with refinement (4.7 GB peak); about 11 min with lineage control.
   The legacy null would need about 50 min.
 - **Calibration:** on 8.4 M known-truth pairs, KDE tails were 15× nominal at 1e-6 (51 % of BY calls
   false). The legacy null was 82× nominal at 1e-6. The GPD tail made no false calls, and its
@@ -86,6 +86,3 @@ simphyni run --sample-name focus --tree tree.nwk --traits candidates_first.csv -
   it.
 - **Negative interactions inside restricted clades** remain near chance for every SimPhyNI
   configuration.
-- **Older pages.** The candidate pages A/B/C ([A](A_anchored.md), [B](B_anchored_mean.md),
-  [C](C_anchored_screen.md)) and the overlap gate describe the earlier KDE-tail configurations and are
-  kept for reference.
