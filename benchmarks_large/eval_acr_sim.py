@@ -43,54 +43,59 @@ traits = truth.trait.tolist()
 obs = X[traits]
 
 # ---------------------------------------------------------------- ACR
+SIM_ONLY = "--sim-only" in sys.argv
 t = time.perf_counter()
-om = build_obs_matrix(ta, obs) if build_obs_matrix.__code__.co_argcount == 2 else build_obs_matrix(ta, obs, traits)
-res = fast_acr(ta, om, traits, mode="ml")
-t_acr = time.perf_counter() - t
-pos = {n: i for i, n in enumerate(names)}
-order = np.array([pos[n] for n in ta.node_names])                 # truth rows in ta order
-St = S_true[order, :].T                                           # traits x nodes
-internal = ~ta.is_leaf
-joint_acc = (res.joint_states[:, internal] == St[:, internal]).mean()
-brier = ((res.marginal_p1[:, internal] - St[:, internal]) ** 2).mean()
-root_acc = (res.joint_states[:, ta.root_idx] == truth.true_root.to_numpy()).mean()
-ub = compute_branch_upper_bound(tree)
-stats = pd.DataFrame(_vectorized_stats(ta, res, traits, {g: int(obs[g].sum()) for g in traits}, ub, "all"))
-true_ch = (truth.true_gains + truth.true_losses).to_numpy()
-joint_ch = (stats.gains + stats.losses).to_numpy()
-flow_ch = (stats.gains_flow + stats.losses_flow).to_numpy()
-print(f"ACR fast_acr: {len(traits)} traits in {t_acr:.1f}s ({1e3 * t_acr / len(traits):.2f} ms/trait)")
-print(f"  internal-node joint state accuracy {joint_acc:.4f}; marginal Brier {brier:.4f}; root accuracy {root_acc:.4f}")
-bins = pd.cut(true_ch, [-1, 2, 5, 10, 20, 50, 1e9], labels=["<=2", "3-5", "6-10", "11-20", "21-50", ">50"])
-tab = pd.DataFrame({"true": true_ch, "joint": joint_ch, "flow": flow_ch, "bin": bins}).groupby("bin", observed=True).agg(
-    n=("true", "size"), true_mean=("true", "mean"), joint_mean=("joint", "mean"), flow_mean=("flow", "mean"))
-tab["joint/true"] = tab.joint_mean / tab.true_mean; tab["flow/true"] = tab.flow_mean / tab.true_mean
-print("  changes per trait by true count:\n" + tab.round(3).to_string())
-print(f"  Spearman(true, JOINT) {spearmanr(true_ch, joint_ch).statistic:.3f}; Spearman(true, FLOW) {spearmanr(true_ch, flow_ch).statistic:.3f}")
+if SIM_ONLY:
+    traits = traits[:NS]; obs = obs[traits]
+om = None if SIM_ONLY else build_obs_matrix(ta, obs) if build_obs_matrix.__code__.co_argcount == 2 else build_obs_matrix(ta, obs, traits)
+res = None if SIM_ONLY else fast_acr(ta, om, traits, mode="ml")
+if not SIM_ONLY:
+    t_acr = time.perf_counter() - t
+    pos = {n: i for i, n in enumerate(names)}
+    order = np.array([pos[n] for n in ta.node_names])                 # truth rows in ta order
+    St = S_true[order, :].T                                           # traits x nodes
+    internal = ~ta.is_leaf
+    joint_acc = (res.joint_states[:, internal] == St[:, internal]).mean()
+    brier = ((res.marginal_p1[:, internal] - St[:, internal]) ** 2).mean()
+    root_acc = (res.joint_states[:, ta.root_idx] == truth.true_root.to_numpy()).mean()
+    ub = compute_branch_upper_bound(tree)
+    stats = pd.DataFrame(_vectorized_stats(ta, res, traits, {g: int(obs[g].sum()) for g in traits}, ub, "all"))
+    true_ch = (truth.true_gains + truth.true_losses).to_numpy()
+    joint_ch = (stats.gains + stats.losses).to_numpy()
+    flow_ch = (stats.gains_flow + stats.losses_flow).to_numpy()
+    print(f"ACR fast_acr: {len(traits)} traits in {t_acr:.1f}s ({1e3 * t_acr / len(traits):.2f} ms/trait)")
+    print(f"  internal-node joint state accuracy {joint_acc:.4f}; marginal Brier {brier:.4f}; root accuracy {root_acc:.4f}")
+    bins = pd.cut(true_ch, [-1, 2, 5, 10, 20, 50, 1e9], labels=["<=2", "3-5", "6-10", "11-20", "21-50", ">50"])
+    tab = pd.DataFrame({"true": true_ch, "joint": joint_ch, "flow": flow_ch, "bin": bins}).groupby("bin", observed=True).agg(
+        n=("true", "size"), true_mean=("true", "mean"), joint_mean=("joint", "mean"), flow_mean=("flow", "mean"))
+    tab["joint/true"] = tab.joint_mean / tab.true_mean; tab["flow/true"] = tab.flow_mean / tab.true_mean
+    print("  changes per trait by true count:\n" + tab.round(3).to_string())
+    print(f"  Spearman(true, JOINT) {spearmanr(true_ch, joint_ch).statistic:.3f}; Spearman(true, FLOW) {spearmanr(true_ch, flow_ch).statistic:.3f}")
 
-if "--pastml" in sys.argv:
-    k = int(sys.argv[sys.argv.index("--pastml") + 1])
-    try:
-        import subprocess, tempfile
-        tmp = Path(tempfile.mkdtemp())
-        obs.iloc[:, :k].to_csv(tmp / "x.csv")
-        t = time.perf_counter()
-        r = subprocess.run([sys.executable, str(SRC / "simphyni/scripts/run_ancestral_reconstruction.py"),
-                            "--inputs_file", str(tmp / "x.csv"), "--tree_file", str(syn / "tree.nwk"),
-                            "--output_csv", str(tmp / "p.csv"), "--reconstruction", "all", "--pastml",
-                            "--max_workers", "8"], capture_output=True, text=True)
-        tp = time.perf_counter() - t
-        if r.returncode == 0:
-            P = pd.read_csv(tmp / "p.csv").set_index("gene").loc[traits[:k]]
-            pc = (P.gains + P.losses).to_numpy(); fc = joint_ch[:k]
-            print(f"  PastML: {k} traits in {tp:.1f}s ({1e3 * tp / k:.1f} ms/trait); "
-                  f"Spearman(PastML JOINT, fast JOINT) {spearmanr(pc, fc).statistic:.3f}; "
-                  f"Spearman(PastML JOINT, true) {spearmanr(pc, true_ch[:k]).statistic:.3f}; "
-                  f"fast JOINT vs true {spearmanr(fc, true_ch[:k]).statistic:.3f}")
-        else:
-            print("  PastML failed:", r.stderr[-400:])
-    except Exception as e:  # noqa: BLE001
-        print("  PastML skipped:", e)
+    if "--pastml" in sys.argv:
+        k = int(sys.argv[sys.argv.index("--pastml") + 1])
+        try:
+            import subprocess, tempfile
+            tmp = Path(tempfile.mkdtemp())
+            obs.iloc[:, :k].to_csv(tmp / "x.csv")
+            t = time.perf_counter()
+            r = subprocess.run([sys.executable, str(SRC / "simphyni/scripts/run_ancestral_reconstruction.py"),
+                                "--inputs_file", str(tmp / "x.csv"), "--tree_file", str(syn / "tree.nwk"),
+                                "--output_csv", str(tmp / "p.csv"), "--reconstruction", "all", "--pastml",
+                                "--max_workers", "8"], capture_output=True, text=True)
+            tp = time.perf_counter() - t
+            if r.returncode == 0:
+                P = pd.read_csv(tmp / "p.csv").set_index("gene").loc[traits[:k]]
+                pc = (P.gains + P.losses).to_numpy(); fc = joint_ch[:k]
+                print(f"  PastML: {k} traits in {tp:.1f}s ({1e3 * tp / k:.1f} ms/trait); "
+                      f"Spearman(PastML JOINT, fast JOINT) {spearmanr(pc, fc).statistic:.3f}; "
+                      f"Spearman(PastML JOINT, true) {spearmanr(pc, true_ch[:k]).statistic:.3f}; "
+                      f"fast JOINT vs true {spearmanr(fc, true_ch[:k]).statistic:.3f}")
+            else:
+                print("  PastML failed:", r.stderr[-400:])
+        except Exception as e:  # noqa: BLE001
+            print("  PastML skipped:", e)
+
 
 # ---------------------------------------------------------------- simulator
 sub = truth.iloc[:NS]

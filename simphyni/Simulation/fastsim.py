@@ -1,11 +1,11 @@
 """
 Fast paths for the anchored candidate (explore/uncertainty).
 
-sim_bit_fast       : Numba simulation of the gain/loss process for scalar rates,
-                     no masks and no emergence threshold.  Each 64-trial word
-                     draws its Bernoulli(1 - exp(-rate * bl)) event mask by
-                     geometric skipping, so a branch costs O(expected events)
-                     instead of 64 uniforms.  Same distribution as sim_bit.
+sim_bit_fast       : Numba simulation of the gain/loss process for scalar rates
+                     with optional per-branch rate multipliers.  Each branch uses
+                     the exact two-state CTMC transition probabilities (sim_bit
+                     allows at most one change per branch); each 64-trial word
+                     draws its Bernoulli mask by geometric skipping.
 anchored_scores    : vectorised anchored scoring.  Every pair gets the observed
                      first trait against the second trait's replicates and the
                      reverse; tails are exact counts, refined with the Gaussian
@@ -78,8 +78,16 @@ def _sim_kernel(preorder, parent, bl, leaf_idx, gain_rate, loss_rate, root, n_ch
                 if m <= 0.0:
                     st[v, c] = s
                     continue
-                pg = 1.0 - math.exp(-gain_rate[t] * bl[v] * m)
-                pl = 1.0 - math.exp(-loss_rate[t] * bl[v] * m)
+                # exact two-state CTMC transition over the branch (any number of
+                # changes): P(0->1) = pi (1 - e^{-mu t}), P(1->0) = (1 - pi)(1 - e^{-mu t})
+                mu_ = gain_rate[t] + loss_rate[t]
+                if mu_ > 0.0:
+                    f = 1.0 - math.exp(-mu_ * bl[v] * m)
+                    pg = gain_rate[t] / mu_ * f
+                    pl = loss_rate[t] / mu_ * f
+                else:
+                    pg = 0.0
+                    pl = 0.0
                 g = _bern_word(pg, nb) & ~s
                 l = _bern_word(pl, nb) & s
                 st[v, c] = ((s | g) & ~l) & full
@@ -90,6 +98,9 @@ def _sim_kernel(preorder, parent, bl, leaf_idx, gain_rate, loss_rate, root, n_ch
 
 
 TIMINGS: dict = {}       # stage -> seconds for the last run_anchored call
+TAIL = ["gpd"]           # tail estimator beyond the sample: "gpd" (default) or "kde"
+GPD_FRAC = [0.1]         # share of the null used as GPD exceedances
+GPD_XI_MIN = [0.0]       # lower bound on the GPD shape (0 = exponential tail or heavier)
 
 
 class _TreeArr:
@@ -222,13 +233,75 @@ def _tail_kernel_idx(C, ai, pj, so_a, srblk, stat, W, eps, h, want_kde):
     return le, ge, mu, var, pl
 
 
-def _score_block(C, ai, pj, so_a, srblk, st, W, kde_below):
+@njit(parallel=True, cache=True, fastmath=True)
+def _null_values_idx(C, ai, pj, so_a, srblk, W, eps):
+    E = ai.shape[0]; N = C.shape[2]
+    out = np.empty((E, N))
+    for e in prange(E):
+        s1 = so_a[e]; x = ai[e]; y = pj[e]
+        for k in range(N):
+            a = C[x, y, k]; s2 = srblk[y, k]
+            out[e, k] = math.log(((a + eps) * (W - s1 - s2 + a + eps)) / ((s1 - a + eps) * (s2 - a + eps)))
+    return out
+
+
+def gpd_tail(null, stat, frac=0.1):
+    """Two-sided tail p from a generalized-Pareto fit to each row's exceedances.
+
+    For each side the top frac of the null (ascending for the left side, after
+    negation) are exceedances over u; a GPD is fitted by probability-weighted
+    moments (Hosking & Wallis 1987) with the shape constrained to xi >= 0
+    (exponential or heavier tail, conservative), and
+        P(T >= t) = frac * (1 + xi (t - u) / sigma) ** (-1 / xi).
+    Where t lies inside the sample the empirical count is used instead.
+    Returns two-sided p = min(1, 2 min(left, right)).
+    """
+    E, N = null.shape
+    M = max(int(round(frac * N)), 10)
+    out = np.empty(E)
+    srt = np.sort(null, axis=1)
+    for side in (1, -1):
+        z = srt[:, ::-1] * 1.0 if side == 1 else -srt                   # descending in the tail
+        x = side * stat
+        u = z[:, M]                                                     # threshold: (M+1)-th largest
+        y = np.sort(z[:, :M] - u[:, None], axis=1)                      # exceedances, ascending
+        a0 = y.mean(1)
+        pp = (np.arange(1, M + 1) - 0.35) / M
+        a1 = ((1 - pp)[None, :] * y).mean(1)
+        denom = np.maximum(a0 - 2 * a1, 1e-12)
+        k = a0 / denom - 2.0                                            # Hosking-Wallis shape (k = -xi)
+        sig = 2.0 * a0 * a1 / denom
+        xi = np.clip(-k, GPD_XI_MIN[0], 0.9)
+        sig = np.maximum(a0 * (1.0 - xi), 1e-9)                         # mean excess = sigma / (1 - xi)
+        ex = np.maximum(x - u, 0.0)
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            base = np.maximum(1.0 + xi * ex / sig, 0.0)
+            surv = np.where(np.abs(xi) > 1e-6, base ** (-1.0 / np.where(np.abs(xi) > 1e-6, xi, 1.0)),
+                            np.exp(-ex / sig))
+            surv = np.nan_to_num(surv, nan=0.0, posinf=1.0)
+        pt = (M / N) * surv
+        emp = ((z >= x[:, None] - 1e-9).sum(1) + 1.0) / (N + 1.0)
+        tail = np.where(x > u, np.minimum(pt, emp), emp)
+        if side == 1:
+            right = tail
+        else:
+            left = tail
+    return np.minimum(1.0, 2.0 * np.minimum(left, right))
+
+
+def _score_block(C, ai, pj, so_a, srblk, st, W, kde_below, tail="gpd"):
     N = C.shape[2]
     z = np.zeros(len(ai))
     le, ge, mu, var, _ = _tail_kernel_idx(C, ai, pj, so_a, srblk, st, float(W), 1.0, z, False)
     pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
     small = np.minimum(le, ge) < kde_below
-    if small.any():
+    if small.any() and tail == "gpd":
+        idx = np.flatnonzero(small)
+        for c0 in range(0, idx.size, 20000):
+            ii = idx[c0:c0 + 20000]
+            nv = _null_values_idx(C, ai[ii], pj[ii], so_a[ii], srblk, float(W), 1.0)
+            pe[ii] = gpd_tail(nv, st[ii], GPD_FRAC[0])
+    elif small.any():
         sd1 = np.sqrt(var[small] * N / max(N - 1, 1))
         h = np.maximum((N * 3.0 / 4.0) ** (-0.2) * sd1, 1e-6)
         _, _, _, _, pl = _tail_kernel_idx(C, ai[small], pj[small], so_a[small], srblk, st[small],
@@ -245,7 +318,10 @@ def _score_cells(co, so_a, sr_b, st, W, kde_below):
     le, ge, mu, var = _tail_kernel(co, so_a, sr_b, st, float(W), 1.0)
     pe = np.minimum(1.0, 2.0 * (np.minimum(le, ge) + 1.0) / (N + 1.0))
     small = np.minimum(le, ge) < kde_below
-    if small.any():
+    if small.any() and TAIL[0] == "gpd":
+        null = _lor(co[small].astype(np.float64), so_a[small][:, None], sr_b[small].astype(np.float64), W)
+        pe[small] = gpd_tail(null, st[small], GPD_FRAC[0])
+    elif small.any():
         sd1 = np.sqrt(var[small] * N / max(N - 1, 1))                       # ddof=1
         h = np.maximum((N * 3.0 / 4.0) ** (-0.2) * sd1, 1e-6)
         pl, pr = _kde_kernel(co[small], so_a[small], sr_b[small], st[small], float(W), 1.0, h)
@@ -297,7 +373,8 @@ def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
             C = (Ow[:, a0:a1].T @ Uf).reshape(a1 - a0, p1 - p0, N)
             p[grp], mu[grp], sd[grp] = _score_block(
                 C, (anchors[grp] - a0).astype(np.int64), (partners[grp] - p0).astype(np.int64),
-                so[anchors[grp]].astype(np.float64), srblk, stat[grp].astype(np.float64), W, kde_below)
+                so[anchors[grp]].astype(np.float64), srblk, stat[grp].astype(np.float64), W, kde_below,
+                TAIL[0])
     return stat, p, mu, sd
 
 
@@ -426,7 +503,8 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                  seed=None, weighted=True, combine="max", gate=None, gate_q=0.95, gate_p=None,
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
                  lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1,
-                 chunk=2000):
+                 chunk=2000, refine_mode="gpd", refine_n=32768, refine_frac=0.01, xi_min=0.0,
+                 refine_tiers=None):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
@@ -434,6 +512,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
     """
     from .uncertainty import gsc_weights
     TIMINGS.clear()
+    GPD_XI_MIN[0] = xi_min
     _t = [time.perf_counter()]
     def lap(name):
         now = time.perf_counter(); TIMINGS[name] = TIMINGS.get(name, 0.0) + now - _t[0]; _t[0] = now
@@ -470,9 +549,22 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                                mult), trials)
     lap("simulate")
     res = anchored_scores(U, obs, w, pairs_index, combine)
-    lap("score")
     res["gated"] = False
     res["refined"] = False
+    lap("score")
+    if refine_p is not None and refine_mode == "gpd":
+        # one or more tiers: (p threshold, replicates, GPD exceedance share); each tier
+        # uses fresh replicates for the pairs still below its threshold
+        tiers = refine_tiers or [(refine_p, refine_n, refine_frac)]
+        for ti, (tp, tn, tf) in enumerate(tiers):
+            cand = np.flatnonzero(res["p-value"].to_numpy() < tp)
+            if cand.size:
+                pr = refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=int(tn),
+                                frac=tf, combine=combine, rng=rng, mult=mult)
+                res.loc[cand, "p-value"] = pr
+                res.loc[cand, "refined"] = True
+            TIMINGS[f"refined_pairs_t{ti}"] = int(cand.size)
+            lap(f"refine_t{ti}")
 
     if gate == "overlap":
         D = tip_distance_matrix(ta)
@@ -538,13 +630,18 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
             k = np.arange(len(gp))
             rres = anchored_scores(Ur, obs[:, src], w, np.stack([2 * k, 2 * k + 1], axis=1), combine)
             pr = rres["p-value"].to_numpy()
+            if refine_p is not None and refine_mode == "gpd":
+                rc = np.flatnonzero(pr < refine_p)
+                if rc.size:
+                    pr[rc] = refine_gpd(tree, ta, P2, np.stack([2 * k, 2 * k + 1], axis=1), obs[:, src], w,
+                                        rc, N=refine_n, frac=refine_frac, combine=combine, rng=rng, mult=el)
             res.loc[cc, "p_region"] = pr
             res.loc[cc, "gated"] = pr > res.loc[cc, "p-value"].to_numpy()
             res.loc[cc, "p-value"] = np.maximum(res.loc[cc, "p-value"].to_numpy(), pr)
         TIMINGS["composite_pairs"] = int(cand.size)
         lap("composite")
 
-    if refine_p is not None:
+    if refine_p is not None and refine_mode == "mc":
         cand = np.flatnonzero((res["p-value"].to_numpy() < refine_p) & ~res["gated"].to_numpy())
         if cand.size:
             from .uncertainty import anchored_mc_pairs
@@ -740,3 +837,36 @@ def confined_traits(tree, ta, obs, trait_params, K=64, alpha=0.1, seed=None):
             continue
         pit[t] = ((sim < so).sum() + 0.5 * (sim == so).sum() + 1) / (len(sim) + 1)
     return np.nan_to_num(pit, nan=1.0) < alpha, pit
+
+
+def refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=32768, frac=0.01,
+               combine="max", rng=None, max_traits=48, batch=4, mult=None):
+    """Second stage for candidate pairs: fresh N replicates per trait, anchored
+    tails with a GPD fitted to the top `frac` of each null (Knijnenburg et al.
+    2009).  Processes candidates in groups of <= max_traits traits."""
+    rng = rng or np.random.default_rng()
+    out = np.empty(len(cand))
+    order = np.argsort(pairs_index[cand, 0], kind="stable")
+    groups, cur, cur_t = [], [], set()
+    for c in order:
+        i, j = pairs_index[cand[c]]
+        if len(cur_t | {i, j}) > max_traits and cur:
+            groups.append(cur); cur, cur_t = [], set()
+        cur.append(c); cur_t |= {i, j}
+    if cur:
+        groups.append(cur)
+    old = (TAIL[0], GPD_FRAC[0]); TAIL[0] = "gpd"; GPD_FRAC[0] = frac
+    try:
+        for g in groups:
+            g = np.array(g)
+            pi = pairs_index[cand[g]]
+            tr = np.unique(pi)
+            loc = {t: k for k, t in enumerate(tr)}
+            el = None if mult is None else np.asarray(mult)[tr]
+            U = unpack_u8(sim_bit_fast(tree, trait_params.iloc[tr], N, None, int(rng.integers(2**31)), ta, el), N)
+            lp = np.array([[loc[a], loc[b]] for a, b in pi])
+            r = anchored_scores(U, obs[:, tr], w, lp, combine, batch=batch, kde_below=10**9)
+            out[g] = r["p-value"].to_numpy()
+    finally:
+        TAIL[0], GPD_FRAC[0] = old
+    return out

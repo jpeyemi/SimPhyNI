@@ -843,7 +843,8 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                          testable_filter=None, adaptive_stages=(4096, 32768), adaptive_h=10,
                          anchor_combine='max', gate=None, gate_q=0.95, gate_p=None, refine_p=None,
                          lineage=None, tau=0.1, sup_p=0.05, composite=False,
-                         confine_alpha=0.1):
+                         confine_alpha=0.1, refine_mode='gpd', refine_n=32768, refine_frac=0.01,
+                         xi_min=0.0, refine_tiers=None):
     """Simulate the null for every trait and score all pairs.
 
     condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
@@ -881,7 +882,9 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                            combine=anchor_combine, gate=gate, gate_q=gate_q, gate_p=gate_p,
                            refine_p=refine_p, refine_stages=tuple(adaptive_stages),
                            refine_h=adaptive_h, lineage=lineage, tau=tau, sup_p=sup_p,
-                           composite=composite, confine_alpha=confine_alpha)
+                           composite=composite, confine_alpha=confine_alpha,
+                           refine_mode=refine_mode, refine_n=refine_n, refine_frac=refine_frac,
+                           xi_min=xi_min, refine_tiers=refine_tiers)
         res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
         res['first'] = res['first'].map(mappingr)
         res['second'] = res['second'].map(mappingr)

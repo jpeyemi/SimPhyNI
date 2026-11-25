@@ -28,6 +28,7 @@ ap.add_argument("--cores", type=int, default=8)
 ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--traits", type=int, default=0, help="use only the first K traits (0 = all)")
 ap.add_argument("--src", default=str(Path(__file__).resolve().parents[1]))
+ap.add_argument("--pairs", default=None, help="CSV with T1,T2: test only these pairs")
 a = ap.parse_args()
 sys.path.insert(0, a.src)
 ds, out = Path(a.dataset), Path(a.out)
@@ -78,10 +79,22 @@ kw = {
     "soft_auto_composite": dict(lineage="soft_auto", composite=True),
     "composite": dict(composite=True),
     "legacy": dict(statistic="logor", pvalue="kde", trials=64, condition="prevalence"),
+    "default_refine": dict(refine_p=1e-3),
+    "default_refine2": dict(refine_p=1e-2, refine_tiers=[(1e-2, 32768, 0.01), (1e-5, 262144, 0.001)]),
+    "soft_auto_composite_refine2": dict(lineage="soft_auto", composite=True, refine_p=1e-2,
+                                        refine_tiers=[(1e-2, 32768, 0.01), (1e-5, 262144, 0.001)]),
+    "default_refine_xi01": dict(refine_p=1e-3, xi_min=-0.1),
+    "default_refine_xi02": dict(refine_p=1e-3, xi_min=-0.2),
+    "default_refine_xi03": dict(refine_p=1e-3, xi_min=-0.3),
+    "soft_auto_composite_refine": dict(lineage="soft_auto", composite=True, refine_p=1e-3),
 }[a.config]
 with contextlib.redirect_stdout(io.StringIO()):
     sim = TreeSimulator(tree=str(out / "tree.nwk"), pastmlfile=params, obsdatafile=str(traits_csv))
-    sim.initialize_simulation_parameters(pre_filter=False)
+    sim.initialize_simulation_parameters(pre_filter=False, run_traits=1 if a.pairs else 0)
+    if a.pairs:
+        pl = pd.read_csv(a.pairs)
+        sim.pairs, sim.obspairs = sim._get_pair_data2(sim.obsdf_modified, list(zip(pl.T1.astype(str), pl.T2.astype(str))))
+        sim.total_tests = len(sim.pairs)
 T["n_pairs"] = int(len(sim.pairs)); T["n_traits"] = int(len(np.unique(sim.pairs)))
 t = lap("init_pairs", t)
 with contextlib.redirect_stdout(io.StringIO()):
@@ -90,10 +103,11 @@ t = lap("run_simulation", t)
 T["fast_stages"] = dict(fastsim.TIMINGS)
 res = sim.get_results()
 t = lap("get_results", t)
-res.to_parquet(out / f"results_{a.config}.parquet", index=False)
+tag = a.config + ("_pairs" if a.pairs else "")
+res.to_parquet(out / f"results_{tag}.parquet", index=False)
 t = lap("write", t)
 T["total"] = round(time.perf_counter() - t0, 1)
 T["peak_rss_gb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9, 2)
 T["n_by05"] = int((res["pval_by"] < 0.05).sum()); T["n_by01"] = int((res["pval_by"] < 0.01).sum())
-(out / f"timing_{a.config}.json").write_text(json.dumps(T, indent=2))
+(out / f"timing_{tag}.json").write_text(json.dumps(T, indent=2))
 print(json.dumps(T, indent=2))
