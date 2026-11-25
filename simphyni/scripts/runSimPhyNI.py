@@ -71,6 +71,13 @@ def main():
     parser.add_argument("--combine", choices=["max", "mean"], default="max",
                         help="Combine the two anchored directions: max (default; valid if either "
                              "trait's null model is right) or mean (more recall, valid at 2x the level)")
+    parser.add_argument("--lineage", choices=["none", "soft_auto", "soft", "mrca"], default="none",
+                        help="Per-trait lineage accessibility in the null simulation (anchored nulls): "
+                             "soft_auto = rate decays with distance from the trait's own MRCA clade, scale "
+                             "chosen by single-trait posterior-predictive fit (default: none)")
+    parser.add_argument("--tau", type=float, default=0.2, help="Decay scale for --lineage soft (fraction of mean tip depth)")
+    parser.add_argument("--composite", action=argparse.BooleanOptionalAction, default=False,
+                        help="Composite null: report max(p_whole-tree, p_pair-region) (valid if either null holds)")
     parser.add_argument("--gate-p", type=float, default=0.05,
                         help="Pairs with p below this get the lineage-overlap check (default: 0.05)")
     parser.add_argument("--refine-p", type=float, default=None,
@@ -141,6 +148,8 @@ def main():
         stages = [s for s in (4096, 32768, 131072, 524288) if s <= args.refine_max] or [args.refine_max]
         extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
                      anchor_combine=args.combine,
+                     lineage=None if args.lineage == "none" else args.lineage, tau=args.tau,
+                     composite=args.composite, sup_p=max(args.gate_p, 0.05),
                      gate=("overlap" if args.null == "anchored" else None), gate_p=args.gate_p,
                      refine_p=args.refine_p, adaptive_stages=stages)
         args.condition = "none"

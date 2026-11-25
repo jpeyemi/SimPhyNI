@@ -1,7 +1,11 @@
 # SimPhyNI null-model candidates (branch `explore/uncertainty`)
 
-Three candidate configurations replace the current default (prevalence-conditioned
-null, `--condition prevalence --oversample 8`). All three:
+**Default on this branch** (`run_simulation()` with no options, `simphyni run` with no `--null`):
+GSC-weighted statistic + anchored null, 512 replicates per trait, no replicate selection, no lineage
+control (`--null anchored-screen`, candidate C below). `--null legacy` restores the earlier default
+(unweighted, prevalence-conditioned).
+
+All configurations below:
 
 - compute the log odds ratio on **phylogenetic tip weights** (Gerstein–Sonnhammer–Chothia),
   so a clade inherited from one gain counts once rather than once per tip;
@@ -10,17 +14,19 @@ null, `--condition prevalence --oversample 8`). All three:
   prevalence or footprint selection;
 - run on the fast path: Numba simulation, vectorised scoring, vectorised ACR statistics.
 
-| candidate | CLI | use it for |
+| configuration | CLI | use it for |
 |---|---|---|
-| **A — anchored, gated (recommended)** | `--null anchored` | default analysis: lowest false-positive rate, robust to clonal trees and co-restricted traits |
-| **B — anchored, gated, mean** | `--null anchored --combine mean` | more recall, still calibrated on every benchmark |
-| **C — anchored screen** | `--null anchored-screen` | fastest exploratory screen; not robust to shared lineage restriction |
+| **C — anchored (default)** | *(none)* | benchmarking default; fastest, most recall; not robust to shared lineage restriction |
+| **D — anchored + lineage control** | `--lineage soft_auto --composite` | pangenomes with lineage-restricted genes; lowest false-positive rate, formally justified (see [LINEAGE.md](LINEAGE.md)) |
+| A — anchored, gated | `--null anchored` | heuristic lineage gate; most recall among lineage-controlled options |
+| B — anchored, gated, mean | `--null anchored --combine mean` | more recall, still calibrated |
 
-Any candidate can add `--refine-p P`. Pairs with p < P are then re-tested by exact
+Any configuration can add `--refine-p P`. Pairs with p < P are then re-tested by exact
 Monte-Carlo counts on fresh replicates (up to `--refine-max`, default 131,072).
 Use it to confirm hits at genome-wide thresholds.
 
-Details and workflows: [A](A_anchored.md) · [B](B_anchored_mean.md) · [C](C_anchored_screen.md).
+Details and workflows: [A](A_anchored.md) · [B](B_anchored_mean.md) · [C](C_anchored_screen.md) ·
+[lineage control (D)](LINEAGE.md).
 
 ## Benchmark summary
 
@@ -37,9 +43,10 @@ smallest species). The datasets are identical for all methods.
 
 | method | null ratio @0.05 | @0.01 | @1e-3 | @1e-4 | BY FPR @0.01 | co-restricted ratio | recall + / − | PR-AUC + / − | late-emerging PR-AUC + | restricted PR-AUC + / − | s per species |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **A anchored, gated** | 0.42 | 0.23 | 0.16 | 0.27 | 0 | **8.6** | 0.23 / 0.16 | 0.86 / 0.77 | 0.90 | 0.47 / 0.13 | **22** |
+| **D anchored + soft auto + composite** | 0.29 | 0.11 | 0.08 | 0.27 | 0 | **7.4** | 0.20 / 0.12 | 0.86 / 0.76 | 0.90 | 0.50 / 0.18 | 27 |
+| **A anchored, gated** | 0.42 | 0.23 | 0.16 | 0.27 | 0 | 8.6 | 0.23 / 0.16 | 0.86 / 0.77 | 0.90 | 0.47 / 0.13 | **22** |
 | **B anchored, gated, mean** | 0.59 | 0.39 | 0.28 | 0.27 | 0 | 10.7 | **0.25 / 0.18** | **0.87 / 0.78** | 0.91 | 0.47 / 0.13 | 24 |
-| C anchored screen | 0.55 | 0.42 | 0.57 | 3.2 | 3e-4 | 26.7 | 0.28 / 0.17 | 0.87 / 0.77 | 0.91 | 0.55 / 0.14 | 23 |
+| C anchored (default) | 0.55 | 0.42 | 0.57 | 3.2 | 3e-4 | 26.7 | 0.28 / 0.17 | 0.87 / 0.77 | 0.91 | 0.55 / 0.14 | 23 |
 | current default (prevalence ×8) | 0.57 | 0.41 | 0.43 | 1.9 | 1e-4 | 11.8 | 0.15 / 0.09 | 0.84 / 0.77 | 0.91 | 0.55 / 0.13 | 35 |
 | footprint ×8 | 1.22 | 1.06 | 1.16 | 3.5 | 3e-4 | 20.3 | 0.24 / 0.17 | 0.82 / 0.75 | 0.91 | 0.59 / 0.13 | 35 |
 | SimPhyNI 2.0.0 | 2.52 | 5.90 | 20.0 | 99.4 | 0.012 | 25.0 | 0.18 / 0.15 | 0.76 / 0.65 | 0.88 | 0.53 / 0.15 | 37 |

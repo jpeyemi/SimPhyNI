@@ -1,7 +1,7 @@
-# Candidate C — anchored screen, no gate (fastest, exploratory)
+# Candidate C — anchored screen, no gate (default on this branch; fastest, exploratory)
 
 ```bash
-simphyni run ... --null anchored-screen
+simphyni run ...            # default; same as --null anchored-screen
 ```
 
 Python API:
