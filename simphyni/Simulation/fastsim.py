@@ -504,7 +504,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
                  lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1,
                  chunk=2000, refine_mode="gpd", refine_n=32768, refine_frac=0.01, xi_min=0.0,
-                 refine_tiers=None, refine_max_pairs=None, tail="gpd"):
+                 refine_tiers=None, refine_max_pairs=None, tail="gpd", p_unrestricted=0.5):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
@@ -545,9 +545,33 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
         mult = lineage_multipliers(tree, ta, obs, trait_params, lineage, tau=tau, U_packed=Up,
                                    trials=trials, gene_names=list(trait_params.index))
         trait_params = scale_subsizes(trait_params, ta, mult)
+    hidden = None
+    if lineage == "hidden_emission":
+        from .hidden import HiddenModel
+        root_ = trait_params["root_state"].to_numpy().astype(int)
+        hidden = HiddenModel(ta, obs, root_, seed=int(rng.integers(2**31)))
+        trait_params = hidden.scaled_params(trait_params)
+        _hp = trait_params
+        sim_fn_h = lambda idx, N, sd: hidden.simulate(_hp, np.asarray(idx), N, sd)
+    elif lineage == "hidden_ml":
+        from .hidden import CovarionModel
+        hidden = CovarionModel(ta, obs, trait_params, seed=int(rng.integers(2**31)))
+        sim_fn_h = lambda idx, N, sd: hidden.simulate(idx, N, sd)
+    elif lineage == "hidden":
+        from .hidden import BayesCovarionModel
+        hidden = BayesCovarionModel(ta, obs, trait_params, p_unrestricted=p_unrestricted)
+        sim_fn_h = lambda idx, N, sd: hidden.simulate(idx, N, sd)
+        TIMINGS["hidden_mean_p_restricted"] = float(np.mean(hidden.p_restricted))
+    if hidden is not None and info is not None:
+        info["hidden"] = hidden
     lap("setup+lineage_model")
-    U = unpack_u8(sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta,
-                               mult), trials)
+    if hidden is not None:
+        sim_fn = sim_fn_h
+        U = unpack_u8(sim_fn(np.arange(len(trait_params)), trials, int(rng.integers(2**31))), trials)
+    else:
+        sim_fn = None
+        U = unpack_u8(sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta,
+                                   mult), trials)
     lap("simulate")
     res = anchored_scores(U, obs, w, pairs_index, combine)
     res["gated"] = False
@@ -564,7 +588,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                 cand = np.sort(cand[np.argsort(pv_[cand], kind="stable")[:refine_max_pairs]])
             if cand.size:
                 pr = refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=int(tn),
-                                frac=tf, combine=combine, rng=rng, mult=mult)
+                                frac=tf, combine=combine, rng=rng, mult=mult, sim_fn=sim_fn)
                 res.loc[cand, "p-value"] = pr
                 res.loc[cand, "refined"] = True
             TIMINGS[f"refined_pairs_t{ti}"] = int(cand.size)
@@ -844,7 +868,7 @@ def confined_traits(tree, ta, obs, trait_params, K=64, alpha=0.1, seed=None):
 
 
 def refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=32768, frac=0.01,
-               combine="max", rng=None, max_traits=48, batch=4, mult=None):
+               combine="max", rng=None, max_traits=48, batch=4, mult=None, sim_fn=None):
     """Second stage for candidate pairs: fresh N replicates per trait, anchored
     tails with a GPD fitted to the top `frac` of each null (Knijnenburg et al.
     2009).  Processes candidates in groups of <= max_traits traits."""
@@ -866,8 +890,11 @@ def refine_gpd(tree, ta, trait_params, pairs_index, obs, w, cand, N=32768, frac=
             pi = pairs_index[cand[g]]
             tr = np.unique(pi)
             loc = {t: k for k, t in enumerate(tr)}
-            el = None if mult is None else np.asarray(mult)[tr]
-            U = unpack_u8(sim_bit_fast(tree, trait_params.iloc[tr], N, None, int(rng.integers(2**31)), ta, el), N)
+            if sim_fn is not None:
+                U = unpack_u8(sim_fn(tr, N, int(rng.integers(2**31))), N)
+            else:
+                el = None if mult is None else np.asarray(mult)[tr]
+                U = unpack_u8(sim_bit_fast(tree, trait_params.iloc[tr], N, None, int(rng.integers(2**31)), ta, el), N)
             lp = np.array([[loc[a], loc[b]] for a, b in pi])
             r = anchored_scores(U, obs[:, tr], w, lp, combine, batch=batch, kde_below=10**9)
             out[g] = r["p-value"].to_numpy()
