@@ -39,7 +39,7 @@ null_flags = (f"--emergence {_opt('emergence', 'none')} "
               f"--oversample {int(_opt('oversample', '8'))} "
               f"--branch-cap {_opt('branch_cap', 'iqr')} "
               f"--eligibility {_opt('eligibility', 'none')} "
-              f"--null {_opt('null', 'legacy')} --trials {int(_opt('trials', '512'))} "
+              f"--null {_opt('null', 'anchored-screen')} --trials {int(_opt('trials', '512'))} "
               f"--gate-p {float(_opt('gate_p', '0.05'))} --combine {_opt('combine', 'max')} "
               + (f"--refine-p {float(_opt('refine_p', ''))} " if _opt('refine_p', '') else ""))
 seed_flag = f'--seed {int(_seed)}' if _seed else ''

@@ -57,7 +57,7 @@ def _seed(s):
 
 @njit(parallel=True, cache=True)
 def _sim_kernel(preorder, parent, bl, leaf_idx, gain_rate, loss_rate, root, n_chunks, last_bits,
-                seeds, elig):
+                seeds, mult):
     n_nodes = preorder.shape[0]
     n_traits = gain_rate.shape[0]
     out = np.zeros((leaf_idx.shape[0], n_traits, n_chunks), dtype=np.uint64)
@@ -73,11 +73,12 @@ def _sim_kernel(preorder, parent, bl, leaf_idx, gain_rate, loss_rate, root, n_ch
                     st[v, c] = full if root[t] else np.uint64(0)
                     continue
                 s = st[parent[v], c]
-                if not elig[t, v]:
+                m = mult[t, v]
+                if m <= 0.0:
                     st[v, c] = s
                     continue
-                pg = 1.0 - math.exp(-gain_rate[t] * bl[v])
-                pl = 1.0 - math.exp(-loss_rate[t] * bl[v])
+                pg = 1.0 - math.exp(-gain_rate[t] * bl[v] * m)
+                pl = 1.0 - math.exp(-loss_rate[t] * bl[v] * m)
                 g = _bern_word(pg, nb) & ~s
                 l = _bern_word(pl, nb) & s
                 st[v, c] = ((s | g) & ~l) & full
@@ -100,13 +101,14 @@ def tree_arrays(tree, branch_cap=None):
     bl = np.array([0.0 if n.up is None else n.dist for n in nodes])
     ta.bl = bl if branch_cap is None else np.minimum(bl, branch_cap)
     ta.leaf_idx = np.array([idx[l] for l in tree], dtype=np.int64)   # tree leaf order
+    ta.nodes = nodes
     return ta
 
 
 def sim_bit_fast(tree, trait_params, trials, branch_cap=None, seed=None, ta=None, elig=None):
     """(n_tips, n_traits, ceil(trials/64)) uint64, tips in tree leaf order.
-    elig : optional (n_traits, n_nodes) bool, nodes in preorder; events only on
-           eligible branches."""
+    elig : optional (n_traits, n_nodes) bool or float rate multipliers, nodes in
+           preorder (0 = no events on that branch)."""
     ta = ta or tree_arrays(tree, branch_cap)
     g = trait_params["gains"].to_numpy(float); l = trait_params["losses"].to_numpy(float)
     gs = trait_params["gain_subsize"].to_numpy(float); ls = trait_params["loss_subsize"].to_numpy(float)
@@ -118,9 +120,9 @@ def sim_bit_fast(tree, trait_params, trials, branch_cap=None, seed=None, ta=None
     rng = np.random.default_rng(seed)
     seeds = rng.integers(0, 2**31 - 1, size=len(g))
     if elig is None:
-        elig = np.ones((len(g), len(ta.parent)), dtype=np.bool_)
+        elig = np.ones((len(g), len(ta.parent)))
     return _sim_kernel(ta.preorder, ta.parent, ta.bl, ta.leaf_idx, gr, lr, root, n_chunks, last, seeds,
-                       np.ascontiguousarray(elig, dtype=np.bool_))
+                       np.ascontiguousarray(elig, dtype=np.float64))
 
 
 def unpack_u8(L, trials):
@@ -328,7 +330,8 @@ def region_eligibility(ta, obs, root_states, pairs_index, tips_names=None):
 
 def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch_cap=None,
                  seed=None, weighted=True, combine="max", gate=None, gate_q=0.95, gate_p=None,
-                 refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None):
+                 refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
+                 lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
@@ -339,7 +342,32 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
     obs = (np.nan_to_num(np.asarray(obs_traits, float)) > 0.5).astype(np.float32)
     w = gsc_weights(tree, branch_cap).astype(np.float32) if weighted else np.ones(obs.shape[0], np.float32)
     rng = np.random.default_rng(seed)
-    U = unpack_u8(sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta), trials)
+    mult = None
+    if lineage == "soft_auto":
+        tau, scores = choose_tau(tree, ta, obs, trait_params, seed=int(rng.integers(2**31)))
+        if info is not None:
+            info["tau"] = tau; info["tau_scores"] = scores
+        lineage = None if tau is None else "soft"
+    if lineage == "soft_adaptive":
+        conf, pit = confined_traits(tree, ta, obs, trait_params, alpha=confine_alpha,
+                                    seed=int(rng.integers(2**31)))
+        mult = np.ones((obs.shape[1], len(ta.parent)))
+        if conf.any():
+            ms = lineage_multipliers(tree, ta, obs, trait_params, "soft", tau=tau)
+            mult[conf] = ms[conf]
+        if info is not None:
+            info["confined"] = conf
+        trait_params = scale_subsizes(trait_params, ta, mult)
+        lineage = None
+    if lineage in ("mrca", "soft", "dist", "adaptive"):
+        Up = None
+        if lineage == "adaptive":
+            Up = sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta)
+        mult = lineage_multipliers(tree, ta, obs, trait_params, lineage, tau=tau, U_packed=Up,
+                                   trials=trials, gene_names=list(trait_params.index))
+        trait_params = scale_subsizes(trait_params, ta, mult)
+    U = unpack_u8(sim_bit_fast(tree, trait_params, trials, branch_cap, int(rng.integers(2**31)), ta,
+                               mult), trials)
     res = anchored_scores(U, obs, w, pairs_index, combine)
     res["gated"] = False
     res["refined"] = False
@@ -378,6 +406,30 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                 res.loc[idx, c] = rres[c].to_numpy()
             res.loc[idx, "gated"] = True
 
+    if lineage == "sup" or composite:
+        # Composite null: independence under the whole-tree model OR under the
+        # pair-region model; report the supremum p.  Computed only where it can
+        # matter (p < sup_p >= the significance level), which leaves BH/BY
+        # rejections at levels <= sup_p unchanged.
+        cand = np.flatnonzero(res["p-value"].to_numpy() < sup_p)
+        res["p_region"] = np.nan
+        if cand.size:
+            gp = pairs_index[cand]
+            root = trait_params["root_state"].to_numpy().astype(int)
+            E, rbl = region_eligibility(ta, obs, root, gp)
+            src = gp.reshape(-1)
+            P2 = trait_params.iloc[src].copy()
+            rb = np.repeat(rbl, 2)
+            P2["gain_subsize"] = rb; P2["loss_subsize"] = rb
+            el = np.repeat(E, 2, axis=0)
+            Ur = unpack_u8(sim_bit_fast(tree, P2, trials, branch_cap, int(rng.integers(2**31)), ta, el), trials)
+            k = np.arange(len(gp))
+            rres = anchored_scores(Ur, obs[:, src], w, np.stack([2 * k, 2 * k + 1], axis=1), combine)
+            pr = rres["p-value"].to_numpy()
+            res.loc[cand, "p_region"] = pr
+            res.loc[cand, "p-value"] = np.maximum(res.loc[cand, "p-value"].to_numpy(), pr)
+            res.loc[cand, "gated"] = pr > res.loc[cand, "p-value"].to_numpy() - 1e-15
+
     if refine_p is not None:
         cand = np.flatnonzero((res["p-value"].to_numpy() < refine_p) & ~res["gated"].to_numpy())
         if cand.size:
@@ -392,3 +444,184 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
             res.loc[cand, "refined"] = True
             res.loc[cand, "n_null"] = mc["n_null"].to_numpy()
     return res
+
+
+# ---------------------------------------------------------------------------
+# Per-trait lineage accessibility (model refinement)
+# ---------------------------------------------------------------------------
+
+def _under_and_depth(ta):
+    n_nodes = len(ta.parent); L = ta.leaf_idx
+    under = np.zeros((n_nodes, len(L)), dtype=bool)
+    for r, v in enumerate(L):
+        u = v
+        while u >= 0:
+            under[u, r] = True
+            u = ta.parent[u]
+    depth = np.zeros(n_nodes); level = np.zeros(n_nodes)
+    for v in ta.preorder:
+        if ta.parent[v] >= 0:
+            depth[v] = depth[ta.parent[v]] + ta.bl[v]; level[v] = level[ta.parent[v]] + 1
+    return under, depth, level
+
+
+def trait_clades(ta, obs, root_states):
+    """(n_traits, n_nodes) bool: nodes in the MRCA clade (incl. its stem) of each
+    trait's non-root-state tips, and the MRCA node index."""
+    under, depth, level = _under_and_depth(ta)
+    T = obs.shape[1]
+    C = np.ones((T, len(ta.parent)), dtype=bool); M = np.zeros(T, dtype=int)
+    for t in range(T):
+        m = obs[:, t] != root_states[t]
+        if not m.any():
+            continue
+        cand = np.flatnonzero(under[:, m].all(axis=1))
+        mrca = cand[np.argmax(level[cand])]
+        M[t] = mrca
+        C[t] = ~(under & ~under[mrca]).any(axis=1)
+    return C, M
+
+
+def node_distances(ta):
+    n = len(ta.parent)
+    anc = np.zeros((n, n), dtype=np.float32)          # anc[v, u] = 1 if u on path root..v (incl v)
+    for v in range(n):
+        u = v
+        while u >= 0:
+            anc[v, u] = 1.0
+            u = ta.parent[u]
+    depth = anc @ ta.bl.astype(np.float32)
+    shared = (anc * ta.bl.astype(np.float32)) @ anc.T
+    return depth[:, None] + depth[None, :] - 2 * shared
+
+
+def lineage_multipliers(tree, ta, obs, trait_params, mode, tau=0.1, U_packed=None, trials=None,
+                        depth_frac=0.2, alpha=0.05, gene_names=None):
+    """Per-trait branch rate multipliers (n_traits, n_nodes in preorder), each from
+    the trait's own data only.
+
+    mrca     : 1 inside the trait's MRCA clade, 0 elsewhere
+    soft     : exp(-d / (tau * mean tip depth)), d = distance from the MRCA node
+               for branches outside the clade (1 inside)
+    dist     : 1 where the node is at or below the trait's emergence depth
+    adaptive : phylogroups excluded when the trait is absent there and an
+               unrestricted simulation (U_packed) almost never leaves them empty
+    """
+    root = trait_params["root_state"].to_numpy().astype(int)
+    T = obs.shape[1]
+    if mode == "mrca":
+        C, _ = trait_clades(ta, obs, root)
+        return C.astype(float)
+    if mode == "soft":
+        C, M = trait_clades(ta, obs, root)
+        D = node_distances(ta)
+        _, depth, _ = _under_and_depth(ta)
+        scale = tau * depth[ta.leaf_idx].mean()
+        mult = np.exp(-D[M] / max(scale, 1e-12))
+        return np.where(C, 1.0, mult)
+    if mode == "dist":
+        # thresholds come from ACR on uncapped lengths: compare uncapped depths
+        raw = np.array([0.0 if n.up is None else n.dist for n in ta.nodes])
+        depth = np.zeros(len(raw))
+        for v in ta.preorder:
+            if ta.parent[v] >= 0:
+                depth[v] = depth[ta.parent[v]] + raw[v]
+        d = np.nan_to_num(trait_params["dist"].to_numpy(float), posinf=0.0)
+        m = (depth[None, :] >= d[:, None]).astype(float)
+        m[m.sum(1) == 0] = 1.0                      # never leave a trait without branches
+        return m
+    if mode == "adaptive":
+        from .simulation import adaptive_phylogroup_mask
+        obsdf = pd.DataFrame(obs, index=[l.name for l in tree], columns=list(gene_names))
+        gm, lm, frac, n_excl = adaptive_phylogroup_mask(
+            tree, U_packed, trials, obsdf, list(gene_names),
+            pd.Series(root, index=list(gene_names)), depth_frac, alpha)
+        lvl = list(tree.traverse())
+        pos = {n: i for i, n in enumerate(lvl)}
+        order = [pos[n] for n in ta.nodes]
+        return gm[order, :].T.astype(float)
+    raise ValueError(f"unknown lineage mode {mode!r}")
+
+
+def scale_subsizes(trait_params, ta, mult):
+    """Rescale rate denominators by the accessible share of (capped) branch length."""
+    P = trait_params.copy()
+    tot = ta.bl.sum()
+    frac = (mult * ta.bl[None, :]).sum(1) / max(tot, 1e-12)
+    frac = np.clip(frac, 1e-6, 1.0)
+    P["gain_subsize"] = P["gain_subsize"].to_numpy(float) * frac
+    P["loss_subsize"] = P["loss_subsize"].to_numpy(float) * frac
+    return P
+
+
+def clade_spread(under, X):
+    """log(MRCA clade size / number present) for each column of X (n_tips x K, 0/1).
+    Larger = more scattered across the tree.  Columns with < 2 present get NaN."""
+    cnt = under.astype(np.float32) @ X.astype(np.float32)          # nodes x K
+    tot = X.sum(0)
+    size = under.sum(1).astype(float)
+    full = cnt >= tot[None, :] - 0.5
+    clade = np.where(full, size[:, None], np.inf).min(0)            # smallest node holding all
+    out = np.log(clade / np.maximum(tot, 1))
+    out[tot < 2] = np.nan
+    return out
+
+
+def choose_tau(tree, ta, obs, trait_params, grid=(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, None),
+               K=64, seed=None):
+    """Pick the soft-accessibility scale whose simulated single-trait clade spread
+    matches the observed one across traits (KS distance of per-trait PIT values to
+    uniform).  Uses no pair information.  Returns (tau or None, {tau: ks})."""
+    under, _, _ = _under_and_depth(ta)
+    root = trait_params["root_state"].to_numpy().astype(int)
+    minority = np.where(root[None, :] == 1, 1 - obs, obs)            # non-root-state tips
+    s_obs = np.array([clade_spread(under, minority[:, [t]])[0] for t in range(obs.shape[1])])
+    rng = np.random.default_rng(seed)
+    scores = {}
+    for tau in grid:
+        if tau is None:
+            mult, P = None, trait_params
+        else:
+            mult = lineage_multipliers(tree, ta, obs, trait_params, "soft", tau=tau)
+            P = scale_subsizes(trait_params, ta, mult)
+        U = unpack_u8(sim_bit_fast(tree, P, K, None, int(rng.integers(2**31)), ta, mult), K)
+        pit = []
+        for t in range(obs.shape[1]):
+            if not np.isfinite(s_obs[t]):
+                continue
+            Xm = U[:, t, :] if root[t] == 0 else 1 - U[:, t, :]
+            sim = clade_spread(under, Xm)
+            sim = sim[np.isfinite(sim)]
+            if len(sim) < 8:
+                continue
+            u = rng.random()
+            pit.append(((sim < s_obs[t]).sum() + u * ((sim == s_obs[t]).sum() + 1)) / (len(sim) + 1))
+        pit = np.sort(np.array(pit))
+        n = len(pit)
+        ks = np.max(np.abs(pit - (np.arange(1, n + 1) - 0.5) / n)) if n else np.inf
+        scores[tau] = float(ks)
+    best = min(scores, key=scores.get)
+    return best, scores
+
+
+def confined_traits(tree, ta, obs, trait_params, K=64, alpha=0.1, seed=None):
+    """Per-trait check: is the trait's clade spread lower than its unrestricted null
+    allows?  Returns (confined bool per trait, PIT per trait).  Single-trait data only."""
+    under, _, _ = _under_and_depth(ta)
+    root = trait_params["root_state"].to_numpy().astype(int)
+    rng = np.random.default_rng(seed)
+    U = unpack_u8(sim_bit_fast(tree, trait_params, K, None, int(rng.integers(2**31)), ta), K)
+    T = obs.shape[1]
+    pit = np.full(T, np.nan)
+    for t in range(T):
+        x = obs[:, [t]] if root[t] == 0 else 1 - obs[:, [t]]
+        so = clade_spread(under, x)[0]
+        if not np.isfinite(so):
+            continue
+        Xm = U[:, t, :] if root[t] == 0 else 1 - U[:, t, :]
+        sim = clade_spread(under, Xm)
+        sim = sim[np.isfinite(sim)]
+        if len(sim) < 8:
+            continue
+        pit[t] = ((sim < so).sum() + 0.5 * (sim == so).sum() + 1) / (len(sim) + 1)
+    return np.nan_to_num(pit, nan=1.0) < alpha, pit

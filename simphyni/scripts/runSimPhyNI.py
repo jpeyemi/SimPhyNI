@@ -61,12 +61,11 @@ def main():
                         help="Exclusion threshold for --eligibility adaptive (default: 0.05)")
     parser.add_argument("--branch-cap", choices=["none", "iqr"], default="iqr",
                         help="Cap branch lengths in simulation as in the rate denominators (default: iqr)")
-    parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="legacy",
-                        help="Null model. legacy: simulated-vs-simulated pairs with --condition "
-                             "(default). anchored: GSC-weighted statistic, observed trait vs the "
+    parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="anchored-screen",
+                        help="Null model. legacy: unweighted, simulated-vs-simulated pairs with --condition. anchored: GSC-weighted statistic, observed trait vs the "
                              "partner's null replicates in both directions (max p), lineage-"
                              "overlap gate on candidate pairs. anchored-screen: anchored without "
-                             "the gate (fastest, highest recall, not robust to co-restriction).")
+                             "the gate (default; fastest, highest recall, not robust to co-restriction).")
     parser.add_argument("--trials", type=int, default=512,
                         help="Null replicates per trait for --null anchored* (default: 512)")
     parser.add_argument("--combine", choices=["max", "mean"], default="max",
@@ -137,7 +136,7 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    extra = {}
+    extra = dict(statistic="logor", pvalue="kde", trials=64)
     if args.null != "legacy":
         stages = [s for s in (4096, 32768, 131072, 524288) if s <= args.refine_max] or [args.refine_max]
         extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,

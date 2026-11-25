@@ -108,7 +108,7 @@ def run_simphyni(args):
         f"oversample={getattr(args, 'oversample', 8)}",
         f"branch_cap={getattr(args, 'branch_cap', 'iqr')}",
         f"eligibility={getattr(args, 'eligibility', 'none')}",
-        f"null={getattr(args, 'null', 'legacy')}",
+        f"null={getattr(args, 'null', 'anchored-screen')}",
         f"trials={getattr(args, 'trials', 512)}",
         f"gate_p={getattr(args, 'gate_p', 0.05)}",
         f"combine={getattr(args, 'combine', 'max')}",
@@ -192,7 +192,7 @@ def main():
     run_parser.add_argument("--emergence", choices=["none", "dist", "scaled", "soft", "mrca"], default="none", help="Emergence-threshold handling (Default: none)")
     run_parser.add_argument("--condition", choices=["prevalence", "footprint", "none"], default="prevalence", help="Condition each trait's null on the observed trait (Default: prevalence)")
     run_parser.add_argument("--oversample", type=int, default=8, help="Replicates simulated per kept replicate when conditioning (Default: 8)")
-    run_parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="legacy", help="Null model (Default: legacy). anchored = weighted anchored test with lineage-overlap gate; anchored-screen = without the gate")
+    run_parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="anchored-screen", help="Null model (Default: anchored-screen = GSC-weighted anchored test). anchored adds the lineage-overlap gate; legacy = unweighted prevalence-conditioned null")
     run_parser.add_argument("--trials", type=int, default=512, help="Null replicates per trait for anchored nulls (Default: 512)")
     run_parser.add_argument("--combine", choices=["max", "mean"], default="max", help="Combine the two anchored directions (Default: max)")
     run_parser.add_argument("--gate-p", type=float, default=0.05, help="p threshold for the lineage-overlap check (Default: 0.05)")

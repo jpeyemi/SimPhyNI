@@ -380,7 +380,7 @@ class TreeSimulator:
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
                        gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
                        emergence='none', emergence_scale=1.0, mrca_subsize='mrca',
-                       condition='prevalence', oversample=8,
+                       condition=None, oversample=8,
                        eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05,
                        branch_cap='iqr', **proto):
         """
@@ -432,6 +432,13 @@ class TreeSimulator:
                       simulator, fixed_k_max, statistic, pvalue, testable_filter);
                       see Simulation/uncertainty.py.
         """
+        # Default null (explore/uncertainty): GSC-weighted statistic, anchored
+        # p-values, 512 replicates per trait, no replicate selection.  Pass
+        # statistic='logor', pvalue='kde', trials=64, condition='prevalence' for
+        # the previous default.
+        proto.setdefault('statistic', 'weighted')
+        proto.setdefault('pvalue', 'anchored_fast')
+        proto.setdefault('trials', 512)
         self._proto          = proto
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
