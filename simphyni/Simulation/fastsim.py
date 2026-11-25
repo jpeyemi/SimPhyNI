@@ -390,7 +390,7 @@ def anchored_scores(U, obs, w, pairs_index, combine="max", batch=256, kde_below=
     st = stat[:P]
     return pd.DataFrame({"p-value": pv, "direction": np.where(st >= m, 1, -1),
                          "effect size": (st - m) / np.maximum(s_, 1e-9), "obs_stat": st,
-                         "p_min": np.nan})
+                         "effect_lor": st - m, "effect_se": s_, "p_min": np.nan})
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +504,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
                  refine_p=None, refine_stages=(4096, 32768), refine_h=10, info=None,
                  lineage=None, tau=0.1, sup_p=0.05, composite=False, confine_alpha=0.1,
                  chunk=2000, refine_mode="gpd", refine_n=32768, refine_frac=0.01, xi_min=0.0,
-                 refine_tiers=None, refine_max_pairs=None):
+                 refine_tiers=None, refine_max_pairs=None, tail="gpd"):
     """Weighted anchored test with optional lineage-overlap gate (pair-region null for
     gated pairs) and Monte-Carlo refinement of pairs with p < refine_p.
 
@@ -513,6 +513,7 @@ def run_anchored(tree, trait_params, pairs_index, obs_traits, trials=512, branch
     from .uncertainty import gsc_weights
     TIMINGS.clear()
     GPD_XI_MIN[0] = xi_min
+    TAIL[0] = tail
     _t = [time.perf_counter()]
     def lap(name):
         now = time.perf_counter(); TIMINGS[name] = TIMINGS.get(name, 0.0) + now - _t[0]; _t[0] = now

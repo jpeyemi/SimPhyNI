@@ -182,3 +182,48 @@ python benchmarks_large/eval_acr_sim.py <out>/syn 300 --pastml 150
 python benchmarks_large/eval_thresholds.py <out>/syn <out>/syn/pairs_sample.csv <results...>
 python benchmarks_large/truth_mc.py <out>/syn <out>/runs/syn <results.parquet> pos1 20 16
 ```
+
+## 6. FDR-based reporting (PanX full tier, 11 species, 3 replicates)
+
+**Method.** Selection uses BH at q < 0.05, with BY as the strict option. Each recall is shown next to
+the observed false discovery proportion (FDP) of the calls, per scenario. Ordering quality is
+reported for three rankings: by p, by |effect|, and by the empirical-Bayes shrunken effect
+(`effect_shrunk`, adaptive-shrinkage prior over all pairs). Generated with `report_panx.py`; the
+full table is in `report_full_tier.md`.
+
+| configuration | BH synthetic recall / FDP | BH late-emerging recall / FDP | BH restricted recall / FDP | BY synthetic recall | null ratio @1e-4 |
+|---|---|---|---|---|---|
+| old default (prevalence ×8) | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 0.15 | 1.9 |
+| anchored, KDE tail, approx. simulator | 0.34 / 0.001 | 0.49 / 0.018 | 0.31 / 0.58 | 0.25 | 3.2 |
+| anchored, KDE tail, exact simulator | 0.32 / 0 | 0.47 / 0.011 | 0.29 / 0.57 | 0.22 | 1.8 |
+| anchored, GPD tail, exact simulator | 0.28 / 0.002 | 0.44 / 0.016 | 0.42 / 0.63 | 0.09 | 0.13 |
+| **anchored, GPD + refinement** (p < 0.01, ≤ 5,000 pairs, 32,768 replicates) | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 0.22 | 3.9 |
+| soft auto + composite (KDE, approx. simulator) | 0.26 / 0 | 0.42 / 0.007 | 0.12 / **0.37** | 0.18 | 0.27 |
+| soft auto + composite, GPD + refinement | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 0.19 | 4.6 |
+| FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 0.19 | 143 |
+| Fisher | 0.77 / 0.65 | 0.81 / 0.52 | 0.52 / 0.81 | 0.69 | 1,243 |
+
+Ordering on synthetic pairs (pairs of anchored configurations):
+
+| rank by | AP | recall at precision ≥ 0.95 |
+|---|---|---|
+| p-value | 0.841 | 0.57 |
+| abs(effect) (z-like) | 0.851 | 0.59 |
+| **shrunken effect** | **0.857** | **0.60** |
+
+**What this shows.**
+
+1. **BY, not the tail estimator, caused the apparent small-study loss.** With BY, the GPD tail
+   cuts synthetic recall from 0.22 to 0.09. With BH it costs little (0.28 vs 0.32), and with
+   refinement the calibrated tail has the highest recall of any configuration (0.37 synthetic,
+   0.51 late-emerging) at FDP 0–1.4 %. Pair tests share traits and are plausibly positively
+   dependent (PRDS), the condition under which BH controls the FDR.
+2. **Lineage restriction causes the remaining false discoveries, for every method.** In the
+   restricted scenario, BH calls are 37–63 % false for SimPhyNI configurations, 54 % for the old
+   default, 65 % for FaST-LMM and 81 % for Fisher. Soft auto + composite is the lowest, but no
+   configuration controls it. This is the case for the hidden-accessibility model.
+3. **The null ratio at 1e-4 rises with refinement.** The refined p-values resolve the separately
+   restricted nulls (a misspecified model) more precisely. That is a model problem, not an
+   estimator problem: the same configuration has 0 false calls among 8.3 M unrestricted nulls
+   (section 3).
+4. **The shrunken effect is the best ordering**, slightly ahead of |effect| and p.

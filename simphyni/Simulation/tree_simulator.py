@@ -687,7 +687,15 @@ class TreeSimulator:
                      'pval_naive','pval_bh','pval_by','pval_bonf']
         if 'null_calibrated' in res.columns:
             base_cols.append('null_calibrated')
-        base_cols += [c for c in ('gated', 'refined', 'overlap', 'n_null') if c in res.columns]
+        if 'effect_lor' in res.columns:
+            # Empirical-Bayes shrinkage of effect sizes (adaptive shrinkage):
+            # posterior mean effect and local false sign rate, for ordering.
+            from .shrinkage import shrink
+            m_, sd_, lfsr_, _ = shrink(res['effect_lor'].to_numpy(), res['effect_se'].to_numpy())
+            res['effect_shrunk'] = m_
+            res['lfsr'] = lfsr_
+        base_cols += [c for c in ('effect_lor', 'effect_se', 'effect_shrunk', 'lfsr',
+                                  'gated', 'refined', 'overlap', 'n_null') if c in res.columns]
         self.result = res[base_cols]
         
 
