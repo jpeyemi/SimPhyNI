@@ -33,7 +33,7 @@ Rate optimisation modes
               cycles × 2 × 30 inner iterations = ~180 BU passes per trait).
               Closely matches PastML's two-phase L-BFGS-B optimisation.
 
-Both modes run with Numba @njit(parallel=True) across traits via prange.
+Both modes run with Numba @njit(parallel=True, cache=True) across traits via prange.
 
 Performance notes
 -----------------
@@ -307,7 +307,7 @@ def build_obs_matrix(
 # Numba utility
 # ---------------------------------------------------------------------------
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _log_sum_exp2(a: float, b: float) -> float:
     """Numerically stable log(exp(a) + exp(b))."""
     if a == -math.inf and b == -math.inf:
@@ -317,7 +317,7 @@ def _log_sum_exp2(a: float, b: float) -> float:
     return b + math.log1p(math.exp(a - b))
 
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _f81_log_probs(bl: float, sf: float, pi1: float):
     """Return (log_alpha, log_beta, log_1m_alpha, log_1m_beta) for F81 binary.
 
@@ -344,7 +344,7 @@ def _f81_log_probs(bl: float, sf: float, pi1: float):
 # Bottom-up pass — marginal (sum-product), in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _bu_marginal_into(postorder, children_ptr, children_list, bl, obs_col,
                       sf, pi1, is_leaf, n_nodes, log_bu):
     """Fill log_bu[n_nodes, 2] in-place.
@@ -384,7 +384,7 @@ def _bu_marginal_into(postorder, children_ptr, children_list, bl, obs_col,
 # Bottom-up pass — JOINT (max-product), in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _bu_joint_into(postorder, children_ptr, children_list, bl, obs_col,
                    sf, pi1, is_leaf, n_nodes, log_bu):
     """Fill log_bu[n_nodes, 2] in-place (bottom-up JOINT, max-product, log-space)."""
@@ -422,7 +422,7 @@ def _bu_joint_into(postorder, children_ptr, children_list, bl, obs_col,
 # Top-down pass — marginal, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _td_marginal_into(preorder, parent, children_ptr, children_list, bl,
                       log_bu, sf, pi0, pi1, n_nodes, root_idx, log_td):
     """Fill log_td[n_nodes, 2] in-place (top-down marginal, log-space).
@@ -463,7 +463,7 @@ def _td_marginal_into(preorder, parent, children_ptr, children_list, bl,
 # Marginal probabilities from BU + TD, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, out_p1):
     """Write P(state=1 | data) at every node into out_p1[n_nodes].
 
@@ -483,7 +483,7 @@ def _marginal_p1_into(log_bu, log_td, pi0, pi1, n_nodes, out_p1):
 # JOINT traceback, in-place
 # ---------------------------------------------------------------------------
 
-@njit
+@njit(cache=True)
 def _joint_traceback_into(preorder, parent, bl, log_bu, sf, pi1,
                            n_nodes, root_idx, out_joint):
     """Write MAP state (0 or 1; -1 = unreachable) into out_joint[n_nodes] (int8)."""
@@ -515,7 +515,7 @@ def _joint_traceback_into(preorder, parent, bl, log_bu, sf, pi1,
 # Log-likelihood helper (used inside rate optimisation)
 # ---------------------------------------------------------------------------
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _log_lh(log_bu_root, pi0, pi1):
     """log P(data) = log Σ_s π_s · BU[root][s]."""
     lpi0 = math.log(pi0) if pi0 > 1e-300 else -math.inf
@@ -527,7 +527,7 @@ def _log_lh(log_bu_root, pi0, pi1):
 # Rate optimisation helpers — accept pre-allocated scratch buffer
 # ---------------------------------------------------------------------------
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
                pi0, pi1, is_leaf, n_nodes, root_idx, log_sf, log_bu_scratch):
     """Evaluate log P(data | sf); overwrites log_bu_scratch[n_nodes, 2] in-place."""
@@ -537,7 +537,7 @@ def _lh_for_sf(postorder, children_ptr, children_list, bl, obs_col,
     return _log_lh(log_bu_scratch[root_idx], pi0, pi1)
 
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
                 sf, is_leaf, n_nodes, root_idx, pi1_, log_bu_scratch):
     """Evaluate log P(data | π₁); overwrites log_bu_scratch[n_nodes, 2] in-place."""
@@ -547,7 +547,7 @@ def _lh_for_pi1(postorder, children_ptr, children_list, bl, obs_col,
     return _log_lh(log_bu_scratch[root_idx], pi0_, pi1_)
 
 
-@njit
+@njit(cache=True)
 def _golden_section_sf(
     postorder, children_ptr, children_list, bl, obs_col,
     pi0, pi1, is_leaf, n_nodes, root_idx,
@@ -586,7 +586,7 @@ def _golden_section_sf(
     return sf_opt, (fc + fd) / 2.0
 
 
-@njit
+@njit(cache=True)
 def _golden_section_pi1(
     postorder, children_ptr, children_list, bl, obs_col,
     sf, is_leaf, n_nodes, root_idx,
@@ -627,7 +627,7 @@ def _golden_section_pi1(
 # Parallel batch kernel — per-thread scratch, no heap allocation in prange
 # ---------------------------------------------------------------------------
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _batch_acr_kernel(
     postorder, preorder, parent,
     children_ptr, children_list,

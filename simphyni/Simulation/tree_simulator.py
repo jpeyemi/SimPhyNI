@@ -680,6 +680,7 @@ class TreeSimulator:
                      'pval_naive','pval_bh','pval_by','pval_bonf']
         if 'null_calibrated' in res.columns:
             base_cols.append('null_calibrated')
+        base_cols += [c for c in ('gated', 'refined', 'overlap', 'n_null') if c in res.columns]
         self.result = res[base_cols]
         
 

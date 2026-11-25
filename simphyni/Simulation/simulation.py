@@ -841,7 +841,7 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                          prior_by_prevalence=False, root='threshold', simulator='poisson',
                          fixed_k_max=None, statistic='logor', pvalue='kde',
                          testable_filter=None, adaptive_stages=(4096, 32768), adaptive_h=10,
-                         anchor_combine='max'):
+                         anchor_combine='max', gate=None, gate_q=0.95, refine_p=None):
     """Simulate the null for every trait and score all pairs.
 
     condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
@@ -867,6 +867,18 @@ def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores
                                     draws=False, prior_by_prevalence=prior_by_prevalence, rng=urng)
         mu = info['mu_mean'] if rate_model == 'eb' else info['mu_point']
         res = unc.analytic_pairs(tree, mu, pairs_index, obs_traits, branch_cap=branch_cap)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
+    if pvalue == 'anchored_fast':
+        from .fastsim import run_anchored
+        res = run_anchored(tree, trait_params, pairs_index, obs_traits, trials=trials,
+                           branch_cap=branch_cap, seed=seed, weighted=(statistic == 'weighted'),
+                           combine=anchor_combine, gate=gate, gate_q=gate_q,
+                           refine_p=refine_p, refine_stages=tuple(adaptive_stages),
+                           refine_h=adaptive_h)
         res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
         res['first'] = res['first'].map(mappingr)
         res['second'] = res['second'].map(mappingr)
