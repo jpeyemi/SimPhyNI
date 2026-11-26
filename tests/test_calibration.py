@@ -375,8 +375,8 @@ def test_branch_cap_limits_events_on_long_branches():
 
 def test_single_shared_clade_is_not_significant():
     """Two traits that each arose once, in the same clade, are weak evidence of
-    association (paper Fig. 1a): the default conditioned null must not call
-    them significant, whereas the legacy unconditioned null did."""
+    association (paper Fig. 1a): the default null must not call them
+    significant, whereas the legacy unconditioned null did."""
     from simphyni import TreeSimulator
     obs = pd.DataFrame({"x": [1, 1, 0, 0, 0, 0, 0, 0], "y": [1, 1, 0, 0, 0, 0, 0, 0]},
                        index=list("ABCDEFGH"), dtype=float)
@@ -389,4 +389,5 @@ def test_single_shared_clade_is_not_significant():
         sim.run_simulation(cores=1, seed=4, **kw)
         return float(sim.get_results()["pval_naive"].iloc[0])
     assert p() > 0.05
-    assert p(condition=None, branch_cap=None) < p()
+    legacy = dict(condition=None, branch_cap=None, statistic="logor", pvalue="kde", trials=64)
+    assert p(**legacy) < p()

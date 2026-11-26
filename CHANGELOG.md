@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0
+## 3.0.0rc1 (release candidate for 3.0.0)
 
 Major release: the default null model, the result files and parts of the CLI changed, so results and
 downstream scripts written for 2.x need updating. The full documentation is in
