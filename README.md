@@ -120,47 +120,32 @@ simphyni run --traits traits.csv --tree tree.nwk --run-traits 0,3 --outdir resul
 
 #### Null model options
 
-The defaults were chosen by benchmarking calibration, power and speed on 11 PanX species trees
-(103–500 strains) with synthetic, real-gene, late-emerging and lineage-restricted traits, and on
-*E. coli* at genome scale (4,501 genes, 10.1 M pairs; 8.4 M known-truth pairs). Details:
-`candidates/README.md` and `benchmarks_large/REPORT.md`.
+The defaults suit most analyses; no flags are needed. For how SimPhyNI compares with other tools,
+see the live benchmark **[mgwas-bench](https://jpeyemi.github.io/mgwas-bench/)**, which re-runs
+SimPhyNI and other methods on every release.
 
-**Default null.** No flags are needed.
+**Default null:**
 
-- **Weighted statistic.** The log odds ratio is computed on phylogenetic tip weights
-  (Gerstein–Sonnhammer–Chothia), so a clade inherited from one gain counts once rather than once per
-  tip.
-- **Anchored null.** Each trait is simulated 512 times from its fitted gain/loss process; the
-  per-branch transitions are exact. Each observed trait is then scored against its partner's
-  replicates, in both directions, and the larger p is reported. That p is valid if either trait's
-  model is right. No replicates are discarded.
-- **Calibrated tails.**
-  - Below the resolution of the replicates, p-values come from a generalized-Pareto tail (shape ≥ 0),
-    so they are never extrapolated to 0.
-  - Pairs with p < 0.01 are re-tested with 32,768 fresh replicates.
+- **Weighted statistic.** The log odds ratio uses phylogenetic tip weights, so a clade inherited from
+  one gain counts about once rather than once per tip.
+- **Anchored null.** Each trait is simulated from its estimated gain/loss history. Each observed trait
+  is scored against its partner's simulated replicates, in both directions, and the larger p-value is
+  reported.
+- **Calibrated tails.** p-values are exact Monte-Carlo counts with a conservative tail model beyond the
+  most extreme replicate. Pairs with small p-values are re-tested with more replicates.
 
-**Flags.**
+**Options:**
 
-- `--refine-p P` (default 0.01, `0` disables), `--refine-max-pairs N` (default 5000),
-  `--refine-n N` (default 32768): the refinement stage.
-- `--lineage none|soft_auto` and `--composite`: control for genes confined to the same lineages
-  (plasmid-, phage- or phylogroup-specific).
-  - `soft_auto` lowers each trait's rate with distance from its own clade, on a scale fitted to the
-    data.
-  - `--composite` reports max(p whole-tree, p pair-region), which is valid if either null holds.
-  - On a replica of the real *E. coli* genome, neither lowered the false-discovery rate, and
-    `soft_auto` created false positives, so neither is recommended by default. Genome-wide runs made
-    no false calls without them. For small analyses built from lineage-confined genes, use
-    `pval_by` and read co-confined positive associations as shared lineage or co-transfer.
-- `--trials N` (default 512): replicates per trait.
-- `--branch-cap iqr|none` (default `iqr`): simulate with the same long-branch cap used for the rate
-  estimate.
-- `--null legacy`: the previous null. It is unweighted, simulates replicate-vs-replicate pairs with
-  prevalence conditioning (`--condition`, `--oversample`) and uses KDE tails. It is about 50× slower
-  at genome scale and anticonservative below 1e-5.
+- `--refine-p` (default 0.01; `0` disables), `--refine-max-pairs`, `--refine-n`: the re-test of
+  small p-values.
+- `--composite`: an optional, more conservative null for pairs of traits confined to the same lineages.
+  It is not needed for genome-wide analyses ([guide §7.4](docs/USER_GUIDE.md#74-lineage-confined-traits-and-co_confined)).
+- `--trials` (default 512): replicates per trait.
+- `--null legacy`: the SimPhyNI ≤ 2.0 null, for reproducing earlier results.
 
-**Reading results.** Select pairs with `pval_bh < 0.05`, then order them by `effect_shrunk`.
-`pval_by` is the strict alternative.
+**Reading results.** Select pairs with `pval_bh < 0.05` and order them by `effect_shrunk`. Use `pval_by`
+for small analyses built mostly from lineage-confined traits. See the
+[user guide](docs/USER_GUIDE.md#7-interpreting-results) for interpretation and pitfalls.
 
 ### Run mode (batch)
 
