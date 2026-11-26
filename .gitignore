@@ -32,3 +32,4 @@ tests/.DS_Store
 *.out_err.txt
 *.out
 *.err
+build/

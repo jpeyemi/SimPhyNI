@@ -81,6 +81,7 @@ selection — no re-running ACR per method combination.
 
 import argparse
 import gc
+import os
 import sys
 import traceback
 import warnings
@@ -633,6 +634,12 @@ def reconstruct_chunk_fast(
     # ---- Run all valid traits in one Numba prange call ----
     result = fast_acr(ta, valid_obs, valid_names, mode=acr_mode)
 
+    if os.environ.get("SIMPHYNI_ACR_LOOP") != "1":
+        # Vectorised statistics over all traits (same values as the per-gene
+        # count_joint_stats / count_all_marginal_stats loop below).
+        return _vectorized_stats(ta, result, valid_names, gene_sums_map,
+                                 upper_bound, reconstruction)
+
     # ---- Pre-compute node distances once (shared topology) ----
     node_dists = _node_dists_from_root(master_tree)
 
@@ -678,6 +685,94 @@ def reconstruct_chunk_fast(
             print(f"  [FAILED fast] {gene}:\n{tb}", file=sys.stderr, flush=True)
 
     return rows
+
+
+def _vectorized_stats(ta, result, names, gene_sums_map, upper_bound, reconstruction):
+    """Gain/loss counts and subsizes for every trait at once from fast_acr output.
+
+    Matches count_joint_stats (fast ACR states are never ambiguous) and
+    count_all_marginal_stats without masks.
+    """
+    n_tr = len(names)
+    nonroot = ta.parent >= 0
+    par = ta.parent[nonroot]
+    bl = ta.bl[nonroot]
+    nd = ta.nd[nonroot]
+    under = bl < upper_bound
+    pos = bl > 0
+    out = {"gene": list(names),
+           "count": [int(gene_sums_map.get(g, 0)) for g in names]}
+    inf = np.inf
+
+    if reconstruction in ("JOINT", "all"):
+        S = result.joint_states.astype(np.int8)                    # traits x nodes
+        root_state = S[:, ta.root_idx].astype(int)
+        sc = S[:, nonroot]                                          # child state per edge
+        sp = S[:, par]                                              # parent state per edge
+        c1, c0 = sc == 1, sc == 0
+        dist = np.where(c1, nd, inf).min(axis=1)
+        loss_dist = np.where(c0, nd, inf).min(axis=1)
+        out["gains"] = None; out["losses"] = None
+        # gains: internal nodes in state 0 with at least one child in state 1
+        n_nodes = ta.n_nodes
+        has1 = np.zeros((n_tr, n_nodes), bool); has0 = np.zeros((n_tr, n_nodes), bool)
+        np.logical_or.at(has1.T, par, c1.T)
+        np.logical_or.at(has0.T, par, c0.T)
+        out["gains"] = ((S == 0) & has1).sum(axis=1).astype(float)
+        out["losses"] = ((S == 1) & has0).sum(axis=1).astype(float)
+        out["dist"] = dist
+        out["loss_dist"] = loss_dist
+        bu, bp = bl * under, bl * pos
+        out["gain_subsize"] = (c0 * bu).sum(1)
+        out["loss_subsize"] = (c1 * bu).sum(1)
+        out["gain_subsize_nofilter"] = (c0 * bp).sum(1)
+        out["loss_subsize_nofilter"] = (c1 * bp).sum(1)
+        g_ok = nd[None, :] >= dist[:, None]; l_ok = nd[None, :] >= loss_dist[:, None]
+        out["gain_subsize_thresh"] = (c0 * g_ok * bu).sum(1)
+        out["loss_subsize_thresh"] = (c1 * l_ok * bu).sum(1)
+        p0, p1 = sp == 0, sp == 1
+        out["gain_subsize_p"] = (p0 * bu).sum(1)
+        out["loss_subsize_p"] = (p1 * bu).sum(1)
+        out["gain_subsize_nofilter_p"] = (p0 * bp).sum(1)
+        out["loss_subsize_nofilter_p"] = (p1 * bp).sum(1)
+        out["gain_subsize_thresh_p"] = (p0 * g_ok * bu).sum(1)
+        out["loss_subsize_thresh_p"] = (p1 * l_ok * bu).sum(1)
+        out["root_state"] = root_state
+
+    if reconstruction in ("MPPA", "all"):
+        P = result.marginal_p1
+        pc, pp = P[:, nonroot], P[:, par]
+        q0 = 1.0 - pp
+        eff = np.minimum(bl, upper_bound)
+        gf = np.maximum(0.0, pc - pp); lf = np.maximum(0.0, pp - pc)
+        eps = 1e-12
+        cert = 1.0 + (q0 + eps) * np.log2(q0 + eps) + (pp + eps) * np.log2(pp + eps)
+        out["gains_flow"] = gf.sum(1); out["losses_flow"] = lf.sum(1)
+        out["gains_markov"] = (q0 * pc * bl).sum(1)
+        out["losses_markov"] = (pp * (1.0 - pc) * bl).sum(1)
+        out["gains_entropy"] = (gf * cert).sum(1); out["losses_entropy"] = (lf * cert).sum(1)
+        out["gain_subsize_marginal"] = (q0 * eff).sum(1)
+        out["loss_subsize_marginal"] = (pp * eff).sum(1)
+        out["gain_subsize_marginal_nofilter"] = (q0 * bl).sum(1)
+        out["loss_subsize_marginal_nofilter"] = (pp * bl).sum(1)
+        out["gain_subsize_entropy"] = (q0 * cert * eff).sum(1)
+        out["loss_subsize_entropy"] = (pp * cert * eff).sum(1)
+        out["gain_subsize_entropy_nofilter"] = (q0 * cert * bl).sum(1)
+        out["loss_subsize_entropy_nofilter"] = (pp * cert * bl).sum(1)
+        dm = np.where(pc >= 0.5, nd, inf).min(1)
+        ldm = np.where(pc < 0.5, nd, inf).min(1)
+        pdist = nd - bl
+        g_ov = np.minimum(np.maximum(0.0, nd[None, :] - np.maximum(pdist[None, :], dm[:, None])), upper_bound)
+        l_ov = np.minimum(np.maximum(0.0, nd[None, :] - np.maximum(pdist[None, :], ldm[:, None])), upper_bound)
+        out["gain_subsize_marginal_thresh"] = (q0 * g_ov).sum(1)
+        out["gain_subsize_entropy_thresh"] = (q0 * cert * g_ov).sum(1)
+        out["loss_subsize_marginal_thresh"] = (pp * l_ov).sum(1)
+        out["loss_subsize_entropy_thresh"] = (pp * cert * l_ov).sum(1)
+        out["dist_marginal"] = dm; out["loss_dist_marginal"] = ldm
+        out["root_prob"] = P[:, ta.root_idx]
+
+    df = pd.DataFrame(out)
+    return df.to_dict("records")
 
 
 # ---------------------------------------------------------------------------

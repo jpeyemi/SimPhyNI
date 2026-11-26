@@ -163,47 +163,65 @@ class TreeSimulator:
         Combine leaves i,j of the obeserved trait dataframe, `obsdf`, for all leaves within
         a distacnce of threshold from eachother. Does not mutate original obsdf 
 
-        :param threshold: a fraction of the longest branch length from root to tip
-        :returns: new dataframe of combined leaves
+        :param threshold: a fraction of the longest branch length from root to tip.
+                          ``threshold <= 0`` (the default) disables collapsing: the tree is
+                          only pruned to the samples present in ``obsdf``.
+        :returns: new dataframe of combined leaves, rows in tree leaf order
         """
         assert(type(self.tree) == TreeNode)
-        # if threshold == 0: 
-        #     treeleaves = set(self.tree.get_leaf_names())
-        #     self.tree.prune([i for i in self.obsdf.index if i in treeleaves], preserve_branch_length=True)
-        #     return self.obsdf.copy()
-        
+        tree_leaves = set(self.tree.get_leaf_names())
+        keep = [i for i in self.obsdf.index if i in tree_leaves]
+        self.tree.prune(keep, preserve_branch_length=True)
+        if threshold <= 0:
+            # Previously `distance <= 0` still merged sister tips joined by
+            # zero-length branches (common in PanX / NJ trees), keeping one
+            # tip's traits and discarding the other's, in an order that
+            # depended on memory addresses.  Threshold 0 now means "no merge".
+            return self.obsdf.loc[self.tree.get_leaf_names()].copy()
+
         threshold = self.tree.get_distance(self.tree,self.tree.get_farthest_leaf()[0]) * threshold
         obsdf = self.obsdf.copy()
-        self.tree.prune([i for i in self.obsdf.index if i in set(self.tree.get_leaf_names())], preserve_branch_length=True)
-        node_queue = set(self.tree.get_leaves())
-        to_prune = set()
+        # Ordered queue (dict keys keep insertion order) so the result is
+        # deterministic; a set of nodes iterates in memory-address order.
+        node_queue = dict.fromkeys(self.tree.get_leaves())
+        to_prune = {}
         while(node_queue):
-            current_node: TreeNode = node_queue.pop()
+            current_node: TreeNode = next(iter(node_queue))
+            del node_queue[current_node]
             sisters = current_node.get_sisters()
             if not sisters:
-                to_prune.add(current_node)
+                to_prune[current_node] = None
                 continue
             sibling: TreeNode = sisters[0]
             if not sibling.is_leaf():
-                to_prune.add(current_node)
+                to_prune[current_node] = None
                 continue
             distance = current_node.dist + sibling.dist
             if distance <= threshold:
                 if current_node.up:
                     # Choosing first node seen as rep
                     obsdf.loc[current_node.up.name] = obsdf.loc[current_node.name]
-                    node_queue.add(current_node.up)
+                    node_queue[current_node.up] = None
             else:
-                to_prune.add(current_node)
-                to_prune.add(sibling)
-            if sibling in node_queue:
-                node_queue.remove(sibling)
-        
-        # print(obsdf.index)
-        self.tree.prune(to_prune, preserve_branch_length= True)
+                to_prune[current_node] = None
+                to_prune[sibling] = None
+            node_queue.pop(sibling, None)
+
+        self.tree.prune(list(to_prune), preserve_branch_length= True)
         obsdf[obsdf>1]=1
-        return obsdf.loc(axis = 0)[tuple(map(lambda x: x.name, to_prune))]
-    
+        return obsdf.loc(axis = 0)[[n.name for n in self.tree.get_leaves()]]
+
+    @staticmethod
+    def count_unique_pairs(vars, targets) -> int:
+        """Number of distinct unordered pairs {a, b}, a != b, with a in vars and b in targets.
+
+        Ordered pairs with a != b number |V||T| - |I| (I = V & T); those with
+        both members in I appear twice, so subtract |I|(|I|-1)/2 once more.
+        All-vs-all (V == T, n traits) gives n(n-1)/2; disjoint sets give |V||T|.
+        """
+        n_shared = len(set(vars) & set(targets))
+        return len(vars) * len(targets) - n_shared - n_shared * (n_shared - 1) // 2
+
     def _get_pair_data(self, vars: pd.DataFrame, targets: pd.DataFrame, prevalence_threshold: float = 0.00, batch_size = 1000, pre_filter = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Returns a list of trait pairs and a NumPy array of their test statistic results 
@@ -284,7 +302,7 @@ class TreeSimulator:
             keep.append((a, b))
         pairs = np.array(keep)
 
-        self.total_tests = len(valid_vars) * len(valid_targets) - len(set(valid_vars) & set(valid_targets))
+        self.total_tests = self.count_unique_pairs(valid_vars, valid_targets)
 
         if len(pairs) == 0:
             return np.array([]), np.array([])
@@ -358,7 +376,11 @@ class TreeSimulator:
         return valid_pairs, stats
 
     def run_simulation(self, cores=-1, gain_mask=None, loss_mask=None, gene_order=None,
-                       gamma=False, include_flagged=False, use_clade_mask=False):
+                       gamma=False, include_flagged=True, use_clade_mask=False, seed=None,
+                       emergence='none', emergence_scale=1.0, mrca_subsize='mrca',
+                       condition=None, oversample=8,
+                       eligibility=None, phylogroup_depth=0.2, adapt_alpha=0.05,
+                       branch_cap='iqr', **proto):
         """
         Runs the tree simulation and stores results.
 
@@ -372,24 +394,80 @@ class TreeSimulator:
                       Gamma(count + 0.5, 1/subsize) instead of using the point estimate.
                       Widens the null for traits with few events; negligible effect for
                       large counts.  Default False.
-        :param include_flagged: If False (default), pairs involving traits with miscalibrated
-                                null distributions are excluded from simulation and assigned p=0.5
-                                in multiple-testing correction.  If True, those pairs are simulated
-                                normally but marked with null_calibrated=False in the results so
-                                downstream users can distinguish them.
+        :param include_flagged: If True (default), pairs involving traits whose null
+                                distribution may be miscalibrated are simulated normally and
+                                marked null_calibrated=False in the results.  If False, those
+                                pairs are excluded from the results (and counted as p=1 in
+                                multiple-testing correction).
+        :param seed: Optional int.  Makes simulation and KDE jitter reproducible.
+        :param emergence: Emergence-threshold handling: 'none' (default; no threshold), 'dist' (global root-distance
+                          threshold from ACR, the pre-2.1 default), 'scaled' (threshold x emergence_scale),
+                          'soft' (per-trial threshold ~ U(0, threshold)), or 'mrca' (events
+                          restricted to the subtree under the MRCA of tips that differ from
+                          the root state; same as use_clade_mask=True).
+        :param emergence_scale: Factor used by emergence='scaled'.
+        :param mrca_subsize: For emergence='mrca': 'mrca' recomputes rate denominators as the
+                             MRCA subtree branch length; 'original' keeps the ACR denominators.
+        :param condition: 'prevalence' (default), 'footprint' or None.  Each trait's null keeps
+                          the simulated replicates closest to the observed trait (out of
+                          trials * oversample): by prevalence, or by prevalence and
+                          parsimony changes ('footprint', robust to rate mis-estimation).
+        :param oversample: Replicates simulated per kept replicate when conditioning.
+        :param eligibility: None (default) or 'phylogroup'.  With 'phylogroup', events for
+                            each trait are restricted to the phylogroups (subtrees below
+                            the branches crossing phylogroup_depth x tree depth) in which
+                            the trait's non-root state is observed.
+        :param phylogroup_depth: Depth fraction at which phylogroups are cut.
+                            'adaptive' excludes a phylogroup only when the trait is absent
+                            from it AND an unrestricted null simulation leaves it empty in
+                            fewer than adapt_alpha of replicates (i.e. the absence is
+                            unexpected unless the lineage is closed to the trait).
+        :param adapt_alpha: Threshold for eligibility='adaptive'.
+        :param branch_cap: 'iqr' (default), None or a float.  'iqr' simulates with the same
+                           branch-length cap used for the ACR rate denominators.
+        :param proto: prototype null-model options passed to simulate_glrates_bit
+                      (rate_model, pi_source, rate_draws, prior_by_prevalence, root,
+                      simulator, fixed_k_max, statistic, pvalue, testable_filter);
+                      see Simulation/uncertainty.py.
         """
+        # Default null (explore/uncertainty): GSC-weighted statistic, anchored
+        # p-values, 512 replicates per trait, no replicate selection.  Pass
+        # statistic='logor', pvalue='kde', trials=64, condition='prevalence' for
+        # the previous default.
+        proto.setdefault('statistic', 'weighted')
+        proto.setdefault('pvalue', 'anchored_fast')
+        proto.setdefault('trials', 512)
+        if proto.get('pvalue') == 'anchored_fast':
+            # Calibrated tails: GPD beyond the 512-replicate null, and pairs with
+            # p < 0.01 (at most 5,000 per run) re-tested with 32,768 fresh replicates.
+            proto.setdefault('refine_p', 0.01)
+            proto.setdefault('refine_max_pairs', 5000)
+        self._proto          = proto
         self._gain_mask      = gain_mask
         self._loss_mask      = loss_mask
         self._gene_order     = gene_order or []
+        if emergence == 'mrca':
+            use_clade_mask = True
         self._use_clade_mask = use_clade_mask and (gain_mask is None)
-        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged)
+        self._emergence      = 'dist' if emergence == 'mrca' else emergence
+        self._emergence_scale = emergence_scale
+        self._mrca_subsize   = mrca_subsize
+        self._condition      = condition
+        self._oversample     = oversample
+        self._eligibility    = eligibility
+        self._phylogroup_depth = phylogroup_depth
+        self._adapt_alpha    = adapt_alpha
+        self._branch_cap     = branch_cap
+        self._simulate_and_evaluate(cores=cores, gamma=gamma, include_flagged=include_flagged,
+                                    seed=seed)
 
-    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=False):
+    def _simulate_and_evaluate(self, alpha=0.05, cores=-1, gamma=False, include_flagged=True,
+                               seed=None):
         traits_to_simulate = np.unique(self.pairs.flatten())
 
         # PastML skips constant traits (< 2 unique states), so they are absent
         # from self.pastml. Drop any pairs where either trait is missing so that
-        # those pairs fall into the p=0.5 bucket in _multiple_test_correction.
+        # those pairs fall into the p=1 bucket in _multiple_test_correction.
         pastml_traits = set(self.pastml.index)
         missing = [t for t in traits_to_simulate if t not in pastml_traits]
         if missing:
@@ -417,20 +495,21 @@ class TreeSimulator:
         # Detect traits whose Poisson null distribution is systematically
         # miscalibrated (sparse events + subsize asymmetry).
         #
-        # include_flagged=False (default): remove their pairs from simulation
-        #   so they fall into the p=0.5 bucket in _multiple_test_correction.
-        # include_flagged=True: simulate normally but annotate results with
-        #   null_calibrated=False so downstream users can distinguish them.
+        # include_flagged=True (default): simulate normally but annotate
+        #   results with null_calibrated=False so users can distinguish them.
+        # include_flagged=False: remove their pairs from the results; they
+        #   fall into the p=1 bucket in _multiple_test_correction.
         # ------------------------------------------------------------------
-        self.flagged_traits = flag_uncalibratable_traits(traits_to_simulate_pastml)
+        self.flagged_traits = flag_uncalibratable_traits(
+            traits_to_simulate_pastml, n_tips=len(self.obsdf_modified))
         if not self.flagged_traits.empty:
             flagged_genes = set(self.flagged_traits['gene'])
             n_flagged = len(flagged_genes)
             if not include_flagged:
                 print(
                     f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
-                    f"null distributions. Their pairs are excluded from simulation "
-                    f"and assigned p=0.5. Use --include-flagged to test them anyway. "
+                    f"null distributions. --no-include-flagged is set: their pairs are "
+                    f"excluded from the results (p=1 in correction). "
                     f"Access via Sim.flagged_traits for details."
                 )
                 keep_pairs = (
@@ -444,8 +523,8 @@ class TreeSimulator:
             else:
                 print(
                     f"[SimPhyNI] Flagging {n_flagged} trait(s) with miscalibrated "
-                    f"null distributions. --include-flagged is set: pairs will be "
-                    f"simulated and marked null_calibrated=False in results. "
+                    f"null distributions. Their pairs are simulated and marked "
+                    f"null_calibrated=False in the results. "
                     f"Access via Sim.flagged_traits for details."
                 )
         else:
@@ -464,7 +543,49 @@ class TreeSimulator:
 
         # Build per-trait eligibility masks for simulation
         gm = lm = None
-        if self._use_clade_mask:
+        if getattr(self, '_eligibility', None) == 'phylogroup':
+            from .simulation import build_phylogroup_mask
+            gm, lm, allowed_bl = build_phylogroup_mask(
+                self.tree, self.obsdf_modified, list(traits_to_simulate),
+                traits_to_simulate_pastml['root_state'], self._phylogroup_depth,
+            )
+            # Rate denominator = eligible branch length (as for the MRCA mask)
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = allowed_bl
+            traits_to_simulate_pastml['loss_subsize'] = allowed_bl
+        elif getattr(self, '_eligibility', None) == 'adaptive':
+            from .simulation import (sim_bit, condition_on_prevalence, condition_on_footprint,
+                                     pack_observed, adaptive_phylogroup_mask)
+            trials = 64
+            cond = getattr(self, '_condition', None) in ('prevalence', 'footprint') and self._oversample > 1
+            obs_prev = self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index).mean().to_numpy()
+            pass_seed = None if seed is None else seed + 3
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = sim_bit(self.tree, traits_to_simulate_pastml,
+                                trials=trials * self._oversample if cond else trials,
+                                seed=pass_seed, emergence=getattr(self, '_emergence', 'dist'),
+                                emergence_scale=getattr(self, '_emergence_scale', 1.0),
+                                branch_cap=self._resolved_branch_cap())
+            if cond and self._condition == 'prevalence':
+                first = condition_on_prevalence(first, obs_prev, trials,
+                                                seed=None if seed is None else seed + 4)
+            elif cond:
+                obs_tr = self.obsdf_modified.reindex(index=[l.name for l in self.tree],
+                                                     columns=traits_to_simulate_pastml.index).to_numpy()
+                first = condition_on_footprint(self.tree, first, pack_observed(obs_tr), trials,
+                                               seed=None if seed is None else seed + 4)
+            gm, lm, frac, n_excl = adaptive_phylogroup_mask(
+                self.tree, first, trials, self.obsdf_modified, list(traits_to_simulate),
+                traits_to_simulate_pastml['root_state'], self._phylogroup_depth, self._adapt_alpha,
+            )
+            self.excluded_phylogroups = pd.Series(n_excl, index=list(traits_to_simulate))
+            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+            traits_to_simulate_pastml['gain_subsize'] = traits_to_simulate_pastml['gain_subsize'] * frac
+            traits_to_simulate_pastml['loss_subsize'] = traits_to_simulate_pastml['loss_subsize'] * frac
+        elif getattr(self, '_eligibility', None) not in (None, 'none'):
+            raise ValueError(f"eligibility must be None, 'phylogroup' or 'adaptive', got {self._eligibility!r}")
+        elif self._use_clade_mask:
             from .simulation import build_clade_mask
             root_states = traits_to_simulate_pastml['root_state']
             gm, lm, mrca_bl = build_clade_mask(
@@ -474,9 +595,10 @@ class TreeSimulator:
             )
             # Recalibrate subsize to the MRCA subtree branch length so the
             # Poisson rate (count / subsize) matches the eligible region.
-            traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
-            traits_to_simulate_pastml['gain_subsize'] = mrca_bl
-            traits_to_simulate_pastml['loss_subsize'] = mrca_bl
+            if getattr(self, '_mrca_subsize', 'mrca') == 'mrca':
+                traits_to_simulate_pastml = traits_to_simulate_pastml.copy()
+                traits_to_simulate_pastml['gain_subsize'] = mrca_bl
+                traits_to_simulate_pastml['loss_subsize'] = mrca_bl
         elif getattr(self, '_gain_mask', None) is not None and self._gene_order:
             # Legacy: explicit mask passed by the caller
             col_idx = [self._gene_order.index(g) for g in traits_to_simulate
@@ -488,7 +610,17 @@ class TreeSimulator:
         self.simulation_result = simulate_glrates_bit(
             tree=self.tree, trait_params=traits_to_simulate_pastml,
             pairs=self.pairs, obspairs=self.obspairs, cores=cores,
-            gain_mask=gm, loss_mask=lm, gamma=gamma,
+            gain_mask=gm, loss_mask=lm, gamma=gamma, seed=seed,
+            emergence=getattr(self, '_emergence', 'dist'),
+            emergence_scale=getattr(self, '_emergence_scale', 1.0),
+            condition=getattr(self, '_condition', None),
+            oversample=getattr(self, '_oversample', 8),
+            obs_prevalence=self.obsdf_modified.reindex(columns=traits_to_simulate_pastml.index)
+                               .mean().to_numpy(),
+            obs_traits=self.obsdf_modified.reindex(index=[l.name for l in self.tree],
+                                                   columns=traits_to_simulate_pastml.index).to_numpy(),
+            branch_cap=self._resolved_branch_cap(),
+            **getattr(self, '_proto', {}),
         )
         self.simulation_result['T1'] = self.simulation_result['first']
         self.simulation_result['T2'] = self.simulation_result['second']
@@ -498,6 +630,15 @@ class TreeSimulator:
 
         self._multiple_test_correction(alpha)
     
+    def _resolved_branch_cap(self):
+        cap = getattr(self, '_branch_cap', None)
+        if cap is None or cap == 'none':
+            return None
+        if cap == 'iqr':
+            from .simulation import iqr_branch_cap
+            return iqr_branch_cap(self.tree)
+        return float(cap)
+
     def _multiple_test_correction(self,alpha = 0.05):
         # get uncorrected results
         res = self.simulation_result
@@ -510,7 +651,27 @@ class TreeSimulator:
         pvals = res['p-value'].values 
         simulated_pairs = len(pvals)
         filtered_pairs = self.total_tests - len(pvals)
-        pvals = np.concatenate((np.array(pvals),np.full(filtered_pairs,0.5)))
+        tf = getattr(self, '_proto', {}).get('testable_filter')
+        if tf is not None and 'p_min' in res.columns:
+            # Tarone-style filtering: pairs that cannot reach p <= tf given their
+            # margins are left out of the correction (adjusted p = 1), as are
+            # pairs never simulated.
+            testable = res['p_min'].to_numpy() <= tf
+            for name, method in (('pval_bh', 'fdr_bh'), ('pval_by', 'fdr_by'),
+                                 ('pval_bonf', 'bonferroni')):
+                adj = np.ones(simulated_pairs)
+                if testable.any():
+                    adj[testable] = sm.multipletests(pvals[testable], alpha=alpha, method=method)[1]
+                res[name] = adj
+            res['pval_naive'] = res.loc[:, 'p-value']
+            res['testable'] = testable
+            base_cols = ['T1','T2','direction','effect size','prevalence_T1','prevalence_T2',
+                         'pval_naive','pval_bh','pval_by','pval_bonf','testable']
+            if 'null_calibrated' in res.columns:
+                base_cols.append('null_calibrated')
+            self.result = res[base_cols]
+            return
+        pvals = np.concatenate((np.array(pvals),np.full(filtered_pairs, 1.0)))
 
         # Benjamini-Hochberg
         res['pval_bh'] = sm.multipletests(pvals, alpha=alpha, method='fdr_bh')[1][:simulated_pairs]
@@ -529,8 +690,143 @@ class TreeSimulator:
                      'pval_naive','pval_bh','pval_by','pval_bonf']
         if 'null_calibrated' in res.columns:
             base_cols.append('null_calibrated')
+        if 'effect_lor' in res.columns:
+            # Empirical-Bayes shrinkage of effect sizes (adaptive shrinkage):
+            # posterior mean effect and local false sign rate, for ordering.
+            from .shrinkage import shrink
+            m_, sd_, lfsr_, _ = shrink(res['effect_lor'].to_numpy(), res['effect_se'].to_numpy())
+            res['effect_shrunk'] = m_
+            res['lfsr'] = lfsr_
+        base_cols += [c for c in ('obs_stat', 'effect_lor', 'effect_se', 'effect_shrunk', 'lfsr',
+                                  'gated', 'p_region', 'refined', 'overlap', 'n_null') if c in res.columns]
         self.result = res[base_cols]
         
+
+    # ------------------------------------------------------------------
+    # Output tables
+    # ------------------------------------------------------------------
+    COMPACT_COLUMNS = ['T1', 'T2', 'direction', 'effect_shrunk', 'lfsr', 'pval_bh', 'pval_by',
+                       'prevalence_T1', 'prevalence_T2', 'n_both', 'co_confined', 'null_calibrated']
+
+    def build_outputs(self, confinement_max_frac=0.35):
+        """Return (long, compact, traits) DataFrames.
+
+        long    : one row per tested pair with every field (see the user guide)
+        compact : the fields needed to select and rank associations
+        traits  : one row per tested trait
+        """
+        from .confinement import trait_confinement, pair_co_confined
+        res = self.result.copy()
+        t1 = res['T1'].astype(str).to_numpy(); t2 = res['T2'].astype(str).to_numpy()
+        obs = self.obsdf_modified.copy()
+        obs.columns = obs.columns.astype(str)
+        traits = sorted(set(t1) | set(t2))
+        V = obs[traits].notna().to_numpy()                       # tip has a value
+        X = (obs[traits].to_numpy() > 0.5)
+        n_tips_all = X.shape[0]
+        col = {t: k for k, t in enumerate(traits)}
+        i = np.array([col[a] for a in t1]); j = np.array([col[b] for b in t2])
+        n1 = X.sum(0)
+        # pairwise-complete 2x2 tables: tips missing either trait are left out
+        Xf, Vf = X.astype(np.float32), V.astype(np.float32)
+        n_both = np.empty(len(res), np.int64); n_pair = np.empty(len(res), np.int64)
+        n1_pair = np.empty(len(res), np.int64); n2_pair = np.empty(len(res), np.int64)
+        if len(traits) <= 8000:
+            n_both[:] = np.rint((Xf.T @ Xf)[i, j]); n_pair[:] = np.rint((Vf.T @ Vf)[i, j])
+            XV = Xf.T @ Vf
+            n1_pair[:] = np.rint(XV[i, j]); n2_pair[:] = np.rint(XV[j, i])
+        else:
+            for c0 in range(0, len(res), 200_000):
+                sl = slice(c0, c0 + 200_000)
+                a_, b_ = i[sl], j[sl]
+                n_both[sl] = (X[:, a_] & X[:, b_]).sum(0); n_pair[sl] = (V[:, a_] & V[:, b_]).sum(0)
+                n1_pair[sl] = (X[:, a_] & V[:, b_]).sum(0); n2_pair[sl] = (X[:, b_] & V[:, a_]).sum(0)
+        long = pd.DataFrame({'T1': t1, 'T2': t2})
+        long['direction'] = res['direction'].to_numpy()
+        long['n_tips'] = n_pair
+        long['n_both'] = n_both
+        long['n_T1_only'] = n1_pair - n_both
+        long['n_T2_only'] = n2_pair - n_both
+        long['n_neither'] = n_pair - n1_pair - n2_pair + n_both
+        n_tips = n_tips_all
+        long['prevalence_T1'] = res['prevalence_T1'].to_numpy()
+        long['prevalence_T2'] = res['prevalence_T2'].to_numpy()
+        if 'obs_stat' in res.columns:
+            long['weighted_lor'] = res['obs_stat'].to_numpy()
+            long['null_mean'] = (res['obs_stat'] - res['effect_lor']).to_numpy()
+            long['null_sd'] = res['effect_se'].to_numpy()
+            long['effect_lor'] = res['effect_lor'].to_numpy()
+        long['effect_z'] = (res['effect size'].abs() * res['direction']).to_numpy()
+        for c in ('effect_shrunk', 'lfsr'):
+            long[c] = res[c].to_numpy() if c in res.columns else np.nan
+        for c in ('pval_naive', 'pval_bh', 'pval_by', 'pval_bonf'):
+            long[c] = res[c].to_numpy()
+        if 'refined' in res.columns:
+            long['refined'] = res['refined'].fillna(False).astype(bool).to_numpy()
+            trials = getattr(self, '_proto', {}).get('trials', 64)
+            rn = getattr(self, '_proto', {}).get('refine_n', 32768)
+            long['n_null'] = np.where(long['refined'], rn, trials)
+        if 'p_region' in res.columns:
+            long['p_region'] = res['p_region'].to_numpy()
+            long['gated'] = res['gated'].fillna(False).astype(bool).to_numpy()
+        long['null_calibrated'] = res['null_calibrated'].to_numpy() if 'null_calibrated' in res.columns else True
+        # descriptive lineage confinement
+        conf, cover = trait_confinement(self.tree, obs[traits], max_frac=confinement_max_frac)
+        cmap = dict(zip(conf['trait'], conf['confined']))
+        long['confined_T1'] = [cmap.get(a, False) for a in t1]
+        long['confined_T2'] = [cmap.get(b, False) for b in t2]
+        long['co_confined'] = pair_co_confined(conf, cover, t1, t2)
+        # estimated number of changes per trait (ancestral reconstruction)
+        P = self.pastml
+        ch = (P['gains'] + P['losses']) if {'gains', 'losses'} <= set(P.columns) else pd.Series(dtype=float)
+        ch.index = ch.index.astype(str)
+        long['changes_T1'] = ch.reindex(t1).to_numpy()
+        long['changes_T2'] = ch.reindex(t2).to_numpy()
+        # order: significance, then size of the shrunken effect
+        key = long['effect_shrunk'].abs() if long['effect_shrunk'].notna().any() else long['effect_z'].abs()
+        long = long.assign(_k=-key).sort_values(['pval_bh', '_k'], kind='stable').drop(columns='_k').reset_index(drop=True)
+        compact = long[[c for c in self.COMPACT_COLUMNS if c in long.columns]].copy()
+        if compact['effect_shrunk'].isna().all():
+            compact['effect_shrunk'] = long['effect_z']
+        # per-trait table
+        sig = long[long['pval_bh'] < 0.05]
+        def _count(df, d):
+            s1 = df[df['direction'] == d]
+            return pd.concat([s1['T1'], s1['T2']]).value_counts()
+        pos, neg = _count(sig, 1), _count(sig, -1)
+        tested = pd.concat([long['T1'], long['T2']]).value_counts()
+        flagged = set(self.get_flagged_traits()['gene']) if not self.get_flagged_traits().empty else set()
+        tt = pd.DataFrame({'trait': traits})
+        tt['n_tips'] = V.sum(0)
+        tt['n_present'] = n1
+        tt['prevalence'] = n1 / np.maximum(V.sum(0), 1)
+        tt['est_gains'] = P['gains'].reindex(traits).to_numpy() if 'gains' in P else np.nan
+        tt['est_losses'] = P['losses'].reindex(traits).to_numpy() if 'losses' in P else np.nan
+        tt['root_state'] = P['root_state'].reindex(traits).to_numpy() if 'root_state' in P else np.nan
+        tt = tt.merge(conf, on='trait', how='left')
+        tt['null_calibrated'] = ~tt['trait'].isin(flagged)
+        tt['n_pairs_tested'] = tested.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt['n_significant_pos'] = pos.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt['n_significant_neg'] = neg.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt = tt.sort_values(['n_significant_pos', 'n_significant_neg'], ascending=False).reset_index(drop=True)
+        return long, compact, tt
+
+    def write_outputs(self, outdir, fmt='csv', prefix='simphyni'):
+        """Write <prefix>_results (compact), <prefix>_results_long and <prefix>_traits."""
+        from pathlib import Path
+        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+        long, compact, traits = self.build_outputs()
+        ext = 'parquet' if fmt == 'parquet' else 'csv'
+        paths = {}
+        for name, df in (('results', compact), ('results_long', long), ('traits', traits)):
+            f = outdir / f'{prefix}_{name}.{ext}'
+            if ext == 'parquet':
+                df.to_parquet(f, index=False)
+            else:
+                df.to_csv(f, index=False)
+            paths[name] = f
+        self._outputs = (long, compact, traits)
+        return paths
 
     def get_results(self):
         return self.get_top_results(top = len(self.result['T1']))
@@ -708,10 +1004,10 @@ class TreeSimulator:
         """Rectangular heatmap: run_traits (rows) vs all other traits (columns).
 
         Cell colour encodes direction and significance via:
-            score = direction * (0.5 - pval)
+            score = direction * (1 - pval) / 2
         Synergistic + significant -> positive -> red
         Antagonistic + significant -> negative -> blue
-        Non-significant (pval~0.5) -> ~0 -> white
+        Non-significant (pval~1) -> ~0 -> white
         """
         res = self.result.copy()
         if prevalence_range is not None:
@@ -731,7 +1027,7 @@ class TreeSimulator:
 
         res[['row_trait', 'col_trait']] = res.apply(
             lambda r: pd.Series(_assign(r)), axis=1)
-        res['score'] = res['direction'] * (0.5 - res[pval_col])
+        res['score'] = res['direction'] * (1.0 - res[pval_col]) / 2.0
 
         matrix = res.pivot_table(
             index='row_trait', columns='col_trait',
@@ -752,7 +1048,7 @@ class TreeSimulator:
         sns.heatmap(
             matrix.fillna(0), cmap=cmap, center=0, vmin=-0.5, vmax=0.5,
             ax=ax, square=False,
-            cbar_kws={'label': 'direction \u00d7 (0.5 \u2212 p-value)'}
+            cbar_kws={'label': 'direction \u00d7 (1 \u2212 p-value) / 2'}
         )
 
         row_labels = list(matrix.index)

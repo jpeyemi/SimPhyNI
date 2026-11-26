@@ -136,7 +136,7 @@ def test_run_missing_args():
     with pytest.raises(SystemExit) as exc:
         run_simphyni(args)
     
-    assert "Must provide either --samples OR -T" in str(exc.value)
+    assert "Provide either --samples" in str(exc.value)
 
 @patch('os.path.exists')
 def test_run_missing_file_check(mock_exists):
