@@ -139,3 +139,51 @@ python benchmarks_large/eval_thresholds.py <out>/syn <out>/syn/pairs_sample.csv 
 python benchmarks_large/truth_mc.py <out>/syn <out>/runs/syn <results.parquet> pos1 20 16
 python benchmarks_large/report_panx.py <runs/full> <datasets/full> <variants...> --md report.md
 ```
+
+## 5. Realistic false-discovery estimate (`realistic_null.py`, `summarize_rnull.py`, `rnull_subsets.py`, `rnull_small_runs.py`)
+
+**Method.** Each of the 4,501 real *E. coli* genes is replaced by an independent synthetic trait with
+the gene's fitted rate and prevalence, so every pair in the replica is a true null. A gene is
+"confined" if its minority-state tips are covered by at most two clades holding ≤ 35 % of tips: 688
+genes (15.3 %).
+
+Two replicas bound the truth:
+
+- **Worst case:** every confined gene can only change inside its own cover clades, i.e. all
+  confinement is treated as independent lineage restriction.
+- **Best case:** every gene evolves freely.
+
+The estimated FDR is the number of replica calls (all false) divided by the number of real calls,
+for the same analysis.
+
+**BH q < 0.05:**
+
+| analysis | real calls | false calls, worst / best case | estimated FDR |
+|---|---|---|---|
+| genome-wide (10.1 M pairs), default | 38,174 | 0 / 0 | ≈ 0 |
+| genome-wide, lineage control | 31,618 | 0 / 0 | ≈ 0 |
+| random 30-gene sets | 1.9 per set | 0 / 0.005 | ≤ 0.3 % |
+| random 100-gene sets | 18.7 per set | 0 / 0 | ≈ 0 |
+| all 688 confined genes (236,328 pairs), default | 1,766 | 0 / 0 | ≈ 0 |
+| all 688 confined genes, composite | 1,297 | 0 / 0 | ≈ 0 |
+| all 688 confined genes, soft auto | 2,506 | **1,290** / 0 | 52 % |
+| all 688 confined genes, soft auto + composite | 1,470 | **684** / 0 | 47 % |
+| sets of 30 confined genes, default | 5.1 per set | 2.6 / — | ≤ 51 % (BY ≤ 22 %) |
+| sets of 30 confined genes, composite | 2.4 per set | 1.4 / — | ≤ 57 % (BY ≤ 31 %) |
+
+**What this shows.**
+
+1. **Genome-wide and random-subset analyses are safe.** Even if all confinement is restriction, the
+   default makes no false calls genome-wide. In the worst-case replica, pairs of confined genes are
+   inflated (5.5× at p < 0.01), but their smallest p (1.2×10⁻⁵) is far above genome-wide BH thresholds.
+2. **The risk is small analyses made of lineage-confined genes.** Their BH thresholds are loose, and
+   refinement sharpens the misspecified co-restricted nulls. The worst-case bound is about half of
+   the calls. The true rate is lower, because genes sharing a clade cover are often co-transferred
+   (islands, mobile elements), which is a real association; the replica counts every such pair as
+   false.
+3. **Soft restriction creates false positives** when confinement is real restriction (52 %, 98 %
+   positive associations). Rescaling each trait's rate by its accessible share spreads its null copies
+   evenly through the whole MRCA clade, while confined traits sit in sub-clades and co-occur far more
+   than that over-dispersed null allows. It is no longer recommended.
+4. **The composite null does not lower the realistic FDR** (genome-wide 0 → 0; small confined sets
+   51 % → 57 %) and costs recall. It helped only on the benchmark's random-region restriction.

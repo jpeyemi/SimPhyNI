@@ -4,12 +4,23 @@
 whole-tree null calls them associated. This affects plasmid-, phage- and phylogroup-specific genes
 in pangenomes. It is the main source of false discoveries that remain with the default null.
 
-**Recommended control:** `--lineage soft_auto --composite`. Significant pairs then mean
-"associated beyond shared confinement".
+**Recommendation (after the realistic-null experiment, `benchmarks_large/REPORT.md` §5):**
+
+- **Genome-wide or random-subset analyses: use the default, with no lineage control.** In a replica of
+  the real *E. coli* genome where every confined gene is treated as lineage-restricted, the default
+  made no false calls.
+- **Small focused analyses built from lineage-confined genes** (e.g. 30 plasmid- or
+  phylogroup-specific genes): the worst-case FDR bound is about 50 % with BH and 22 % with BY,
+  whatever the null. Use BY, and read positive associations among genes confined to the same clades
+  as "shared lineage or co-transfer", not as functional interaction.
+- **Do not use `--lineage soft_auto`.** It creates false positives when confinement is real
+  restriction (52 % of calls in the replica).
+- **`--composite` is optional.** It reduces false positives for traits confined to random clades
+  (benchmark restricted scenario), but not in the realistic replica, and it costs recall.
 
 ## The two components
 
-**1. `--lineage soft_auto` (model refinement).** Each trait's gain/loss rate decays as
+**1. `--lineage soft_auto` (model refinement; no longer recommended, see above).** Each trait's gain/loss rate decays as
 exp(−d / (τ · mean tip depth)) with distance d from the trait's own MRCA clade.
 
 - τ is chosen per run by posterior-predictive fit of a single-trait statistic: the clade spread of

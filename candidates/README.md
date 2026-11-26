@@ -26,9 +26,11 @@
    `pval_by` is the strict alternative.
 2. **Order** the selected pairs by `effect_shrunk`. On the benchmark it ranks best, ahead of
    |effect| and p.
-3. **Lineage-restricted genes** (plasmid, phage, phylogroup-specific): add
-   `--lineage soft_auto --composite` and read results as "association beyond shared confinement"
-   (see [LINEAGE.md](LINEAGE.md)).
+3. **Lineage-confined genes.**
+   - Genome-wide runs need no lineage control: there were no false calls even when every confined
+     gene was treated as restricted.
+   - For small analyses built from confined genes, use BY and read co-confined positive associations
+     as "shared lineage or co-transfer" (see [LINEAGE.md](LINEAGE.md)).
 
 ## Benchmark (PanX full tier: 11 species, ≤250 tips, 3 replicates)
 
@@ -39,7 +41,7 @@ Generated with `benchmarks_large/report_panx.py`; the full table is in
 | configuration | synthetic | late-emerging | restricted | null ratio @1e-4 | AP by p / by shrunken effect |
 |---|---|---|---|---|---|
 | **default (GPD tail + refinement)** | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 3.9* | 0.841 / **0.857** |
-| default + `--lineage soft_auto --composite` | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 4.6* | 0.834 / 0.851 |
+| default + `--composite` (benchmark restriction only) | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 4.6* | 0.834 / 0.851 |
 | anchored, KDE tail (earlier default) | 0.32 / 0 | 0.47 / 0.011 | 0.29 / 0.57 | 1.8 | 0.841 / — |
 | legacy (unweighted, prevalence ×8) | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 1.9 | 0.806 / — |
 | FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 143 | 0.442 / — |
@@ -66,13 +68,14 @@ Generated with `benchmarks_large/report_panx.py`; the full table is in
 simphyni run --sample-name screen --tree tree.nwk --traits pangenome.csv --outdir screen --cores 16 --seed 1
 #    rank by effect_shrunk; candidates = pval_bh < 0.05, or the top of the ranking
 
-# 2. focused test: candidate traits first in the file, one-vs-rest, with lineage control
+# 2. focused test: candidate traits first in the file, one-vs-rest
 simphyni run --sample-name focus --tree tree.nwk --traits candidates_first.csv --run-traits 0,...,K \
-  --outdir focus --lineage soft_auto --composite --cores 16 --seed 2
-#    report pval_bh < 0.05; order by effect_shrunk; lfsr < 0.05 for a confident sign
+  --outdir focus --cores 16 --seed 2
+#    report pval_bh < 0.05 (pval_by if the set is mostly lineage-confined genes);
+#    order by effect_shrunk; lfsr < 0.05 for a confident sign
 
-# 3. pair level: gated (composite) pairs = association beyond shared confinement; re-run with a
-#    different --seed to check Monte-Carlo stability
+# 3. pair level: positive associations between genes confined to the same clades may be shared
+#    lineage or co-transfer; re-run with a different --seed to check Monte-Carlo stability
 ```
 
 ## Limits

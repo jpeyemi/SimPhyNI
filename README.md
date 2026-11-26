@@ -147,8 +147,10 @@ The defaults were chosen by benchmarking calibration, power and speed on 11 PanX
   - `soft_auto` lowers each trait's rate with distance from its own clade, on a scale fitted to the
     data.
   - `--composite` reports max(p whole-tree, p pair-region), which is valid if either null holds.
-  - Use both for pangenomes with lineage-restricted genes, and read significant pairs as
-    "association beyond shared confinement".
+  - On a replica of the real *E. coli* genome, neither lowered the false-discovery rate, and
+    `soft_auto` created false positives, so neither is recommended by default. Genome-wide runs made
+    no false calls without them. For small analyses built from lineage-confined genes, use
+    `pval_by` and read co-confined positive associations as shared lineage or co-transfer.
 - `--trials N` (default 512): replicates per trait.
 - `--branch-cap iqr|none` (default `iqr`): simulate with the same long-branch cap used for the rate
   estimate.

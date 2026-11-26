@@ -78,6 +78,7 @@ kw = {
     "default": dict(),
     "soft_auto_composite": dict(lineage="soft_auto", composite=True),
     "composite": dict(composite=True),
+    "soft_auto": dict(lineage="soft_auto"),
     "legacy": dict(statistic="logor", pvalue="kde", trials=64, condition="prevalence"),
     "default_refine": dict(refine_p=1e-3),
     "default_r01": dict(refine_p=1e-2, refine_max_pairs=5000),
