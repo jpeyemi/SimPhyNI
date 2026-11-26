@@ -110,22 +110,24 @@ Cells are recall / observed FDP at BH q < 0.05 (`report_panx.py`; full table in
 
 ## 4. Real E. coli (10.1 M pairs): speed and calls
 
-| stage | default | lineage control |
+| stage | default | `--composite` |
 |---|---|---|
 | ACR (once per tree) | 18 s | 18 s |
 | pairs + observed statistics | 28 s | 28 s |
-| τ selection | — | 27 s |
 | simulation (4,501 × 512) | 1 s | 1 s |
-| scoring (anchored, GPD tails) | 71 s | 71 s |
-| refinement (5,000 pairs) | 175 s | 179 s |
-| composite (37,645 candidates; 5,000 refined) | — | 331 s |
-| **total (excluding ACR)** | **299 s** | **663 s** |
-| peak memory | 4.7 GB | 4.4 GB |
-| BH / BY < 0.05 calls | 38,174 / 22,629 | 31,618 / 18,851 |
+| scoring (anchored, exact counts + GPD beyond the sample) | 44 s | 44 s |
+| refinement (5,000 pairs) | 178 s | 251 s |
+| composite (38,164 candidates; 5,000 refined) | — | 331–1,424 s* |
+| **total (excluding ACR)** | **277 s** | 11–33 min* |
+| peak memory | 4.5 GB | 4.4 GB |
+| BH / BY < 0.05 calls | 38,164 / 22,629 | 31,671 / 18,890 |
 
-Lineage control removes 8,032 of the default's BH calls (21 %), which shared confinement explains or
-which lose significance, and adds 1,476. The legacy null would need about 50 minutes for these pairs
-and is anticonservative below 10⁻⁵.
+\* The composite step took 331 s on a lightly loaded machine and 1,424 s while another benchmark kept
+the load average near 190 on 11 cores. The default timings were measured under the same load.
+
+`--composite` removes 6,493 of the default's BH calls (17 %) and adds none. In the realistic replicas
+(§5), neither configuration made false calls genome-wide, so the removed calls are mostly lost power.
+The legacy null would need about 50 minutes for these pairs and is anticonservative below 10⁻⁵.
 
 ## Reproduce
 
@@ -160,8 +162,8 @@ for the same analysis.
 
 | analysis | real calls | false calls, worst / best case | estimated FDR |
 |---|---|---|---|
-| genome-wide (10.1 M pairs), default | 38,174 | 0 / 0 | ≈ 0 |
-| genome-wide, lineage control | 31,618 | 0 / 0 | ≈ 0 |
+| genome-wide (10.1 M pairs), default | 38,164 | 0 / 0 | ≈ 0 |
+| genome-wide, soft auto + composite | 31,618 | 0 / 0 | ≈ 0 |
 | random 30-gene sets | 1.9 per set | 0 / 0.005 | ≤ 0.3 % |
 | random 100-gene sets | 18.7 per set | 0 / 0 | ≈ 0 |
 | all 688 confined genes (236,328 pairs), default | 1,766 | 0 / 0 | ≈ 0 |

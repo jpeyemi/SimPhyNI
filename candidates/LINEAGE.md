@@ -62,9 +62,9 @@ q < 0.05.
 | hidden + composite | 0.21 / 0.026 | 0.12 / 0.49 | 14.3 |
 | **soft auto + composite** | 0.20 / 0.027 | 0.13 / **0.50** | **9.7** |
 
-**Real *E. coli* (4,501 genes, 10.1 M pairs).** The default makes 38,174 BH calls in 5 min; with
-lineage control there are 31,618 in 11 min. 8,032 of the default's calls (21 %) are explained by
-shared confinement or lose significance, and 1,476 are new.
+**Real *E. coli* (4,501 genes, 10.1 M pairs).** The default makes 38,164 BH calls in about 5 min.
+With `--composite` there are 31,671: 6,493 of the default's calls (17 %) drop out and none are added.
+Because the realistic replicas show no genome-wide false calls (below), these are mostly lost power.
 
 ## Approaches that did not help
 

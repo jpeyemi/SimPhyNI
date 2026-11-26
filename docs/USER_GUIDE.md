@@ -435,7 +435,7 @@ summary_plots(long, traits, "out/")
 |---|---|---|---|
 | 150 traits, 125 tips | 11,000 | ~15 s end to end | < 1 GB |
 | 1,000 genes, 250 tips | 0.5 M | ~1 min | ~2 GB |
-| 4,501 genes, 500 tips (*E. coli*) | 10.1 M | ~5 min | 4.7 GB |
+| 4,501 genes, 500 tips (*E. coli*) | 10.1 M | ~5 min (`--composite`: +5–25 min) | 4.5 GB |
 
 The legacy null takes about 50 minutes on the *E. coli* example. Use `--output-format parquet` for
 large runs: a 10 M-row long table is several GB as CSV.

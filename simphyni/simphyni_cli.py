@@ -5,7 +5,11 @@ import sys
 import pandas as pd
 import subprocess
 
-__version__ = "1.0.2"
+try:
+    from ._version import __version__
+except ImportError:  # run as a plain script: read the version file next to this one
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_version.py")) as _f:
+        __version__ = _f.read().split("=")[1].strip().strip('"')
 
 EXAMPLES_DIR = os.path.join(os.getcwd(), "example_inputs")
 GITHUB_EXAMPLES_URL = "https://github.com/jpeyemi/SimPhyNI/raw/master/example_inputs"
