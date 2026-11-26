@@ -60,7 +60,7 @@ simphyni version
 **2. Traits File (`.csv` or `.parquet`)**
 
 * **Rows:** Genomes/Samples (matching tree tips).
-* **Columns:** Binary traits (0 = Absent, 1 = Present; non-numerical values will be set to 1 and blank values will be set to 0).
+* **Columns:** Binary traits (0 = Absent, 1 = Present; values above 0.5 count as present). Blank / `NA` cells are treated as **missing**: the ancestral reconstruction treats them as unknown, and each pair is tested on the tips where both traits are known.
 * **Header:** Required (Trait names).
 * **Index:** The first column must contain sample names matching tree tip labels.
 

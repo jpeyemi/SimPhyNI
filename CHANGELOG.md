@@ -45,6 +45,12 @@ downstream scripts written for 2.x need updating. The full documentation is in
 - **New plots** (`--plot`): genome-scale volcano, clustered heatmap of the most-connected traits,
   p-value histogram, top traits, and per-query volcanoes. They replace the per-correction heatmaps.
 
+### Missing values
+
+- Blank/`NA` trait values are kept as missing (from the dev-branch NA support). The anchored test and
+  the output tables use pairwise-complete data: tips missing either trait are left out of that pair's
+  observed statistic, null and 2×2 counts.
+
 ### Command line
 
 - **`--null`.** `--null default|legacy`; `legacy` reproduces the 2.x null.

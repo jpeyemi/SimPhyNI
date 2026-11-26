@@ -71,7 +71,10 @@ simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --plot
 
 - **Rows:** genomes, with the first column holding names that match the tree tips.
 - **Columns:** binary traits; the header row holds trait names.
-- **Values:** 1 = present, 0 = absent. Values above 0.5 count as present, blanks as absent.
+- **Values:** 1 = present, 0 = absent; values above 0.5 count as present.
+- **Missing values:** blank or `NA` cells mean unknown. The ancestral reconstruction treats them as
+  unknown tips, and each pair is tested only on tips where both traits are known (pairwise-complete).
+  `n_tips` in the long table is the number of such tips per pair.
 
 ```csv
 Sample,PhenotypeX,GeneA,GeneB
@@ -217,7 +220,7 @@ Pairs are sorted by `pval_bh`, then by the size of the shrunken effect.
 | column | meaning |
 |---|---|
 | `T1`, `T2`, `direction` | as above |
-| `n_tips` | tips tested |
+| `n_tips` | tips with both traits known (pairwise-complete) |
 | `n_both`, `n_T1_only`, `n_T2_only`, `n_neither` | the 2×2 table of tips |
 | `prevalence_T1`, `prevalence_T2` | trait prevalences |
 | `weighted_lor` | observed log odds ratio computed with phylogenetic tip weights (section 10) |
@@ -240,7 +243,7 @@ Pairs are sorted by `pval_bh`, then by the size of the shrunken effect.
 | column | meaning |
 |---|---|
 | `trait` | trait name |
-| `n_tips`, `n_present`, `prevalence` | tips tested and tips carrying the trait |
+| `n_tips`, `n_present`, `prevalence` | tips with a known value, tips carrying the trait, and their ratio |
 | `est_gains`, `est_losses` | expected numbers of gains and losses from ancestral reconstruction |
 | `root_state` | reconstructed state at the root (0/1) |
 | `confined`, `cover_frac`, `cover_clades` | whether the trait's minority-state tips fit in ≤ 2 clades holding ≤ 35 % of tips, the share of tips in that cover and the number of clades |
