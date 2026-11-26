@@ -90,8 +90,8 @@ Cells are recall / observed FDP at BH q < 0.05 (`report_panx.py`; full table in
 
 | configuration | synthetic | late-emerging | restricted | BY synthetic recall |
 |---|---|---|---|---|
-| **default** | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 0.22 |
-| default + lineage control | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 0.19 |
+| **default** | **0.36 / 0** | **0.49 / 0.010** | 0.28 / 0.56 | 0.21 |
+| default + `--composite` | 0.31 / 0 | 0.43 / 0.006 | 0.16 / 0.42 | 0.18 |
 | legacy null | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 0.15 |
 | FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 0.19 |
 | Fisher | 0.77 / 0.65 | 0.81 / 0.52 | 0.52 / 0.81 | 0.69 |

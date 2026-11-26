@@ -49,8 +49,8 @@ q < 0.05.
 
 | configuration | synthetic | late-emerging | restricted | same-clade null ratio @0.01 |
 |---|---|---|---|---|
-| default | 0.37 / 0 | 0.51 / 0.014 | 0.36 / 0.59 | 28 |
-| `--lineage soft_auto --composite` | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 11 |
+| default | 0.36 / 0 | 0.49 / 0.010 | 0.28 / 0.56 | 21 |
+| `--composite` | 0.31 / 0 | 0.43 / 0.006 | 0.16 / 0.42 | 10 |
 
 **Quick tier (6 species, ≤150 tips).**
 
@@ -84,7 +84,7 @@ or information shared across genes.
 ## What the control does not do
 
 - It cannot separate "co-restricted and independent" from "co-restricted and interacting within the
-  clade". Interactions confined to a clade lose power (restricted recall 0.36 → 0.18).
+  clade". Interactions confined to a clade lose power (restricted recall 0.28 → 0.16 with `--composite`).
 - Negative interactions inside restricted clades remain near chance for every SimPhyNI
   configuration.
 - About half of the restricted-scenario calls are still false. The scenario is a stress test (see

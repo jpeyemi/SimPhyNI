@@ -40,8 +40,8 @@ Generated with `benchmarks_large/report_panx.py`; the full table is in
 
 | configuration | synthetic | late-emerging | restricted | null ratio @1e-4 | AP by p / by shrunken effect |
 |---|---|---|---|---|---|
-| **default (GPD tail + refinement)** | **0.37 / 0** | **0.51 / 0.014** | 0.36 / 0.59 | 3.9* | 0.841 / **0.857** |
-| default + `--composite` (benchmark restriction only) | 0.33 / 0 | 0.45 / 0.010 | 0.18 / 0.45 | 4.6* | 0.834 / 0.851 |
+| **default (GPD tail + refinement)** | **0.36 / 0** | **0.49 / 0.010** | 0.28 / 0.56 | 4.0* | 0.841 / **0.857** |
+| default + `--composite` | 0.31 / 0 | 0.43 / 0.006 | 0.16 / 0.42 | 3.8* | 0.840 / 0.857 |
 | anchored, KDE tail (earlier default) | 0.32 / 0 | 0.47 / 0.011 | 0.29 / 0.57 | 1.8 | 0.841 / — |
 | legacy (unweighted, prevalence ×8) | 0.24 / 0.004 | 0.38 / 0.009 | 0.11 / 0.54 | 1.9 | 0.806 / — |
 | FaST-LMM | 0.27 / 0.45 | 0.36 / 0.32 | 0.51 / 0.65 | 143 | 0.442 / — |

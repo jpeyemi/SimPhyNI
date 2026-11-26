@@ -10,6 +10,9 @@ This pipeline is designed to:
 * Estimate trait co-occurrence null models through independent simulation of traits
 * Output statistical results for associations
 
+**Full documentation:** [docs/USER_GUIDE.md](docs/USER_GUIDE.md) covers installation, every option,
+every output column, interpretation and workflows.
+
 **Graphical Workflow:**
 <img width="2332" height="594" alt="Figure2gh" src="https://github.com/user-attachments/assets/7d2dc282-c988-4d7a-93ae-cd041cf6d931" />
 
@@ -95,27 +98,25 @@ For those familiar with Snakemake, rules can be edited, added, or removed to sui
 ### Run mode (single-run)
 
 ```bash
-simphyni run \
-  --sample-name my_sample \
-  --tree path/to/tree.nwk \
-  --traits path/to/traits.csv \
-  --run-traits 0,1,2 \
-  --outdir my_analysis \
-  --cores 4 \
-  --temp-dir ./tmp \
-  --min_prev 0.05 \
-  --max_prev 0.95 \
-  --plot
+# every pair of traits
+simphyni run --traits traits.csv --tree tree.nwk --sample-name my_run --outdir results --cores 8 --plot
+
+# query traits (columns 0 and 3) against all others
+simphyni run --traits traits.csv --tree tree.nwk --run-traits 0,3 --outdir results --plot
 ```
 
-**Key flags:**
+**Key flags** (`simphyni run --help`; all options are described in the [user guide](docs/USER_GUIDE.md#4-command-line-options)):
 
-* `--run-traits` — Comma-separated list of N values (e.g. `0,1,2`) to designate the first N traits in the file as query traits for a one-vs-rest comparison. Use `ALL` (default) for all-against-all. For example, `--run-traits 0,1,2` tests the first 3 traits against all others.
-* `--include-flagged` / `--no-include-flagged` — Some traits are flagged as having a possibly miscalibrated null distribution (sparse events combined with highly asymmetric eligible regions). By default their pairs are tested normally and marked `null_calibrated=False` in the output so you can assess them separately. `--no-include-flagged` drops them from the results instead. Access the list of flagged traits via `Sim.get_flagged_traits()` when using the Python API.
-* `--min_prev` / `--max_prev` — Minimum and maximum tip prevalence thresholds for traits to be included (default: 0.05 / 0.95).
-* `--plot` — Generate heatmap summaries of results.
-* `--save-object` — Save the full analysis object as a `.pkl` file (not recommended for analyses > 1,000,000 trait pairs).
-* `--seed` — Make results reproducible (independent of `--cores`).
+* `-T/--traits`, `-t/--tree`: trait table (.csv or .parquet; rows = tips) and rooted Newick tree.
+* `-r/--run-traits`: `ALL` (default) for every pair, or comma-separated column indices of query traits
+  (0 = first trait) to test against all others.
+* `--min-prev` / `--max-prev`: keep traits present in this range of tip fractions (default 0.05–0.95).
+* `--output-format csv|parquet`: format of the result tables. Parquet is much smaller for > 1 M pairs.
+* `--plot`: write summary plots (volcano, heatmap, p-value histogram, top traits).
+* `--seed`: reproducible results (independent of `--cores`).
+* `--include-flagged` / `--no-include-flagged`: keep (default) or drop pairs with traits whose null may be
+  miscalibrated. Kept pairs are marked `null_calibrated=False`.
+* `--save-object`: also save the analysis object as `.pkl` (avoid for > 1 M pairs).
 
 #### Null model options
 
@@ -219,57 +220,42 @@ simphyni run --samples example_inputs/simphyni_sample_info.csv --cores 8 --plot
 
 ## Outputs
 
-Outputs for each sample are placed in structured folders in the working directory or specified output directory in subdirectories by sample name, including:
+Each sample's results are written to `<outdir>/<sample>/` (`.csv` or `.parquet`). Every column is
+explained in the [user guide](docs/USER_GUIDE.md#5-outputs).
 
-### Main Result Files
+| file | one row per | contents |
+| --- | --- | --- |
+| `simphyni_results` | tested pair | compact table for selecting and ranking associations (below) |
+| `simphyni_results_long` | tested pair | every statistic: 2×2 tip counts, weighted log odds ratio, null mean and SD, raw and shrunken effects, raw p, BH/BY/Bonferroni, refinement, lineage confinement, estimated changes per trait |
+| `simphyni_traits` | trait | prevalence, estimated gains/losses, root state, lineage confinement, number of significant positive and negative partners |
 
-**`simphyni_results.csv`**
-Contains the statistical results for all tested trait pairs.
+**`simphyni_results` (compact)**, sorted by `pval_bh` and then by effect size:
 
 | Column | Description |
 | --- | --- |
-| `T1` / `T2` | Identifiers for the two traits being compared. |
-| `direction` | Direction of association: `1` = positive (co-occurrence), `-1` = negative (avoidance). |
-| `effect size` | Standardised association: \|observed − null mean\| / null SD of the weighted log odds ratio. |
-| `effect_lor`, `effect_se` | Observed weighted log odds ratio minus the null mean, and the null SD. |
-| `effect_shrunk` | Empirical-Bayes posterior mean of `effect_lor` (adaptive shrinkage over all pairs); recommended for ordering. |
-| `lfsr` | Local false sign rate of the association. |
-| `prevalence_T1` / `prevalence_T2` | Fraction of samples containing each trait (0.0 to 1.0). |
-| `pval_naive` | Raw p-value (anchored null, generalized-Pareto tail). |
-| `pval_bh` | Benjamini-Hochberg FDR correction (recommended). |
-| `pval_by` | Benjamini-Yekutieli FDR correction (strict; valid under arbitrary dependence). |
-| `pval_bonf` | Bonferroni correction. |
-| `refined` | The p-value comes from the 32,768-replicate refinement stage. |
-| `gated` | With `--composite`: the pair-region null gave the larger p-value. |
-| `null_calibrated` | `False` for pairs involving traits flagged as possibly miscalibrated (see `--include-flagged`). |
+| `T1` / `T2` | The two traits. |
+| `direction` | `1` = co-occur more than the phylogeny predicts (positive); `-1` = less (negative). |
+| `effect_shrunk` | Association strength in log-odds units after empirical-Bayes shrinkage. **Rank by this.** |
+| `lfsr` | Local false sign rate: probability that the direction is wrong. |
+| `pval_bh` | Benjamini–Hochberg q-value. **Select pairs with `pval_bh < 0.05`.** |
+| `pval_by` | Benjamini–Yekutieli q-value: stricter, valid under any dependence. |
+| `prevalence_T1` / `prevalence_T2` | Fraction of tips carrying each trait. |
+| `n_both` | Tips carrying both traits. |
+| `co_confined` | Both traits are confined to the same small part of the tree. A positive association may then reflect shared lineage or co-transfer rather than interaction ([guide §7.4](docs/USER_GUIDE.md#74-lineage-confined-traits-and-co_confined)). |
+| `null_calibrated` | `False` for pairs involving traits whose null may be miscalibrated. |
 
-### Additional Outputs
+**Plots** (`--plot`):
 
-* **`simphyni_results.csv`**: Main results table (see above).
-* **`simphyni_object.pkl`**: Optional file containing the completed analysis object, parsable with an active SimPhyNI environment. Controlled with the `--save-object` flag (not recommended for large analyses > 1,000,000 comparisons).
-* **Plots**: Heatmap summaries of tested associations (if `--plot` is enabled).
+* `simphyni_volcano.png`: all pairs, shrunken effect vs significance; significant pairs coloured by
+  direction, co-confined pairs outlined.
+* `simphyni_heatmap.png`: the 40 most-connected traits, clustered; colour = shrunken effect where q < 0.05.
+* `simphyni_pvalues.png`: p-value histogram, a quick calibration check.
+* `simphyni_top_traits.png`: traits with the most significant partners.
+* `volcano_<trait>.png`: one per query trait in `--run-traits` runs.
 
----
-
-### Directory Structure
-
-```
-SimPhyNI/
-├── simphyni/               # Core package
-│   ├── Simulation/         # Simulation engine
-│   ├── scripts/            # Pipeline scripts
-│   ├── Snakefile.py        # Workflow definition
-│   ├── simphyni_cli.py     # Command-line entry points
-│   └── envs/simphyni.yaml  # Conda environment (used by Snakemake)
-├── tests/                  # Testing suite
-├── conda-recipe/           # Build recipe
-├── cluster_profile/        # Cluster config template for HPC
-├── example_inputs/         # Example inputs to run SimPhyNI
-└── pyproject.toml
-```
+**Other files:** `simphyni_object.pkl` (with `--save-object`) and intermediate files in `--temp-dir`.
 
 ---
-
 
 ## Contact
 
