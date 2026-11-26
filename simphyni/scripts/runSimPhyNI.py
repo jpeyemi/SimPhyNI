@@ -61,7 +61,7 @@ def main():
                         help="Exclusion threshold for --eligibility adaptive (default: 0.05)")
     parser.add_argument("--branch-cap", choices=["none", "iqr"], default="iqr",
                         help="Cap branch lengths in simulation as in the rate denominators (default: iqr)")
-    parser.add_argument("--null", choices=["legacy", "anchored", "anchored-screen"], default="anchored-screen",
+    parser.add_argument("--null", choices=["default", "legacy", "anchored", "anchored-screen"], default="default",
                         help="Null model. legacy: unweighted, simulated-vs-simulated pairs with --condition. anchored: GSC-weighted statistic, observed trait vs the "
                              "partner's null replicates in both directions (max p), lineage-"
                              "overlap gate on candidate pairs. anchored-screen: anchored without "
@@ -87,6 +87,8 @@ def main():
                         help="At most this many smallest-p pairs are refined (default: 5000)")
     parser.add_argument("--refine-n", type=int, default=32768,
                         help="Replicates per trait in the refinement stage (default: 32768)")
+    parser.add_argument("--output-format", choices=["csv", "parquet"], default="csv",
+                        help="File format of the result tables (default: csv)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
@@ -146,6 +148,8 @@ def main():
     # ----------------------
     print("Running SimPhyNI analysis...")
     extra = dict(statistic="logor", pvalue="kde", trials=64)
+    if args.null == "default":
+        args.null = "anchored-screen"
     if args.null != "legacy":
         extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
                      anchor_combine=args.combine,
@@ -176,41 +180,15 @@ def main():
         with open(output_dir / 'simphyni_object.pkl', 'wb') as f:
             pickle.dump(Sim, f)
 
-    Sim.get_results().to_csv(output_dir / 'simphyni_results.csv')
-    print("Simulation completed.")
-
-    PVAL_COLS = {
-        'uncorrected': 'pval_naive',
-        'bh':          'pval_bh',
-        'by':          'pval_by',
-        'bonf':        'pval_bonf',
-    }
+    paths = Sim.write_outputs(output_dir, fmt=args.output_format)
+    print("Simulation completed. Wrote " + ", ".join(str(p) for p in paths.values()))
 
     if args.plot:
-        if args.run_traits > 0 and Sim.run_trait_names:
-            # Specific traits mode: volcano per trait+method, rectangular heatmap per method
-            for trait in Sim.run_trait_names:
-                safe = trait.replace('/', '_').replace(' ', '_')
-                for label, col in PVAL_COLS.items():
-                    Sim.plot_volcano(
-                        trait=trait,
-                        pval_col=col,
-                        output_file=str(output_dir / f'volcano_{safe}_{label}.png')
-                    )
-            for label, col in PVAL_COLS.items():
-                Sim.plot_heatmap_subset(
-                    run_traits=Sim.run_trait_names,
-                    pval_col=col,
-                    output_file=str(output_dir / f'heatmap_subset_{label}.png')
-                )
-        else:
-            # All-by-all mode: scalable symmetric heatmaps
-            for label, col in PVAL_COLS.items():
-                Sim.plot_results(
-                    pval_col=col,
-                    output_file=str(output_dir / f'heatmap_{label}.png'),
-                    figure_size=-1
-                )
+        from simphyni.plotting import summary_plots
+        long, _, traits = Sim._outputs
+        query = list(Sim.run_trait_names) if args.run_traits > 0 and getattr(Sim, 'run_trait_names', None) else None
+        made = summary_plots(long, traits, output_dir, query_traits=query)
+        print("Plots: " + ", ".join(str(m) for m in made))
 
 
 if __name__ == '__main__':

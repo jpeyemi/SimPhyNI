@@ -39,11 +39,14 @@ null_flags = (f"--emergence {_opt('emergence', 'none')} "
               f"--oversample {int(_opt('oversample', '8'))} "
               f"--branch-cap {_opt('branch_cap', 'iqr')} "
               f"--eligibility {_opt('eligibility', 'none')} "
-              f"--null {_opt('null', 'anchored-screen')} --trials {int(_opt('trials', '512'))} "
+              f"--null {_opt('null', 'default')} --trials {int(_opt('trials', '512'))} "
               f"--gate-p {float(_opt('gate_p', '0.05'))} --combine {_opt('combine', 'max')} "
               f"--lineage {_opt('lineage', 'none')} "
               + ("--composite " if str(config.get('composite', False)).lower() == 'true' else "")
-              + f"--refine-p {float(_opt('refine_p', '0.01'))} ")
+              + f"--refine-p {float(_opt('refine_p', '0.01'))} "
+              + f"--refine-max-pairs {int(_opt('refine_max_pairs', '5000'))} --refine-n {int(_opt('refine_n', '32768'))} "
+              + f"--output-format {_opt('output_format', 'csv')} ")
+RES_EXT = 'parquet' if _opt('output_format', 'csv') == 'parquet' else 'csv'
 seed_flag = f'--seed {int(_seed)}' if _seed else ''
 include_flagged = 'no-include-flagged' if str(config.get('include_flagged', True)).lower() == 'false' else 'include-flagged'
 
@@ -102,7 +105,7 @@ ext_dict = {
 
 rule all:
     input:
-        expand(f"{outdir}/{{sample}}/simphyni_results.csv", sample=SAMPLE_ls),
+        expand(f"{outdir}/{{sample}}/simphyni_results.{RES_EXT}", sample=SAMPLE_ls),
 
 rule reformat_csv:
     threads: 1
@@ -332,7 +335,7 @@ rule SimPhyNI:
         systems=rules.reformat_csv.output.out,
         tree=rules.reformat_tree.output.out
     output:
-        annotation=f"{outdir}/{{sample}}/simphyni_results.csv"
+        annotation=f"{outdir}/{{sample}}/simphyni_results.{RES_EXT}"
     params:
         outdir=f"{outdir}/{{sample}}/",
         runtype=lambda w: len(run_dict.get(w.sample, [])),

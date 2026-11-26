@@ -699,10 +699,129 @@ class TreeSimulator:
             m_, sd_, lfsr_, _ = shrink(res['effect_lor'].to_numpy(), res['effect_se'].to_numpy())
             res['effect_shrunk'] = m_
             res['lfsr'] = lfsr_
-        base_cols += [c for c in ('effect_lor', 'effect_se', 'effect_shrunk', 'lfsr',
-                                  'gated', 'refined', 'overlap', 'n_null') if c in res.columns]
+        base_cols += [c for c in ('obs_stat', 'effect_lor', 'effect_se', 'effect_shrunk', 'lfsr',
+                                  'gated', 'p_region', 'refined', 'overlap', 'n_null') if c in res.columns]
         self.result = res[base_cols]
         
+
+    # ------------------------------------------------------------------
+    # Output tables
+    # ------------------------------------------------------------------
+    COMPACT_COLUMNS = ['T1', 'T2', 'direction', 'effect_shrunk', 'lfsr', 'pval_bh', 'pval_by',
+                       'prevalence_T1', 'prevalence_T2', 'n_both', 'co_confined', 'null_calibrated']
+
+    def build_outputs(self, confinement_max_frac=0.35):
+        """Return (long, compact, traits) DataFrames.
+
+        long    : one row per tested pair with every field (see the user guide)
+        compact : the fields needed to select and rank associations
+        traits  : one row per tested trait
+        """
+        from .confinement import trait_confinement, pair_co_confined
+        res = self.result.copy()
+        t1 = res['T1'].astype(str).to_numpy(); t2 = res['T2'].astype(str).to_numpy()
+        obs = self.obsdf_modified.copy()
+        obs.columns = obs.columns.astype(str)
+        traits = sorted(set(t1) | set(t2))
+        X = (obs[traits].to_numpy() > 0.5)
+        n_tips = X.shape[0]
+        col = {t: k for k, t in enumerate(traits)}
+        i = np.array([col[a] for a in t1]); j = np.array([col[b] for b in t2])
+        n1 = X.sum(0)
+        n_both = np.empty(len(res), np.int64)
+        Xf = X.astype(np.float32)
+        if len(traits) <= 8000:
+            OO = Xf.T @ Xf
+            n_both[:] = np.rint(OO[i, j]).astype(np.int64)
+        else:
+            for c0 in range(0, len(res), 200_000):
+                sl = slice(c0, c0 + 200_000)
+                n_both[sl] = (X[:, i[sl]] & X[:, j[sl]]).sum(0)
+        long = pd.DataFrame({'T1': t1, 'T2': t2})
+        long['direction'] = res['direction'].to_numpy()
+        long['n_tips'] = n_tips
+        long['n_both'] = n_both
+        long['n_T1_only'] = n1[i] - n_both
+        long['n_T2_only'] = n1[j] - n_both
+        long['n_neither'] = n_tips - n1[i] - n1[j] + n_both
+        long['prevalence_T1'] = res['prevalence_T1'].to_numpy()
+        long['prevalence_T2'] = res['prevalence_T2'].to_numpy()
+        if 'obs_stat' in res.columns:
+            long['weighted_lor'] = res['obs_stat'].to_numpy()
+            long['null_mean'] = (res['obs_stat'] - res['effect_lor']).to_numpy()
+            long['null_sd'] = res['effect_se'].to_numpy()
+            long['effect_lor'] = res['effect_lor'].to_numpy()
+        long['effect_z'] = (res['effect size'].abs() * res['direction']).to_numpy()
+        for c in ('effect_shrunk', 'lfsr'):
+            long[c] = res[c].to_numpy() if c in res.columns else np.nan
+        for c in ('pval_naive', 'pval_bh', 'pval_by', 'pval_bonf'):
+            long[c] = res[c].to_numpy()
+        if 'refined' in res.columns:
+            long['refined'] = res['refined'].fillna(False).astype(bool).to_numpy()
+            trials = getattr(self, '_proto', {}).get('trials', 64)
+            rn = getattr(self, '_proto', {}).get('refine_n', 32768)
+            long['n_null'] = np.where(long['refined'], rn, trials)
+        if 'p_region' in res.columns:
+            long['p_region'] = res['p_region'].to_numpy()
+            long['gated'] = res['gated'].fillna(False).astype(bool).to_numpy()
+        long['null_calibrated'] = res['null_calibrated'].to_numpy() if 'null_calibrated' in res.columns else True
+        # descriptive lineage confinement
+        conf, cover = trait_confinement(self.tree, obs[traits], max_frac=confinement_max_frac)
+        cmap = dict(zip(conf['trait'], conf['confined']))
+        long['confined_T1'] = [cmap.get(a, False) for a in t1]
+        long['confined_T2'] = [cmap.get(b, False) for b in t2]
+        long['co_confined'] = pair_co_confined(conf, cover, t1, t2)
+        # estimated number of changes per trait (ancestral reconstruction)
+        P = self.pastml
+        ch = (P['gains'] + P['losses']) if {'gains', 'losses'} <= set(P.columns) else pd.Series(dtype=float)
+        ch.index = ch.index.astype(str)
+        long['changes_T1'] = ch.reindex(t1).to_numpy()
+        long['changes_T2'] = ch.reindex(t2).to_numpy()
+        # order: significance, then size of the shrunken effect
+        key = long['effect_shrunk'].abs() if long['effect_shrunk'].notna().any() else long['effect_z'].abs()
+        long = long.assign(_k=-key).sort_values(['pval_bh', '_k'], kind='stable').drop(columns='_k').reset_index(drop=True)
+        compact = long[[c for c in self.COMPACT_COLUMNS if c in long.columns]].copy()
+        if compact['effect_shrunk'].isna().all():
+            compact['effect_shrunk'] = long['effect_z']
+        # per-trait table
+        sig = long[long['pval_bh'] < 0.05]
+        def _count(df, d):
+            s1 = df[df['direction'] == d]
+            return pd.concat([s1['T1'], s1['T2']]).value_counts()
+        pos, neg = _count(sig, 1), _count(sig, -1)
+        tested = pd.concat([long['T1'], long['T2']]).value_counts()
+        flagged = set(self.get_flagged_traits()['gene']) if not self.get_flagged_traits().empty else set()
+        tt = pd.DataFrame({'trait': traits})
+        tt['n_tips'] = n_tips
+        tt['n_present'] = n1
+        tt['prevalence'] = n1 / n_tips
+        tt['est_gains'] = P['gains'].reindex(traits).to_numpy() if 'gains' in P else np.nan
+        tt['est_losses'] = P['losses'].reindex(traits).to_numpy() if 'losses' in P else np.nan
+        tt['root_state'] = P['root_state'].reindex(traits).to_numpy() if 'root_state' in P else np.nan
+        tt = tt.merge(conf, on='trait', how='left')
+        tt['null_calibrated'] = ~tt['trait'].isin(flagged)
+        tt['n_pairs_tested'] = tested.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt['n_significant_pos'] = pos.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt['n_significant_neg'] = neg.reindex(traits).fillna(0).astype(int).to_numpy()
+        tt = tt.sort_values(['n_significant_pos', 'n_significant_neg'], ascending=False).reset_index(drop=True)
+        return long, compact, tt
+
+    def write_outputs(self, outdir, fmt='csv', prefix='simphyni'):
+        """Write <prefix>_results (compact), <prefix>_results_long and <prefix>_traits."""
+        from pathlib import Path
+        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+        long, compact, traits = self.build_outputs()
+        ext = 'parquet' if fmt == 'parquet' else 'csv'
+        paths = {}
+        for name, df in (('results', compact), ('results_long', long), ('traits', traits)):
+            f = outdir / f'{prefix}_{name}.{ext}'
+            if ext == 'parquet':
+                df.to_parquet(f, index=False)
+            else:
+                df.to_csv(f, index=False)
+            paths[name] = f
+        self._outputs = (long, compact, traits)
+        return paths
 
     def get_results(self):
         return self.get_top_results(top = len(self.result['T1']))

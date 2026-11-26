@@ -281,7 +281,10 @@ def gpd_tail(null, stat, frac=0.1):
             surv = np.nan_to_num(surv, nan=0.0, posinf=1.0)
         pt = (M / N) * surv
         emp = ((z >= x[:, None] - 1e-9).sum(1) + 1.0) / (N + 1.0)
-        tail = np.where(x > u, np.minimum(pt, emp), emp)
+        # exact Monte-Carlo count wherever any null value is as extreme; the GPD only
+        # extrapolates beyond the most extreme simulated value (capped at that floor)
+        n_ext = (z >= x[:, None] - 1e-9).sum(1)
+        tail = np.where(n_ext == 0, np.minimum(pt, emp), emp)
         if side == 1:
             right = tail
         else:
@@ -289,7 +292,7 @@ def gpd_tail(null, stat, frac=0.1):
     return np.minimum(1.0, 2.0 * np.minimum(left, right))
 
 
-def _score_block(C, ai, pj, so_a, srblk, st, W, kde_below, tail="gpd"):
+def _score_block(C, ai, pj, so_a, srblk, st, W, kde_below=1, tail="gpd"):
     N = C.shape[2]
     z = np.zeros(len(ai))
     le, ge, mu, var, _ = _tail_kernel_idx(C, ai, pj, so_a, srblk, st, float(W), 1.0, z, False)
@@ -329,7 +332,7 @@ def _score_cells(co, so_a, sr_b, st, W, kde_below):
     return pe, mu, np.sqrt(var)
 
 
-def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
+def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=1,
                      dense_min=20000, pblock=256, ablock=256):
     """For each (anchor a, partner b): the observed anchor against b's replicates.
 
@@ -378,7 +381,7 @@ def anchored_entries(U, obs, w, anchors, partners, batch=256, kde_below=20,
     return stat, p, mu, sd
 
 
-def anchored_scores(U, obs, w, pairs_index, combine="max", batch=256, kde_below=20):
+def anchored_scores(U, obs, w, pairs_index, combine="max", batch=256, kde_below=1):
     """Anchored p-values for pairs (i, j): max (or mean) over both anchors."""
     i, j = pairs_index[:, 0], pairs_index[:, 1]
     anchors = np.concatenate([i, j]); partners = np.concatenate([j, i])
