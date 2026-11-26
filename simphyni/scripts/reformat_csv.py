@@ -3,6 +3,7 @@ import sys
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -73,9 +74,11 @@ def _sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _binarize(df: pd.DataFrame) -> pd.DataFrame:
-    df[df > 0] = 1
-    df.fillna(0, inplace=True)
-    return df.astype(int)
+    df = df.apply(pd.to_numeric, errors='coerce')
+    na_mask = df.isna()
+    df = (df > 0).astype(float)
+    df[na_mask] = np.nan
+    return df
 
 
 def _apply_run_cols_order(df: pd.DataFrame, run_columns) -> pd.DataFrame:

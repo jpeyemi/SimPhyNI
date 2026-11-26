@@ -36,16 +36,61 @@ def main():
     parser.add_argument(
         "--include-flagged",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Include traits with miscalibrated null distributions in significance "
-            "testing. By default these traits are excluded and their pairs assigned "
-            "p=0.5. With --include-flagged they are simulated normally and results "
-            "are annotated with a null_calibrated=False column. "
-            "Use Sim.get_flagged_traits() or check null_calibrated in the output CSV "
-            "to identify which pairs are affected. (Default: disabled)"
+            "Test traits whose null distribution may be miscalibrated (sparse events "
+            "with highly asymmetric eligible regions). Their pairs are simulated "
+            "normally and marked null_calibrated=False in the output. "
+            "--no-include-flagged drops them from the results instead. "
+            "(Default: enabled)"
         ),
     )
+    parser.add_argument("--emergence", choices=["dist", "none", "scaled", "soft", "mrca"],
+                        default="none", help="Emergence-threshold handling (default: none)")
+    parser.add_argument("--emergence-scale", type=float, default=1.0,
+                        help="Threshold multiplier for --emergence scaled (default: 1.0)")
+    parser.add_argument("--condition", choices=["none", "prevalence", "footprint"], default="prevalence",
+                        help="Condition each trait's null on the observed trait: prevalence (default) or footprint (prevalence + parsimony changes)")
+    parser.add_argument("--oversample", type=int, default=8,
+                        help="Replicates simulated per kept replicate with --condition prevalence")
+    parser.add_argument("--eligibility", choices=["none", "phylogroup", "adaptive"], default="none",
+                        help="Restrict each trait's null to the phylogroups it occupies (default: none)")
+    parser.add_argument("--phylogroup-depth", type=float, default=0.2,
+                        help="Tree-depth fraction at which phylogroups are cut (default: 0.2)")
+    parser.add_argument("--adapt-alpha", type=float, default=0.05,
+                        help="Exclusion threshold for --eligibility adaptive (default: 0.05)")
+    parser.add_argument("--branch-cap", choices=["none", "iqr"], default="iqr",
+                        help="Cap branch lengths in simulation as in the rate denominators (default: iqr)")
+    parser.add_argument("--null", choices=["default", "legacy", "anchored", "anchored-screen"], default="default",
+                        help="Null model. legacy: unweighted, simulated-vs-simulated pairs with --condition. anchored: GSC-weighted statistic, observed trait vs the "
+                             "partner's null replicates in both directions (max p), lineage-"
+                             "overlap gate on candidate pairs. anchored-screen: anchored without "
+                             "the gate (default; fastest, highest recall, not robust to co-restriction).")
+    parser.add_argument("--trials", type=int, default=512,
+                        help="Null replicates per trait for --null anchored* (default: 512)")
+    parser.add_argument("--combine", choices=["max", "mean"], default="max",
+                        help="Combine the two anchored directions: max (default; valid if either "
+                             "trait's null model is right) or mean (more recall, valid at 2x the level)")
+    parser.add_argument("--lineage", choices=["none", "soft_auto", "soft", "mrca"], default="none",
+                        help="Per-trait lineage accessibility in the null simulation (anchored nulls): "
+                             "soft_auto = rate decays with distance from the trait's own MRCA clade, scale "
+                             "chosen by single-trait posterior-predictive fit (default: none)")
+    parser.add_argument("--tau", type=float, default=0.2, help="Decay scale for --lineage soft (fraction of mean tip depth)")
+    parser.add_argument("--composite", action=argparse.BooleanOptionalAction, default=False,
+                        help="Composite null: report max(p_whole-tree, p_pair-region) (valid if either null holds)")
+    parser.add_argument("--gate-p", type=float, default=0.05,
+                        help="Pairs with p below this get the lineage-overlap check (default: 0.05)")
+    parser.add_argument("--refine-p", type=float, default=0.01,
+                        help="Re-test pairs with p below this with --refine-n fresh replicates and a "
+                             "GPD tail fitted to the top 1%% (default: 0.01; 0 disables)")
+    parser.add_argument("--refine-max-pairs", type=int, default=5000,
+                        help="At most this many smallest-p pairs are refined (default: 5000)")
+    parser.add_argument("--refine-n", type=int, default=32768,
+                        help="Replicates per trait in the refinement stage (default: 32768)")
+    parser.add_argument("--output-format", choices=["csv", "parquet"], default="csv",
+                        help="File format of the result tables (default: csv)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible simulations (default: unseeded)")
     args = parser.parse_args()
 
     # ----------------------
@@ -102,7 +147,28 @@ def main():
     # Run Simulation
     # ----------------------
     print("Running SimPhyNI analysis...")
-    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged, use_clade_mask=False)
+    extra = dict(statistic="logor", pvalue="kde", trials=64)
+    if args.null == "default":
+        args.null = "anchored-screen"
+    if args.null != "legacy":
+        extra = dict(statistic="weighted", pvalue="anchored_fast", trials=args.trials,
+                     anchor_combine=args.combine,
+                     lineage=None if args.lineage == "none" else args.lineage, tau=args.tau,
+                     composite=args.composite, sup_p=max(args.gate_p, 0.05),
+                     gate=("overlap" if args.null == "anchored" else None), gate_p=args.gate_p,
+                     refine_p=args.refine_p or None, refine_max_pairs=args.refine_max_pairs,
+                     refine_n=args.refine_n)
+        args.condition = "none"
+    Sim.run_simulation(cores=args.cores, gamma=False, include_flagged=args.include_flagged,
+                       use_clade_mask=False, seed=args.seed,
+                       emergence=args.emergence, emergence_scale=args.emergence_scale,
+                       condition=None if args.condition == 'none' else args.condition,
+                       oversample=args.oversample,
+                       eligibility=None if args.eligibility == 'none' else args.eligibility,
+                       phylogroup_depth=args.phylogroup_depth,
+                       adapt_alpha=args.adapt_alpha,
+                       branch_cap=None if args.branch_cap == 'none' else args.branch_cap,
+                       **extra)
 
     # ----------------------
     # Save Outputs
@@ -114,41 +180,15 @@ def main():
         with open(output_dir / 'simphyni_object.pkl', 'wb') as f:
             pickle.dump(Sim, f)
 
-    Sim.get_results().to_csv(output_dir / 'simphyni_results.csv')
-    print("Simulation completed.")
-
-    PVAL_COLS = {
-        'uncorrected': 'pval_naive',
-        'bh':          'pval_bh',
-        'by':          'pval_by',
-        'bonf':        'pval_bonf',
-    }
+    paths = Sim.write_outputs(output_dir, fmt=args.output_format)
+    print("Simulation completed. Wrote " + ", ".join(str(p) for p in paths.values()))
 
     if args.plot:
-        if args.run_traits > 0 and Sim.run_trait_names:
-            # Specific traits mode: volcano per trait+method, rectangular heatmap per method
-            for trait in Sim.run_trait_names:
-                safe = trait.replace('/', '_').replace(' ', '_')
-                for label, col in PVAL_COLS.items():
-                    Sim.plot_volcano(
-                        trait=trait,
-                        pval_col=col,
-                        output_file=str(output_dir / f'volcano_{safe}_{label}.png')
-                    )
-            for label, col in PVAL_COLS.items():
-                Sim.plot_heatmap_subset(
-                    run_traits=Sim.run_trait_names,
-                    pval_col=col,
-                    output_file=str(output_dir / f'heatmap_subset_{label}.png')
-                )
-        else:
-            # All-by-all mode: scalable symmetric heatmaps
-            for label, col in PVAL_COLS.items():
-                Sim.plot_results(
-                    pval_col=col,
-                    output_file=str(output_dir / f'heatmap_{label}.png'),
-                    figure_size=-1
-                )
+        from simphyni.plotting import summary_plots
+        long, _, traits = Sim._outputs
+        query = list(Sim.run_trait_names) if args.run_traits > 0 and getattr(Sim, 'run_trait_names', None) else None
+        made = summary_plots(long, traits, output_dir, query_traits=query)
+        print("Plots: " + ", ".join(str(m) for m in made))
 
 
 if __name__ == '__main__':

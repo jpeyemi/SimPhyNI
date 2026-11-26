@@ -114,14 +114,16 @@ class pair_statistics:
 
     @staticmethod
     def _log_odds_ratio_statistic(tp: np.ndarray, tq: np.ndarray) -> np.ndarray:
-        epsilon = 1#e-2
-        a = np.logical_and(tp, tq).sum(axis=0) + epsilon # Both traits present
-        b = np.logical_and(tp, np.logical_not(tq)).sum(axis=0)  + epsilon# First trait present, second absent
-        c = np.logical_and(np.logical_not(tp), tq).sum(axis=0) + epsilon # First trait absent, second present
-        d = np.logical_and(np.logical_not(tp), np.logical_not(tq)).sum(axis=0) + epsilon # Both traits absent
+        epsilon = 1
+        # Pairwise-complete: only count tips where both traits are measured
+        valid = np.isfinite(tp) & np.isfinite(tq)
+        tp_v = np.where(valid, tp, 0).astype(bool)
+        tq_v = np.where(valid, tq, 0).astype(bool)
+        a = (tp_v & tq_v & valid).sum(axis=0) + epsilon
+        b = (tp_v & ~tq_v & valid).sum(axis=0) + epsilon
+        c = (~tp_v & tq_v & valid).sum(axis=0) + epsilon
+        d = (~tp_v & ~tq_v & valid).sum(axis=0) + epsilon
 
-        # Calculate odds ratio; avoid division by zero
-        # odds_ratio_values = (a * d) / np.maximum(b * c, 1)
         odds_ratio_values = (a * d) / (b * c)
 
         return np.log(odds_ratio_values)

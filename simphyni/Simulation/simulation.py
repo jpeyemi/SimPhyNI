@@ -278,6 +278,7 @@ def build_sim_params(df: pd.DataFrame, counting: str, subsize: str,
     # Root state: for marginal counting methods use root_prob thresholded at 0.5
     if counting not in ('JOINT', 'JOINTP') and 'root_prob' in src.columns:
         out['root_state'] = (src['root_prob'].values >= 0.5).astype(int)
+        out['root_prob'] = src['root_prob'].values
     else:
         out['root_state'] = src['root_state'].values.astype(int)
 
@@ -363,6 +364,7 @@ def build_clade_mask(
             n for n in tree.get_leaves()
             if n.name in all_leaf_names
             and n.name in obsdf.index
+            and pd.notna(obsdf.at[n.name, gene])
             and int(obsdf.at[n.name, gene]) == minority_val
         ]
 
@@ -389,6 +391,142 @@ def build_clade_mask(
 
 
 # ---------------------------------------------------------------------------
+# build_phylogroup_mask: restrict events to phylogroups where a trait occurs
+# ---------------------------------------------------------------------------
+
+def phylogroups(tree, depth_frac: float = 0.2):
+    """Partition the tree into phylogroups by cutting at a fraction of its depth.
+
+    A phylogroup is the subtree below each branch that crosses depth
+    ``depth_frac * max_root_to_tip``.  Tips shallower than the cut form their
+    own group.  Returns (node -> group id or -1 for backbone nodes, n_groups).
+    """
+    depth = {}
+    for n in tree.traverse("preorder"):
+        depth[n] = 0.0 if n.up is None else depth[n.up] + n.dist
+    cut = depth_frac * max(depth[l] for l in tree.get_leaves())
+    group = {}
+    n_groups = 0
+    for n in tree.traverse("preorder"):
+        if n.up is None:
+            group[n] = -1
+        elif group[n.up] >= 0:
+            group[n] = group[n.up]
+        elif depth[n] >= cut or n.is_leaf():
+            group[n] = n_groups
+            n_groups += 1
+        else:
+            group[n] = -1
+    return group, n_groups
+
+
+def build_phylogroup_mask(tree, obsdf: pd.DataFrame, gene_order: list, root_states,
+                          depth_frac: float = 0.2):
+    """(n_nodes, n_traits) gain/loss eligibility restricted to occupied phylogroups.
+
+    For each trait, a phylogroup is "occupied" if any of its tips carries the
+    non-root state.  Events are allowed only on branches inside occupied
+    phylogroups (including each group's stem branch).  Backbone branches above
+    the cut are allowed only when every phylogroup is occupied, in which case
+    the trait is unrestricted.
+
+    This encodes that some traits never enter some lineages (e.g. genes
+    confined to one species or phylogroup of a multi-species tree) while
+    still letting the null move the trait anywhere within those lineages.
+
+    Returns (gain_mask, loss_mask, allowed_bl) where allowed_bl is the total
+    branch length of eligible branches, used as the rate denominator.
+    """
+    node_list = list(tree.traverse())
+    group, n_groups = phylogroups(tree, depth_frac)
+    node_group = np.array([group[n] for n in node_list])
+    bl = np.array([0.0 if n.up is None else n.dist for n in node_list])
+    leaves = [n for n in node_list if n.is_leaf()]
+    leaf_group = np.array([group[l] for l in leaves])
+    leaf_names = [l.name for l in leaves]
+    mask = np.zeros((len(node_list), len(gene_order)), dtype=bool)
+    allowed_bl = np.zeros(len(gene_order))
+    for t, gene in enumerate(gene_order):
+        rs = int(root_states.loc[gene] if hasattr(root_states, "loc") else root_states[gene])
+        if gene not in obsdf.columns:
+            mask[:, t] = True
+        else:
+            vals = obsdf[gene].reindex(leaf_names).to_numpy(dtype=float)
+            hit = np.isfinite(vals) & (vals.astype(float) != rs)
+            occupied = np.unique(leaf_group[hit])
+            if len(occupied) >= n_groups:
+                mask[:, t] = True
+            else:
+                mask[:, t] = np.isin(node_group, occupied)
+        allowed_bl[t] = bl[mask[:, t]].sum()
+    return mask, mask.copy(), allowed_bl
+
+
+def adaptive_phylogroup_mask(tree, lineages, trials, obsdf: pd.DataFrame, gene_order: list,
+                             root_states, depth_frac: float = 0.2, alpha: float = 0.05,
+                             block: int = 256):
+    """Posterior-predictive phylogroup restriction.
+
+    ``lineages`` is an *unrestricted* null simulation (n_tips, n_traits,
+    n_chunks) for ``gene_order``, tips in ``tree`` leaf order.  For each trait
+    and each phylogroup in which the trait's non-root state is NOT observed,
+    compute the fraction of simulated replicates that also leave that group
+    without the non-root state.  If that fraction is below ``alpha`` the
+    unrestricted model would almost always have put the trait there, so the
+    observed absence is evidence the lineage is closed to it: the group is
+    excluded.  Groups whose emptiness is plausible under the null (e.g. for
+    sparse traits) stay eligible, so the restriction only bites when the data
+    support it.
+
+    Returns (gain_mask, loss_mask, eligible_frac, n_excluded) where
+    eligible_frac is the share of total branch length that remains eligible
+    (used to rescale the rate denominator) and n_excluded counts excluded
+    groups per trait.
+    """
+    node_list = list(tree.traverse())
+    group, n_groups = phylogroups(tree, depth_frac)
+    node_group = np.array([group[n] for n in node_list])
+    bl = np.array([0.0 if n.up is None else n.dist for n in node_list])
+    leaves = list(tree)                                 # same order as sim_bit lineages
+    leaf_group = np.array([group[l] for l in leaves])
+    leaf_names = [l.name for l in leaves]
+    G = np.zeros((len(leaves), n_groups), dtype=np.float32)
+    G[np.arange(len(leaves)), leaf_group] = 1.0
+
+    rs = np.array([int(root_states.loc[g] if hasattr(root_states, "loc") else root_states[g])
+                   for g in gene_order])
+    n_traits = len(gene_order)
+    mask = np.ones((len(node_list), n_traits), dtype=bool)
+    eligible_frac = np.ones(n_traits)
+    n_excluded = np.zeros(n_traits, dtype=int)
+    total_bl = bl.sum()
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(len(leaves), e - s, -1)[:, :, :trials].astype(np.float32)
+        for j in range(e - s):
+            t = s + j
+            gene = gene_order[t]
+            nonroot = bits[:, j, :] if rs[t] == 0 else 1.0 - bits[:, j, :]     # tips x trials
+            per_group = G.T @ nonroot                                           # groups x trials
+            p_empty = (per_group == 0).mean(axis=1)                             # groups
+            if gene in obsdf.columns:
+                v = obsdf[gene].reindex(leaf_names).to_numpy(dtype=float)
+                hit = np.isfinite(v) & (v != rs[t])
+                occupied = np.zeros(n_groups, bool)
+                occupied[np.unique(leaf_group[hit])] = True
+            else:
+                occupied = np.ones(n_groups, bool)
+            excluded = (~occupied) & (p_empty < alpha)
+            if excluded.any():
+                allowed = ~excluded
+                mask[:, t] = (node_group >= 0) & allowed[np.maximum(node_group, 0)]
+                eligible_frac[t] = bl[mask[:, t]].sum() / total_bl if total_bl > 0 else 1.0
+                n_excluded[t] = int(excluded.sum())
+    return mask, mask.copy(), eligible_frac, n_excluded
+
+
+# ---------------------------------------------------------------------------
 # flag_uncalibratable_traits: data-driven detection of miscalibrated nulls
 # ---------------------------------------------------------------------------
 
@@ -398,6 +536,7 @@ def flag_uncalibratable_traits(
     rate_iqr_multiplier: float = 3.0,
     max_sparse_events: int = 5,
     max_prevalence_fraction: float = 0.80,
+    n_tips: int | None = None,
 ) -> pd.DataFrame:
     """
     Identify traits whose Poisson null distribution will be systematically
@@ -462,6 +601,10 @@ def flag_uncalibratable_traits(
         their null distributions are well-calibrated even with asymmetric rates.
         Requires ``_raw_count`` in params; if absent, no prevalence gate is
         applied.
+    n_tips : int, optional
+        Number of tips, used as the prevalence denominator.  Falls back to
+        the largest trait count in ``params`` when not given (which
+        overestimates prevalence when no trait is near fixation).
 
     Returns
     -------
@@ -505,7 +648,7 @@ def flag_uncalibratable_traits(
     sparse = (raw_gains + raw_losses) <= max_sparse_events
 
     if '_raw_count' in df.columns:
-        n_tips_est   = df['_raw_count'].max()
+        n_tips_est   = n_tips if n_tips else df['_raw_count'].max()
         prevalence   = df['_raw_count'] / n_tips_est
         low_prev     = prevalence < max_prevalence_fraction
     else:
@@ -562,23 +705,299 @@ def flag_uncalibratable_traits(
 
 ### Simulation Methods
 
-def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
-                         gain_mask=None, loss_mask=None, gamma=False):
+def condition_on_prevalence(lineages, target_prev, trials, seed=None, block=256):
+    """Keep, per trait, the ``trials`` simulated replicates whose tip prevalence
+    is closest to the observed prevalence.
 
-    sim = sim_bit(tree=tree, trait_params=trait_params, trials=trials,
-                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma)
+    lineages    : (n_tips, n_traits, n_chunks_big) uint64 from sim_bit run with
+                  trials_big = trials * oversample replicates
+    target_prev : (n_traits,) observed prevalence (NaN -> no conditioning)
+    Returns (n_tips, n_traits, ceil(trials/64)) uint64.
+
+    This conditions each trait's null on its observed marginal, the way
+    Fisher's exact test conditions on the table margins.  Without it, traits
+    with few events are simulated with the right number of events but the
+    wrong footprint (events land on short tip branches), so their simulated
+    copies are far rarer and less clade-like than the observed trait and the
+    null co-occurrence spread is too narrow.
+    """
+    n_tips, n_traits, _ = lineages.shape
+    n_chunks, _ = _chunk_info(trials)
+    rng = np.random.default_rng(seed)
+    out = np.zeros((n_tips, n_traits, n_chunks), dtype=np.uint64)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(n_tips, e - s, -1)                          # tips x traits x trials_big
+        prev = bits.mean(axis=0)                                         # traits x trials_big
+        tgt = np.asarray(target_prev[s:e], dtype=float)[:, None]
+        dist = np.abs(prev - np.where(np.isfinite(tgt), tgt, prev))
+        dist = dist + rng.random(dist.shape) * 1e-9                     # random tie-break
+        idx = np.argsort(dist, axis=1)[:, :trials]                       # traits x trials
+        sel = np.take_along_axis(bits, idx[None, :, :], axis=2)          # tips x traits x trials
+        pad = n_chunks * 64 - trials
+        if pad:
+            sel = np.pad(sel, ((0, 0), (0, 0), (0, pad)))
+        out[:, s:e, :] = np.packbits(sel, axis=-1, bitorder="little").view(np.uint64)
+    return out
+
+
+def fitch_changes_packed(tree, lineages, n_trials, block=128):
+    """Parsimony change count for every (trait, replicate) of a packed simulation.
+
+    lineages : (n_tips, n_traits, n_chunks) uint64, tips in ``tree`` leaf order.
+    Returns (n_traits, n_trials) int32.  Bit-parallel Fitch: each node keeps two
+    bitsets (state 0 possible / state 1 possible) per (trait, chunk).
+    Multifurcations are resolved left to right, so counts are an upper bound
+    on the minimum for polytomies; observed traits must be scored with this
+    same function for a like-for-like comparison.
+    """
+    leaves = list(tree)
+    leaf_pos = {l: i for i, l in enumerate(leaves)}
+    n_tips, n_traits, n_chunks = lineages.shape
+    out = np.zeros((n_traits, n_trials), dtype=np.int32)
+    full = np.uint64(0xFFFFFFFFFFFFFFFF)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        L = lineages[:, s:e, :]
+        counts = np.zeros((e - s, n_chunks * 64), dtype=np.int32)
+        sets = {}
+        for node in tree.traverse("postorder"):
+            if node.is_leaf():
+                b = L[leaf_pos[node]]
+                sets[node] = (~b & full, b)
+                continue
+            kids = node.children
+            s0, s1 = sets.pop(kids[0])
+            for c in kids[1:]:
+                c0, c1 = sets.pop(c)
+                i0, i1 = s0 & c0, s1 & c1
+                empty = ~(i0 | i1) & full
+                if empty.any():
+                    counts += np.unpackbits(empty.view(np.uint8), axis=-1,
+                                            bitorder="little").reshape(e - s, -1)
+                s0 = np.where(empty, s0 | c0, i0)
+                s1 = np.where(empty, s1 | c1, i1)
+            sets[node] = (s0, s1)
+        out[s:e] = counts[:, :n_trials]
+    return out
+
+
+def condition_on_footprint(tree, lineages, obs_lineages, trials, seed=None, block=256):
+    """Keep, per trait, the ``trials`` replicates closest to the observed trait in
+    BOTH prevalence and parsimony changes.
+
+    Prevalence alone fails when the estimated rates are off: on clonal trees
+    (many zero-length branches) FLOW rates overstate change, so replicates
+    reach the observed prevalence through many small clumps instead of the
+    few large ones observed, and the null is too narrow.  Matching the number
+    of changes as well makes the null reproduce the trait's footprint
+    regardless of rate error.  Each distance is scaled by its spread across
+    the trait's replicates.
+
+    obs_lineages : (n_tips, n_traits, 1) uint64 with the observed traits in bit 0
+                   (NA tips should be 0; they are rare and only affect the score).
+    """
+    n_tips, n_traits, n_chunks_big = lineages.shape
+    big = n_chunks_big * 64
+    n_chunks, _ = _chunk_info(trials)
+    rng = np.random.default_rng(seed)
+    f_sim = fitch_changes_packed(tree, lineages, big)
+    f_obs = fitch_changes_packed(tree, obs_lineages, 1)[:, 0]
+    out = np.zeros((n_tips, n_traits, n_chunks), dtype=np.uint64)
+    for s in range(0, n_traits, block):
+        e = min(n_traits, s + block)
+        bits = np.unpackbits(lineages[:, s:e, :].view(np.uint8), axis=-1, bitorder="little")
+        bits = bits.reshape(n_tips, e - s, -1)
+        prev = bits.mean(axis=0)
+        obs_bits = np.unpackbits(obs_lineages[:, s:e, :].view(np.uint8), axis=-1,
+                                 bitorder="little").reshape(n_tips, e - s, -1)[:, :, 0]
+        p_obs = obs_bits.mean(axis=0)[:, None]
+        lf = np.log1p(f_sim[s:e])
+        lf_obs = np.log1p(f_obs[s:e])[:, None]
+        sp = prev.std(axis=1, keepdims=True) + 1e-9
+        sf = lf.std(axis=1, keepdims=True) + 1e-9
+        dist = ((prev - p_obs) / sp) ** 2 + ((lf - lf_obs) / sf) ** 2
+        dist = dist + rng.random(dist.shape) * 1e-9
+        idx = np.argsort(dist, axis=1)[:, :trials]
+        sel = np.take_along_axis(bits, idx[None, :, :], axis=2)
+        pad = n_chunks * 64 - trials
+        if pad:
+            sel = np.pad(sel, ((0, 0), (0, 0), (0, pad)))
+        out[:, s:e, :] = np.packbits(sel, axis=-1, bitorder="little").view(np.uint64)
+    return out
+
+
+def pack_observed(obs: np.ndarray) -> np.ndarray:
+    """(n_tips, n_traits) 0/1 (NaN -> 0) -> (n_tips, n_traits, 1) uint64 with bit 0 set."""
+    o = np.nan_to_num(np.asarray(obs, dtype=float), nan=0.0) > 0.5
+    return o.astype(np.uint64)[:, :, None]
+
+
+def simulate_glrates_bit(tree, trait_params, pairs, obspairs, trials = 64, cores = -1,
+                         gain_mask=None, loss_mask=None, gamma=False, seed=None,
+                         emergence='dist', emergence_scale=1.0,
+                         condition=None, oversample=8, obs_prevalence=None, obs_traits=None,
+                         branch_cap=None, rate_model='point', pi_source='acr', rate_draws=True,
+                         prior_by_prevalence=False, root='threshold', simulator='poisson',
+                         fixed_k_max=None, statistic='logor', pvalue='kde',
+                         testable_filter=None, adaptive_stages=(4096, 32768), adaptive_h=10,
+                         anchor_combine='max', gate=None, gate_q=0.95, gate_p=None, refine_p=None,
+                         lineage=None, tau=0.1, sup_p=0.05, composite=False,
+                         confine_alpha=0.1, refine_mode='gpd', refine_n=32768, refine_frac=0.01,
+                         xi_min=0.0, refine_tiers=None, refine_max_pairs=None, tail='gpd',
+                         p_unrestricted=0.5):
+    """Simulate the null for every trait and score all pairs.
+
+    condition : None | 'prevalence' | 'footprint'.  ``trials * oversample``
+                replicates are simulated per trait and the ``trials`` closest
+                to the observed trait are kept: by prevalence
+                (``obs_prevalence``), or by prevalence and parsimony changes
+                (``obs_traits``: (n_tips, n_traits) in tree leaf order).
+
+    Prototype options (see uncertainty.py): rate_model, pi_source, rate_draws,
+    prior_by_prevalence, root, simulator, fixed_k_max, statistic, pvalue,
+    testable_filter.
+    """
+    from . import uncertainty as unc
+    if condition not in (None, 'none', 'prevalence', 'footprint'):
+        raise ValueError(f"condition must be None, 'prevalence' or 'footprint', got {condition!r}")
     mappingr = dict(enumerate(trait_params.index))
     mapping = dict(zip(trait_params.index,range(len(trait_params.index))))
     pairs_index = np.vectorize(lambda key: mapping[key])(pairs)
+    urng = np.random.default_rng(None if seed is None else seed + 11)
 
-    res = compres(sim, pairs_index, obspairs, bits=trials)
+    if pvalue == 'analytic':
+        gr, lr, info = unc.eb_rates(trait_params, obs_prevalence, 1, pi_source=pi_source,
+                                    draws=False, prior_by_prevalence=prior_by_prevalence, rng=urng)
+        mu = info['mu_mean'] if rate_model == 'eb' else info['mu_point']
+        res = unc.analytic_pairs(tree, mu, pairs_index, obs_traits, branch_cap=branch_cap)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
+    if pvalue == 'anchored_fast':
+        from .fastsim import run_anchored
+        res = run_anchored(tree, trait_params, pairs_index, obs_traits, trials=trials,
+                           branch_cap=branch_cap, seed=seed, weighted=(statistic == 'weighted'),
+                           combine=anchor_combine, gate=gate, gate_q=gate_q, gate_p=gate_p,
+                           refine_p=refine_p, refine_stages=tuple(adaptive_stages),
+                           refine_h=adaptive_h, lineage=lineage, tau=tau, sup_p=sup_p,
+                           composite=composite, confine_alpha=confine_alpha,
+                           refine_mode=refine_mode, refine_n=refine_n, refine_frac=refine_frac,
+                           xi_min=xi_min, refine_tiers=refine_tiers,
+                           refine_max_pairs=refine_max_pairs, tail=tail, p_unrestricted=p_unrestricted)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
+    if pvalue == 'anchored_mc':
+        # No conditioning: anchored counts against fresh, unselected replicates.
+        stage_ctr = [0]
+        def _simulate(tidx, N):
+            stage_ctr[0] += 1
+            sub = trait_params.iloc[tidx]
+            sd = None if seed is None else seed + 101 * stage_ctr[0]
+            gm = None if gain_mask is None else gain_mask[:, tidx]
+            lm = None if loss_mask is None else loss_mask[:, tidx]
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                L = sim_bit(tree=tree, trait_params=sub, trials=N, gain_mask=gm, loss_mask=lm,
+                            gamma=gamma, seed=sd, emergence=emergence,
+                            emergence_scale=emergence_scale, branch_cap=branch_cap)
+            n_tips_, n_tr_, _ = L.shape
+            bits = np.unpackbits(L.view(np.uint8), axis=-1, bitorder='little')
+            return bits.reshape(n_tips_, n_tr_, -1)[:, :, :N]
+        w = unc.gsc_weights(tree, branch_cap) if statistic == 'weighted' else None
+        res = unc.anchored_mc_pairs(_simulate, pairs_index, obs_traits, trials, weights=w,
+                                    stages=tuple(adaptive_stages), h=adaptive_h,
+                                    combine=anchor_combine)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+        res['first'] = res['first'].map(mappingr)
+        res['second'] = res['second'].map(mappingr)
+        return res
+
+    conditioned = condition in ('prevalence', 'footprint') and oversample > 1
+    n_sim = trials * oversample if conditioned else trials
+
+    rates = None
+    if rate_model == 'eb':
+        gr, lr, _ = unc.eb_rates(trait_params, obs_prevalence, n_sim, pi_source=pi_source,
+                                 draws=rate_draws, prior_by_prevalence=prior_by_prevalence,
+                                 rng=urng)
+        rates = (gr, lr)
+    elif rate_model not in (None, 'point'):
+        raise ValueError(f"rate_model must be 'point' or 'eb', got {rate_model!r}")
+
+    root_bits = None
+    if root == 'sample' and 'root_prob' in trait_params.columns:
+        rp = np.nan_to_num(trait_params['root_prob'].to_numpy(dtype=float), nan=0.5)
+        root_bits = (urng.random((len(rp), n_sim)) < rp[:, None]).astype(np.uint8)
+
+    sim = sim_bit(tree=tree, trait_params=trait_params, trials=n_sim,
+                  gain_mask=gain_mask, loss_mask=loss_mask, gamma=gamma, seed=seed,
+                  emergence=emergence, emergence_scale=emergence_scale, branch_cap=branch_cap,
+                  rates=rates, root_bits=root_bits)
+
+    if simulator == 'fixed_k':
+        if '_raw_gains' in trait_params.columns:
+            k = (trait_params['_raw_gains'] + trait_params['_raw_losses']).to_numpy(dtype=float)
+        else:
+            k = (trait_params['gains'] + trait_params['losses']).to_numpy(dtype=float)
+        k = np.rint(np.nan_to_num(k)).astype(int)
+        sel = np.ones(len(k), bool) if fixed_k_max is None else (k <= fixed_k_max)
+        if sel.any():
+            rs = trait_params['root_state'].to_numpy()[sel]
+            fk = unc.sim_fixed_k(tree, k[sel], rs, n_sim, branch_cap=branch_cap, rng=urng,
+                                 root_bits=None if root_bits is None else root_bits[sel])
+            sim[:, sel, :] = fk
+    elif simulator not in (None, 'poisson'):
+        raise ValueError(f"simulator must be 'poisson' or 'fixed_k', got {simulator!r}")
+
+    if conditioned and condition == 'prevalence':
+        if obs_prevalence is None:
+            raise ValueError("condition='prevalence' needs obs_prevalence")
+        sim = condition_on_prevalence(sim, np.asarray(obs_prevalence, float), trials,
+                                      seed=None if seed is None else seed + 2)
+    elif conditioned:
+        if obs_traits is None:
+            raise ValueError("condition='footprint' needs obs_traits")
+        sim = condition_on_footprint(tree, sim, pack_observed(obs_traits), trials,
+                                     seed=None if seed is None else seed + 2)
+
+    dense = statistic != "logor" or pvalue != "kde" or testable_filter is not None
+    if dense:
+        w = unc.gsc_weights(tree, branch_cap) if statistic == 'weighted' else None
+        res = unc.score_pairs_dense(sim, pairs_index, obs_traits, trials, weights=w,
+                                    pvalue=pvalue, want_pmin=testable_filter is not None)
+        res.insert(0, 'second', pairs_index[:, 1]); res.insert(0, 'first', pairs_index[:, 0])
+    else:
+        res = compres(sim, pairs_index, obspairs, bits=trials, cores=cores,
+                      seed=None if seed is None else seed + 1)
 
     res['first'] = res['first'].map(mappingr)
     res['second'] = res['second'].map(mappingr)
     return res
 
 
-def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False):
+EMERGENCE_MODES = ('dist', 'none', 'scaled', 'soft')
+
+
+def iqr_branch_cap(tree) -> float:
+    """Branch-length cap used for rate denominators by run_ancestral_reconstruction
+    (10 ** (Q3 + 0.5 * IQR) of log10 non-zero branch lengths)."""
+    bls = np.array([n.dist for n in tree.traverse() if not n.is_root() and n.dist > 0])
+    if len(bls) == 0:
+        return float('inf')
+    q1, q3 = np.percentile(np.log10(bls), [25, 75])
+    return float(10 ** (q3 + 0.5 * (q3 - q1)))
+
+
+def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma=False,
+            seed=None, emergence='dist', emergence_scale=1.0, branch_cap=None,
+            rates=None, root_bits=None):
     """
     Simulate trait evolution on a phylogenetic tree using bit-packed trials.
 
@@ -626,6 +1045,27 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                    point estimate count/subsize.  This widens the null distribution
                    for traits with few events (sparse data) while having negligible
                    effect when counts are large.  Each trial receives its own rate.
+    seed         : int or None.  With an int, simulation draws come from
+                   ``np.random.default_rng(seed)`` and are reproducible.  With None
+                   (default) the global ``np.random`` state is used, so callers can
+                   still control it with ``np.random.seed``.
+    emergence    : how the emergence threshold (``dist`` / ``loss_dist``) gates
+                   events in distance mode (ignored in mask mode):
+                   'dist'   — events allowed once root distance >= threshold (default)
+                   'none'   — no threshold; every branch eligible
+                   'scaled' — threshold multiplied by ``emergence_scale``
+                   'soft'   — each trial draws its own threshold ~ U(0, threshold),
+                              so uncertainty in emergence time enters the null
+                   (For an MRCA clade mask use TreeSimulator.run_simulation(
+                   emergence='mrca'), which builds gain/loss masks.)
+    emergence_scale : factor for emergence='scaled'.
+    branch_cap   : None (default) or float.  Event probabilities use
+                   min(branch length, branch_cap).  Pass iqr_branch_cap(tree) to
+                   make the simulation consistent with the IQR-capped rate
+                   denominators (subsize='ORIGINAL'); otherwise rates estimated
+                   on capped lengths are applied to full lengths, which on
+                   clonal trees (where most length sits above the cap) makes
+                   long branches flip in nearly every replicate.
 
     Returns
     -------
@@ -636,7 +1076,15 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
     """
     gains, losses, dists, loss_dists, gain_subsize, loss_subsize, root_values = \
         unpack_trait_params(trait_params)
+    rng = np.random if seed is None else np.random.default_rng(seed)
     use_mask = (gain_mask is not None) and (loss_mask is not None)
+    if emergence not in EMERGENCE_MODES:
+        raise ValueError(f"emergence must be one of {EMERGENCE_MODES}, got {emergence!r}")
+    if emergence == 'none':
+        dists = np.zeros_like(dists); loss_dists = np.zeros_like(loss_dists)
+    elif emergence == 'scaled':
+        dists = dists * emergence_scale; loss_dists = loss_dists * emergence_scale
+    soft = (emergence == 'soft') and not use_mask
 
     # Preprocess and setup
     node_map = {node: ind for ind, node in enumerate(tree.traverse())}
@@ -658,18 +1106,22 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
     last_mask = FULL_MASK if last_chunk_bits == 64 \
         else (np.uint64(1) << np.uint64(last_chunk_bits)) - np.uint64(1)
 
-    if gamma:
+    if rates is not None:
+        # Caller-supplied (n_traits, trials) gain and loss rates (rate_model='eb').
+        gain_rates, loss_rates = (np.asarray(r, dtype=float) for r in rates)
+        gamma = True
+    elif gamma:
         # Sample one rate per trait per trial from the Jeffreys posterior:
         #   rate | data ~ Gamma(count + 0.5, scale=1/subsize)
         # Shape: (n_traits, trials) — each trial uses an independent draw.
         gain_rates = np.zeros((num_traits, trials), dtype=float)
         loss_rates = np.zeros((num_traits, trials), dtype=float)
-        gain_rates[valid_gains] = np.random.gamma(
+        gain_rates[valid_gains] = rng.gamma(
             (gains[valid_gains] + 0.5)[:, np.newaxis],
             (1.0 / gain_subsize[valid_gains])[:, np.newaxis],
             size=(valid_gains.sum(), trials),
         )
-        loss_rates[valid_losses] = np.random.gamma(
+        loss_rates[valid_losses] = rng.gamma(
             (losses[valid_losses] + 0.5)[:, np.newaxis],
             (1.0 / loss_subsize[valid_losses])[:, np.newaxis],
             size=(valid_losses.sum(), trials),
@@ -679,6 +1131,12 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
         loss_rates = np.zeros(num_traits, dtype=float)
         gain_rates[valid_gains] = gains[valid_gains] / gain_subsize[valid_gains]
         loss_rates[valid_losses] = losses[valid_losses] / loss_subsize[valid_losses]
+
+    if soft:
+        # Per-trial thresholds, shape (n_traits, trials)
+        gain_thr = dists[:, np.newaxis] * rng.random((num_traits, trials))
+        loss_thr = loss_dists[:, np.newaxis] * rng.random((num_traits, trials))
+        all_traits = np.ones(num_traits, dtype=bool)
 
     # Distance calculations
     node_dists = {}
@@ -692,6 +1150,15 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
 
         if node.up is None:
             # Root state: hard 0/1 (build_sim_params thresholds root_prob at 0.5)
+            if root_bits is not None:
+                # Per-replicate root states (root='sample'), (n_traits, trials) 0/1
+                rb = np.asarray(root_bits, dtype=np.uint8)
+                pad = n_chunks * bits - trials
+                if pad:
+                    rb = np.pad(rb, ((0, 0), (0, pad)))
+                sim[node_map[node], :, :] = np.packbits(
+                    rb, axis=-1, bitorder='little').view(nptype).reshape(num_traits, n_chunks)
+                continue
             root = root_values > 0
             for c in range(n_chunks):
                 chunk_val = FULL_MASK if c < n_chunks - 1 else last_mask
@@ -700,12 +1167,17 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
 
         parent = sim[node_map[node.up], :, :]        # (n_traits, n_chunks)
         node_total_dist = node_dists[node]
+        bl_eff = node.dist if branch_cap is None else min(node.dist, branch_cap)
 
         if use_mask:
             # Mask mode: per-node, per-trait eligibility from entropy mask
             node_idx = node_map[node]
             applicable_traits_gains  = gain_mask[node_idx, :]
             applicable_traits_losses = loss_mask[node_idx, :]
+        elif soft:
+            # Soft mode: sample everywhere, gate per trial below
+            applicable_traits_gains  = all_traits
+            applicable_traits_losses = all_traits
         else:
             # Distance mode: global threshold gate
             applicable_traits_gains  = node_total_dist >= dists
@@ -731,13 +1203,23 @@ def sim_bit(tree, trait_params, trials=64, gain_mask=None, loss_mask=None, gamma
                 gr = gain_rates[applicable_traits_gains,  np.newaxis]
                 lr = loss_rates[applicable_traits_losses, np.newaxis]
 
-            g_samp = (np.random.poisson(node.dist * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
-            l_samp = (np.random.poisson(node.dist * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
+            g_samp = (rng.poisson(bl_eff * gr, (n_gain, chunk_trials)) > 0).astype(np.uint8)
+            l_samp = (rng.poisson(bl_eff * lr, (n_loss, chunk_trials)) > 0).astype(np.uint8)
 
             if chunk_trials < bits:
                 # Zero-pad to exactly 64 columns so packbits produces one uint64
                 g_samp = np.pad(g_samp, ((0, 0), (0, bits - chunk_trials)), mode='constant')
                 l_samp = np.pad(l_samp, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+
+            if soft:
+                sl = slice(chunk_start, chunk_start + chunk_trials)
+                g_ok = (node_total_dist >= gain_thr[:, sl]).astype(np.uint8)
+                l_ok = (node_total_dist >= loss_thr[:, sl]).astype(np.uint8)
+                if chunk_trials < bits:
+                    g_ok = np.pad(g_ok, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+                    l_ok = np.pad(l_ok, ((0, 0), (0, bits - chunk_trials)), mode='constant')
+                g_samp &= g_ok
+                l_samp &= l_ok
 
             gain_events[applicable_traits_gains,  c] = (
                 np.packbits(g_samp, axis=-1, bitorder='little').view(nptype).flatten())
@@ -910,7 +1392,7 @@ def compute_kde_stats(observed_value: float, simulated_values: np.ndarray) -> Tu
     return kde_pval_ant, kde_pval_syn, med, max(iqr * 1.349,1)
 
 
-def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int, total_trials: int = 64) -> Dict[str, List]:
+def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int, total_trials: int = 64, seed=None) -> Dict[str, List]:
     """
     Process a single batch of data.
     """
@@ -922,7 +1404,15 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
     tq = sim_readonly[:, pair_batch[:, 1], :]
 
     batch_cooc = compute_bitwise_cooc(tp, tq, total_trials)
-    noised_batch_cooc = batch_cooc + np.random.normal(0, 1e-12, size=batch_cooc.shape)
+    # Tiny jitter keeps the KDE non-singular when all simulated scores tie.
+    # Seeded per pair (global index), so results do not depend on how pairs
+    # are split into batches or on the number of workers.
+    if seed is None:
+        noise = np.random.default_rng().normal(0, 1e-12, size=batch_cooc.shape)
+    else:
+        noise = np.stack([np.random.default_rng((seed, index + i)).normal(0, 1e-12, batch_cooc.shape[1])
+                          for i in range(batch_cooc.shape[0])])
+    noised_batch_cooc = batch_cooc + noise
 
     results = [
         compute_kde_stats(current_obspairs[i], noised_batch_cooc[i])
@@ -931,8 +1421,11 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
 
     kde_pvals_ant, kde_pvals_syn, medians, normalization_factors = map(np.array, zip(*results))
 
-    # Vectorized calculation of final results
-    min_pvals = np.minimum(kde_pvals_syn, kde_pvals_ant)
+    # Vectorized calculation of final results.
+    # The direction is chosen after looking at the data, so the p-value is the
+    # two-sided  2 * min(left tail, right tail), capped at 1.  Using the bare
+    # minimum would reject at twice the nominal rate under the null.
+    min_pvals = np.minimum(1.0, 2.0 * np.minimum(kde_pvals_syn, kde_pvals_ant))
     directions = np.where(kde_pvals_ant < kde_pvals_syn, -1, 1)
     effect_sizes = (current_obspairs - medians) / normalization_factors
 
@@ -947,7 +1440,7 @@ def process_batch(index: int, sim_readonly: np.ndarray, pairs: np.ndarray, obspa
 
     return batch_res
 
-def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000, bits: int = 64, cores: int = -1) -> pd.DataFrame:
+def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size: int = 1000, bits: int = 64, cores: int = -1, seed=None) -> pd.DataFrame:
     """
     Compile KDE results asynchronously using parallel batch processing.
     Optimized for time (no nested parallelism) and memory (read-only array setup).
@@ -966,13 +1459,14 @@ def compres(sim: np.ndarray, pairs: np.ndarray, obspairs: np.ndarray, batch_size
     sim.setflags(write=False)
 
     num_pairs = len(pairs)
-    batch_size = min(int(np.ceil(num_pairs/(os.cpu_count() or 1))),batch_size)
+    n_workers = cores if cores and cores > 0 else (os.cpu_count() or 1)
+    batch_size = max(1, min(int(np.ceil(num_pairs / n_workers)), batch_size))
     batch_indices = range(0, num_pairs, batch_size)
 
     print(f"Processing Batches, Total: {num_pairs//batch_size + 1}")
 
     batch_results = Parallel(n_jobs=cores, verbose=10)(
-        delayed(process_batch)(index, sim, pairs, obspairs, batch_size, bits)
+        delayed(process_batch)(index, sim, pairs, obspairs, batch_size, bits, seed)
         for index in batch_indices
     )
 
